@@ -16,7 +16,7 @@ impl Schedule {
         }
     }
 
-    pub fn add_system<P, F: IntoSystem<P>>(&mut self, system: F) {
+    pub fn register_system<P, F: IntoSystem<P>>(&mut self, system: F) {
         self.systems.push(system.into_system());
     }
 }
@@ -91,77 +91,3 @@ fn check_conflicts(accesses: &[Access]) {
     }
 }
 
-pub struct Resource<'w, T>(Ref<'w, T>);
-pub struct ResourceMut<'w, T>(RefMut<'w, T>);
-
-impl<'w, T> Deref for Resource<'w, T> {
-    type Target = T;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<'w, T> Deref for ResourceMut<'w, T> {
-    type Target = T;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<'w, T> DerefMut for ResourceMut<'w, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl<T: 'static> SystemParam for Resource<'_, T> {
-    type Item<'w> = Resource<'w, T>;
-
-    fn fetch<'w>(world: &'w World) -> Self::Item<'w> {
-        let box_cell = world
-            .storage
-            .get(&TypeId::of::<T>())
-            .expect("Resource not initialized");
-
-        let borrow: Ref<'w, dyn Any> = box_cell.borrow();
-        let resource_ref = Ref::map(borrow, |any| {
-            any.downcast_ref::<T>().expect("Type does not match TypeId")
-        });
-
-        Resource(resource_ref)
-    }
-
-    fn access() -> Access {
-        Access {
-            type_id: TypeId::of::<T>(),
-            type_name: std::any::type_name::<T>(),
-            mutable: false,
-        }
-    }
-}
-
-impl<T: 'static> SystemParam for ResourceMut<'_, T> {
-    type Item<'w> = ResourceMut<'w, T>;
-
-    fn fetch<'w>(world: &'w World) -> Self::Item<'w> {
-        let box_cell = world
-            .storage
-            .get(&TypeId::of::<T>())
-            .expect("Not initialized");
-
-        let borrow: RefMut<'w, dyn Any> = box_cell.borrow_mut();
-        let resource_ref = RefMut::map(borrow, |any| {
-            any.downcast_mut::<T>().expect("Type does not match TypeId")
-        });
-
-        ResourceMut(resource_ref)
-    }
-
-    fn access() -> Access {
-        Access {
-            type_id: TypeId::of::<T>(),
-            type_name: std::any::type_name::<T>(),
-            mutable: true,
-        }
-    }
-}
