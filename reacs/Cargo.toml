@@ -2,9 +2,10 @@
 name = "reacs"
 version = "0.1.0"
 edition = "2024"
+description = "A deterministic, push-based reactive ECS for simulation and game logic"
+license = "Apache-2.0"
 
 [dependencies]
-
 reacs-derive = { path = "../derive" }
 serde = { version = "1.0", features = ["derive"] }
 bincode = "1.3"
