@@ -158,13 +158,27 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "ctor",
- "reacs-derive",
+ "reacs-derive 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
 ]
 
 [[package]]
 name = "reacs-derive"
 version = "0.1.0"
+dependencies = [
+ "ctor",
+ "quote",
+ "serde",
+ "sha2",
+ "syn 2.0.119",
+ "uuid",
+]
+
+[[package]]
+name = "reacs-derive"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd444376847c515371753a155255016c389146ea94f9706a22f1c55afbbc785e"
 dependencies = [
  "ctor",
  "quote",
