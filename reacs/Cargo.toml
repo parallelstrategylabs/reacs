@@ -9,3 +9,6 @@ reacs-derive = { path = "../derive" }
 serde = { version = "1.0", features = ["derive"] }
 bincode = "1.3"
 ctor = "0.2"
+
+[alias]
+test = "test -- --test-threads=1"

@@ -5,24 +5,32 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
-pub struct Schedule {
-    pub systems: Vec<StoredSystem>,
+use std::ptr::addr_of_mut;
+
+static mut SYSTEM_REGISTRY: Option<Vec<StoredSystem>> = None;
+
+pub fn register_system(system: StoredSystem) {
+    unsafe {
+        let ptr = addr_of_mut!(SYSTEM_REGISTRY);
+        (*ptr).get_or_insert_with(Vec::new).push(system);
+    }
 }
 
-impl Schedule {
-    pub fn new() -> Self {
-        Self {
-            systems: Vec::new(),
-        }
-    }
-
-    pub fn register_system<P, F: IntoSystem<P>>(&mut self, system: F) {
-        self.systems.push(system.into_system());
+pub fn get_registered_systems() -> Vec<StoredSystem> {
+    unsafe {
+        let ptr = addr_of_mut!(SYSTEM_REGISTRY);
+        (*ptr).take().unwrap_or_default()
     }
 }
 
 pub struct StoredSystem {
     pub run_fn: Box<dyn FnMut(&World)>,
+}
+
+impl StoredSystem {
+    pub fn run(&mut self, world: &World) {
+        (self.run_fn)(&world)
+    }
 }
 
 pub trait SystemParam {
@@ -59,6 +67,7 @@ macro_rules! impl_into_system_tuples {
     };
 }
 
+impl_into_system_tuples!();
 impl_into_system_tuples!(P1);
 impl_into_system_tuples!(P1, P2);
 impl_into_system_tuples!(P1, P2, P3);
@@ -90,4 +99,3 @@ fn check_conflicts(accesses: &[Access]) {
         }
     }
 }
-

@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
 
-# Lista as pastas que fazem parte do seu projeto
 members = [
     "derive",
     "reacs",
