@@ -1,6 +1,14 @@
-use std::{any::TypeId, cell::{Ref, RefMut}, ops::{Deref, DerefMut}};
+use std::{
+    any::TypeId,
+    cell::{Ref, RefMut},
+    ops::{Deref, DerefMut},
+};
 
-use crate::{hashed::Hashed, schedule::{Access, SystemParam}, world::World};
+use crate::{
+    hashed::Hashed,
+    schedule::{Access, SystemParam},
+    world::World,
+};
 
 pub struct Resource<'w, T>(pub Ref<'w, T>);
 pub struct ResourceMut<'w, T>(RefMut<'w, T>);
@@ -60,5 +68,41 @@ impl<T: 'static + Default + Hashed> SystemParam for ResourceMut<'_, T> {
             type_name: std::any::type_name::<T>(),
             mutable: true,
         }
+    }
+}
+
+#[cfg(test)]
+
+mod tests {
+    use crate::prelude::*;
+
+    #[resource]
+    struct IntResource(pub u64);
+
+    #[test]
+    fn system_reads_resource() {
+        fn read_system(res: Resource<IntResource>) {
+            assert_eq!((*res).0, 94);
+        }
+
+        let mut world = World::new();
+        world.insert_resource(IntResource(94));
+
+        read_system.into_system().run(&world);
+    }
+
+    #[test]
+    fn system_writes_resource() {
+        fn write_system(mut res_mut: ResourceMut<IntResource>) {
+            (*res_mut).0 = 234;
+        }
+
+        let mut world = World::new();
+        world.init_resource::<IntResource>();
+
+        write_system.into_system().run(&world);
+
+        let res = world.get_resource::<IntResource>();
+        assert_eq!((*res.unwrap()).0, 234);
     }
 }

@@ -1,4 +1,6 @@
-#[derive(Default, Clone, Debug)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Default, Clone, Serialize, Deserialize, Debug)]
 pub struct BitSet {
     pub words: Vec<u64>,
 }

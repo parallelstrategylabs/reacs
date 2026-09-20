@@ -1,9 +1,5 @@
 use crate::world::World;
-use std::{
-    any::{Any, TypeId},
-    cell::{Ref, RefCell, RefMut},
-    ops::{Deref, DerefMut},
-};
+use std::any::TypeId;
 
 use std::ptr::addr_of_mut;
 
@@ -16,10 +12,10 @@ pub fn register_system(system: StoredSystem) {
     }
 }
 
-pub fn get_registered_systems() -> Vec<StoredSystem> {
+pub fn get_registered_systems() -> &'static Vec<StoredSystem> {
     unsafe {
         let ptr = addr_of_mut!(SYSTEM_REGISTRY);
-        (*ptr).take().unwrap_or_default()
+        (*ptr).get_or_insert_with(Vec::new)
     }
 }
 
@@ -97,5 +93,74 @@ fn check_conflicts(accesses: &[Access]) {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+
+mod tests {
+    use crate::{prelude::*, schedule::get_registered_systems};
+
+    #[resource]
+    struct IntResource(pub u64);
+
+    #[resource]
+    struct BoolResource(pub bool);
+
+    #[resource]
+    struct CustomResource {
+        pub value: i32,
+        pub active: bool,
+    }
+
+    #[system]
+    fn auto_registered_system() {}
+
+    #[test]
+    fn system_auto_registers_in_scheduler() {
+        assert!(
+            get_registered_systems().len() > 0,
+            "No system was registered!"
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn system_panics_with_conflict() {
+        fn conflicting_system(_res: Resource<IntResource>, _res_mut: ResourceMut<IntResource>) {}
+        let world = World::new();
+        conflicting_system.into_system().run(&world);
+    }
+
+    #[test]
+    fn system_runs_with_no_params() {
+        fn system() {}
+
+        let world = World::new();
+        system.into_system().run(&world);
+    }
+
+    #[test]
+    fn system_runs_with_many_params() {
+        fn two_param_system(
+            _res_mut_bool: ResourceMut<BoolResource>,
+            _res_int: Resource<IntResource>,
+        ) {
+        }
+
+        fn three_param_system(
+            _res_custom: ResourceMut<CustomResource>,
+            _res_int: Resource<IntResource>,
+            _res_bool: Resource<BoolResource>,
+        ) {
+        }
+
+        let mut world = World::new();
+        world.init_resource::<BoolResource>();
+        world.init_resource::<IntResource>();
+        world.init_resource::<CustomResource>();
+
+        two_param_system.into_system().run(&world);
+        three_param_system.into_system().run(&world);
     }
 }

@@ -1,13 +1,8 @@
-use std::{
-    any::TypeId,
-    marker::PhantomData,
-    ops::{Deref, DerefMut},
-};
-
-use reacs_derive::{resource, system};
+use std::any::TypeId;
 
 use crate::{
-    resource::{self, ResourceMut}, schedule::{Access, SystemParam}, world::World,
+    schedule::{Access, SystemParam},
+    world::World,
 };
 
 pub struct Entity {
