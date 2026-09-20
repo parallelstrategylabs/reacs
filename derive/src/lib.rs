@@ -3,16 +3,6 @@ use quote::{format_ident, quote};
 use syn::{
     DeriveInput, FnArg, GenericParam, ItemFn, parse_macro_input, parse_quote, spanned::Spanned,
 };
-use uuid::Uuid;
-
-fn generate_uuid_v5(struct_name: &str) -> u128 {
-    let engine_namespace = Uuid::parse_str("804277dc-701f-41c1-b670-fbf99628435f").unwrap();
-    let crate_name = std::env::var("CARGO_PKG_NAME").unwrap_or_default();
-    let qualified = format!("{crate_name}::{struct_name}");
-
-    let uuid = Uuid::new_v5(&engine_namespace, qualified.as_bytes());
-    uuid.as_u128()
-}
 
 #[proc_macro_derive(Hashed)]
 pub fn derive_hashed_def(input: TokenStream) -> TokenStream {
