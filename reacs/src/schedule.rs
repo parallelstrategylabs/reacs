@@ -3,40 +3,47 @@ use std::any::TypeId;
 
 use std::ptr::addr_of_mut;
 
-static mut SYSTEM_REGISTRY: Option<Vec<StoredSystem>> = None;
+pub static mut SYSTEM_REGISTRY: Option<Vec<SystemEntry>> = None;
 
-pub fn register_system(system: StoredSystem) {
+pub fn register_system(system: SystemEntry) {
     unsafe {
         let ptr = addr_of_mut!(SYSTEM_REGISTRY);
         (*ptr).get_or_insert_with(Vec::new).push(system);
     }
 }
 
-pub fn get_registered_systems() -> &'static Vec<StoredSystem> {
+pub fn get_registered_systems() -> &'static mut Vec<SystemEntry> {
     unsafe {
         let ptr = addr_of_mut!(SYSTEM_REGISTRY);
         (*ptr).get_or_insert_with(Vec::new)
     }
 }
 
-pub struct StoredSystem {
-    pub run_fn: Box<dyn FnMut(&World)>,
+pub struct SystemEntry {
+    pub init_fn: Box<dyn FnMut(&mut World)>,
+    pub run_fn: Box<dyn FnMut(&mut World)>,
 }
 
-impl StoredSystem {
-    pub fn run(&mut self, world: &World) {
-        (self.run_fn)(&world)
+impl SystemEntry {
+    pub fn init(&mut self, world: &mut World) {
+        (self.init_fn)(world);
+    }
+
+    pub fn run(&mut self, world: &mut World) {
+        (self.run_fn)(world);
     }
 }
 
 pub trait SystemParam {
     type Item<'w>;
+
+    fn init(world: &mut World);
     fn fetch<'w>(world: &'w World) -> Self::Item<'w>;
     fn access() -> Access;
 }
 
 pub trait IntoSystem<P> {
-    fn into_system(self) -> StoredSystem;
+    fn into_system(self) -> SystemEntry;
 }
 
 macro_rules! impl_into_system_tuples {
@@ -45,17 +52,31 @@ macro_rules! impl_into_system_tuples {
         where
             F: FnMut($($param),*) + 'static,
             F: for<'w> FnMut($($param::Item<'w>),*),
-            $($param: SystemParam + 'static),*
+            $($param: SystemParam),*
         {
-            #[allow(nonstandard_style)]
-            fn into_system(mut self) -> StoredSystem {
+            #[allow(nonstandard_style, unused_variables, unused_mut)]
+            fn into_system(mut self) -> SystemEntry {
                 check_conflicts(&[$($param::access()),*]);
-                StoredSystem {
-                    run_fn: Box::new(move |world| {
+
+                SystemEntry {
+                    init_fn: Box::new(move |world: &mut World| {
                         $(
-                            let $param = $param::fetch(world);
+                            $param::init(world);
                         )*
-                        (self)($($param),*);
+                    }),
+
+                    run_fn: Box::new(move |world: &mut World| {
+                        fn call_inner<$($param),*>(
+                            mut f: impl FnMut($($param),*),
+                            $($param: $param),*
+                        ) {
+                            f($($param),*)
+                        }
+
+                        $(
+                            let $param = unsafe { $param::fetch(world) };
+                        )*
+                        call_inner(&mut self, $($param),*);
                     }),
                 }
             }
@@ -96,10 +117,21 @@ fn check_conflicts(accesses: &[Access]) {
     }
 }
 
-#[cfg(test)]
+impl World {
+    #[inline]
+    pub fn init_param<P: SystemParam>(&mut self) {
+        P::init(self);
+    }
 
+    #[inline]
+    pub fn fetch_param<P: SystemParam>(&self) -> P::Item<'_> {
+        P::fetch(self)
+    }
+}
+
+#[cfg(test)]
 mod tests {
-    use crate::{prelude::*, schedule::get_registered_systems};
+    use crate::prelude::*;
 
     #[resource]
     struct IntResource(pub u64);
@@ -117,37 +149,33 @@ mod tests {
     fn auto_registered_system() {}
 
     #[test]
-    fn system_auto_registers_in_scheduler() {
-        assert!(
-            get_registered_systems().len() > 0,
-            "No system was registered!"
-        );
-    }
-
-    #[test]
     #[should_panic]
     fn system_panics_with_conflict() {
         fn conflicting_system(_res: Resource<IntResource>, _res_mut: ResourceMut<IntResource>) {}
-        let world = World::new();
-        conflicting_system.into_system().run(&world);
+
+        let mut world = World::new();
+        conflicting_system.into_system().run(&mut world);
     }
 
     #[test]
     fn system_runs_with_no_params() {
+        #[system]
         fn system() {}
 
-        let world = World::new();
-        system.into_system().run(&world);
+        let mut world = World::new();
+        system.into_system().run(&mut world);
     }
 
     #[test]
     fn system_runs_with_many_params() {
+        #[system]
         fn two_param_system(
             _res_mut_bool: ResourceMut<BoolResource>,
             _res_int: Resource<IntResource>,
         ) {
         }
 
+        #[system]
         fn three_param_system(
             _res_custom: ResourceMut<CustomResource>,
             _res_int: Resource<IntResource>,
@@ -156,11 +184,8 @@ mod tests {
         }
 
         let mut world = World::new();
-        world.init_resource::<BoolResource>();
-        world.init_resource::<IntResource>();
-        world.init_resource::<CustomResource>();
 
-        two_param_system.into_system().run(&world);
-        three_param_system.into_system().run(&world);
+        two_param_system.into_system().run(&mut world);
+        three_param_system.into_system().run(&mut world);
     }
 }

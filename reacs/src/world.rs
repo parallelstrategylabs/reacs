@@ -1,33 +1,28 @@
 use std::{
     any::Any,
     cell::{Ref, RefCell, RefMut},
-    collections::HashMap,
 };
 
-use crate::{direct_map::DirectMap, hashed::Hashed, registry::get_registry_entry};
+use crate::{
+    hashed::Hashed,
+    schedule::get_registered_systems,
+};
 pub struct World {
-    pub(crate) table: HashMap<u128, u32>,
-    pub(crate) storage: Vec<Box<RefCell<dyn Any>>>,
+    pub resources: Vec<(u128, Box<RefCell<dyn Any>>)>,
 }
 
 impl World {
     #[inline]
     pub fn new() -> Self {
-        Self {
-            table: HashMap::new(),
-            storage: Vec::new(),
-        }
-    }
+        let mut world = Self {
+            resources: Vec::new(),
+        };
 
-    #[inline]
-    pub fn insert_resource<R: 'static + Hashed>(&mut self, resource: R) {
-        let id = R::TYPE_UUID;
-        if let Some(&index) = self.table.get(&id) {
-            self.storage[index as usize] = Box::new(RefCell::new(resource));
-        } else {
-            self.table.insert(R::TYPE_UUID, self.storage.len() as u32);
-            self.storage.push(Box::new(RefCell::new(resource)));
+        for system in get_registered_systems().iter_mut() {
+            system.init(&mut world);
         }
+
+        world
     }
 
     #[inline]
@@ -38,107 +33,55 @@ impl World {
     }
 
     #[inline]
-    pub fn remove_resource<R: 'static + Hashed>(&mut self) -> bool {
-        let Some(index) = self.table.remove(&R::TYPE_UUID) else {
-            return false;
-        };
-        self.storage.swap_remove(index as usize);
+    pub fn insert_resource<R: 'static + Hashed>(&mut self, resource: R) {
+        let id = R::TYPE_UUID;
+        let search_result = self.resources.binary_search_by(|x| x.0.cmp(&id));
+        let new_resource = Box::new(RefCell::new(resource));
 
-        let old_last = self.storage.len() as u32;
-        if index != old_last {
-            for slot in self.table.values_mut() {
-                if *slot == old_last {
-                    *slot = index;
-                    break;
-                }
-            }
+        match search_result {
+            Ok(i) => self.resources[i].1 = new_resource,
+            Err(i) => self.resources.insert(i, (id, new_resource)),
         }
-        true
+    }
+
+    #[inline]
+    pub fn remove_resource<R: 'static + Hashed>(&mut self) -> bool {
+        let id = R::TYPE_UUID;
+        let search_result = self.resources.binary_search_by(|x| x.0.cmp(&id));
+
+        if let Some(i) = search_result.ok() {
+            self.resources.remove(i);
+        }
+
+        search_result.is_ok()
     }
 
     #[inline]
     pub fn has_resource<R: 'static + Hashed>(&self) -> bool {
         let id = R::TYPE_UUID;
-        self.table.contains_key(&id)
+        self.resources.binary_search_by(|x| x.0.cmp(&id)).is_ok()
     }
 
     #[inline]
     pub fn get_resource<R: 'static + Hashed>(&self) -> Option<Ref<'_, R>> {
         let id = R::TYPE_UUID;
-        let index = *self.table.get(&id)?;
-        let storage_cell = self.storage.get(index as usize)?;
-        let borrow = storage_cell.borrow();
-        Ref::filter_map(borrow, |any| any.downcast_ref::<R>()).ok()
+        let i = self.resources.binary_search_by(|x| x.0.cmp(&id)).ok()?;
+        Ref::filter_map(self.resources[i].1.borrow(), |any| any.downcast_ref::<R>()).ok()
     }
 
     #[inline]
-    pub fn get_resource_mut<R: 'static + Hashed>(&mut self) -> Option<RefMut<'_, R>> {
+    pub fn get_resource_mut<R: 'static + Hashed>(&self) -> Option<RefMut<'_, R>> {
         self.get_resource_mut_silent::<R>()
     }
 
     #[inline]
     pub(crate) fn get_resource_mut_silent<R: 'static + Hashed>(&self) -> Option<RefMut<'_, R>> {
         let id = R::TYPE_UUID;
-        let index = *self.table.get(&id)?;
-        let storage_cell = self.storage.get(index as usize)?;
-
-        let borrow = storage_cell.borrow_mut();
-        RefMut::filter_map(borrow, |any| any.downcast_mut::<R>()).ok()
-    }
-
-    #[inline]
-    pub fn init_component<C: 'static + Copy + Default + Hashed>(&mut self) {
-        let id = DirectMap::<C>::TYPE_UUID;
-        get_registry_entry(id).unwrap_or_else(|| {
-            let type_name = std::any::type_name::<C>();
-            panic!("Component `{type_name}` not registered, try using #[component] {type_name}!")
-        });
-
-        if !self.has_resource::<DirectMap<C>>() {
-            self.insert_resource(DirectMap::<C>::new());
-        }
-    }
-
-    #[inline]
-    pub fn get_component_map<C: 'static + Copy + Default + Hashed>(&self) -> Ref<'_, DirectMap<C>> {
-        self.get_resource::<DirectMap<C>>().unwrap_or_else(|| {
-            panic!(
-                "Component `{}` not initialized, call init_component first!",
-                std::any::type_name::<C>()
-            )
+        let i = self.resources.binary_search_by(|x| x.0.cmp(&id)).ok()?;
+        RefMut::filter_map(self.resources[i].1.borrow_mut(), |any| {
+            any.downcast_mut::<R>()
         })
-    }
-
-    #[inline]
-    pub fn get_component_map_mut<C: 'static + Copy + Default + Hashed>(
-        &mut self,
-    ) -> RefMut<'_, DirectMap<C>> {
-        self.get_resource_mut::<DirectMap<C>>().unwrap_or_else(|| {
-            panic!(
-                "Component `{}` not initialized, call init_component first!",
-                std::any::type_name::<C>()
-            )
-        })
-    }
-
-    #[inline]
-    pub fn set_component<C: 'static + Copy + Default + Hashed>(&mut self, key: usize, value: C) {
-        self.get_component_map_mut::<C>().insert(key, value);
-    }
-
-    #[inline]
-    pub fn remove_component<C: 'static + Copy + Default + Hashed>(&mut self, key: usize) {
-        self.get_component_map_mut::<C>().remove(key);
-    }
-
-    #[inline]
-    pub fn get_component<C: 'static + Copy + Default + Hashed>(&self, key: usize) -> Option<C> {
-        self.get_component_map().get(key).copied()
-    }
-
-    #[inline]
-    pub fn has_component<C: 'static + Copy + Default + Hashed>(&self, key: usize) -> bool {
-        self.get_component_map::<C>().has(key)
+        .ok()
     }
 }
 
@@ -147,7 +90,6 @@ pub struct StoredSerializer {
 }
 
 #[cfg(test)]
-
 mod tests {
     use crate::prelude::*;
 

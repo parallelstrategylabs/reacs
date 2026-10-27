@@ -2,13 +2,13 @@ use std::{any::Any, collections::HashMap, ptr::addr_of_mut};
 use std::collections::hash_map::Entry as MapEntry;
 
 #[derive(Debug)]
-pub struct Entry {
+pub struct RegistryEntry {
     pub type_name: &'static str,
     pub serialize: fn(&dyn Any) -> Vec<u8>,
     pub deserialize: fn(&[u8]) -> Box<dyn Any>,
 }
 
-static mut REGISTRY: Option<HashMap<u128, Entry>> = None;
+pub static mut REGISTRY: Option<HashMap<u128, RegistryEntry>> = None;
 
 pub fn register_entry<T>(id: u128)
 where
@@ -24,7 +24,7 @@ where
                 std::any::type_name::<T>(),
             ),
             MapEntry::Vacant(slot) => {
-                slot.insert(Entry {
+                slot.insert(RegistryEntry {
                     type_name: std::any::type_name::<T>(),
                     serialize: |v| bincode::serialize(v.downcast_ref::<T>().unwrap()).unwrap(),
                     deserialize: |b| Box::new(bincode::deserialize::<T>(b).unwrap()),
@@ -34,7 +34,7 @@ where
     }
 }
 
-pub fn get_registry_entry(id: u128) -> Option<&'static Entry> {
+pub fn get_registry_entry(id: u128) -> Option<&'static RegistryEntry> {
     unsafe {
         let ptr = addr_of_mut!(REGISTRY);
         (*ptr).as_ref()?.get(&id)
@@ -42,7 +42,6 @@ pub fn get_registry_entry(id: u128) -> Option<&'static Entry> {
 }
 
 #[cfg(test)]
-
 mod tests {
     use crate::{direct_map::DirectMap, prelude::*, registry::get_registry_entry};
 
