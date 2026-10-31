@@ -4,6 +4,8 @@ use syn::{
     DeriveInput, FnArg, GenericParam, ItemFn, parse_macro_input, parse_quote, spanned::Spanned,
 };
 
+mod param_impl;
+
 #[proc_macro_derive(Hashed)]
 pub fn derive_hashed_def(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -140,4 +142,11 @@ pub fn system(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     TokenStream::from(expanded)
+}
+
+#[proc_macro_attribute]
+pub fn param(attr: TokenStream, item: TokenStream) -> TokenStream {
+    param_impl::expand(attr.into(), item.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
 }

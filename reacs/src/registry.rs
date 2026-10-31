@@ -1,5 +1,5 @@
-use std::{any::Any, collections::HashMap, ptr::addr_of_mut};
 use std::collections::hash_map::Entry as MapEntry;
+use std::{any::Any, collections::HashMap, ptr::addr_of_mut};
 
 #[derive(Debug)]
 pub struct RegistryEntry {

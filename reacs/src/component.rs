@@ -1,59 +1,11 @@
-use crate::{direct_map::DirectMap, prelude::*, registry::get_registry_entry, schedule::Access};
-use std::{
-    any::{TypeId, type_name},
-    cell::{Ref, RefMut},
-};
+use reacs_derive::param;
 
-pub struct Component<'w, C: Default + Copy> {
-    pub map: Resource<'w, DirectMap<C>>,
-}
+use crate::{direct_map::DirectMap, prelude::*, registry::get_registry_entry};
+use std::cell::{Ref, RefMut};
 
-pub struct ComponentMut<'w, C: Default + Copy> {
-    pub map: ResourceMut<'w, DirectMap<C>>,
-}
-
-impl<C: 'static + Default + Copy + Hashed> SystemParam for Component<'_, C> {
-    type Item<'w> = Component<'w, C>;
-
-    fn init(world: &mut World) {
-        Resource::<DirectMap<C>>::init(world);
-    }
-
-    fn fetch<'w>(world: &'w World) -> Self::Item<'w> {
-        Component {
-            map: Resource::fetch(world),
-        }
-    }
-
-    fn access() -> crate::schedule::Access {
-        Access {
-            type_id: TypeId::of::<C>(),
-            type_name: type_name::<C>(),
-            mutable: false,
-        }
-    }
-}
-
-impl<C: 'static + Default + Copy + Hashed> SystemParam for ComponentMut<'_, C> {
-    type Item<'w> = ComponentMut<'w, C>;
-
-    fn init(world: &mut World) {
-        ResourceMut::<DirectMap<C>>::init(world);
-    }
-
-    fn fetch<'w>(world: &'w World) -> Self::Item<'w> {
-        ComponentMut {
-            map: ResourceMut::<DirectMap<C>>::fetch(world),
-        }
-    }
-
-    fn access() -> crate::schedule::Access {
-        Access {
-            type_id: TypeId::of::<C>(),
-            type_name: type_name::<C>(),
-            mutable: true,
-        }
-    }
+#[param]
+pub struct Component<C: Default + Copy + Hashed> {
+    pub map: Resource<DirectMap<C>>,
 }
 
 impl World {
@@ -115,7 +67,7 @@ impl World {
 
 #[cfg(test)]
 mod tests {
-    use crate::prelude::*;
+    use crate::{prelude::*, schedule::Mut};
 
     #[component]
     struct IntComponent(pub i32);
@@ -125,8 +77,8 @@ mod tests {
         const KEY: usize = 18;
 
         #[system]
-        fn write(mut c_int: ComponentMut<IntComponent>) {
-            c_int.map.insert(KEY, IntComponent(967));
+        fn write(mut c_int: Mut<Component<IntComponent>>) {
+            c_int.insert(KEY, IntComponent(967));
         }
         #[system]
         fn check(c: Component<IntComponent>) {
@@ -144,8 +96,8 @@ mod tests {
         const KEY: usize = 7;
 
         #[system]
-        fn remove(mut c_int: ComponentMut<IntComponent>) {
-            c_int.map.remove(KEY);
+        fn remove(mut c_int: Mut<Component<IntComponent>>) {
+            c_int.remove(KEY);
         }
         #[system]
         fn check(c: Component<IntComponent>) {

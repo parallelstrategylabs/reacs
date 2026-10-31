@@ -167,6 +167,7 @@ name = "reacs-derive"
 version = "0.1.0"
 dependencies = [
  "ctor",
+ "proc-macro2",
  "quote",
  "serde",
  "sha2",

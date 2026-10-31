@@ -63,7 +63,7 @@ impl BitSet {
         }
         self.words[index] = word;
     }
-    
+
     #[inline]
     pub fn clear(&mut self) {
         self.words.fill(0);

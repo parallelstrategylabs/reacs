@@ -3,10 +3,7 @@ use std::{
     cell::{Ref, RefCell, RefMut},
 };
 
-use crate::{
-    hashed::Hashed,
-    schedule::get_registered_systems,
-};
+use crate::{hashed::Hashed, schedule::get_registered_systems};
 pub struct World {
     pub resources: Vec<(u128, Box<RefCell<dyn Any>>)>,
 }

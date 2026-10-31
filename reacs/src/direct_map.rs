@@ -32,7 +32,7 @@ impl<T: Copy + Default> DirectMap<T> {
             let new_size = (key + 1).next_power_of_two();
             self.values.resize(new_size, T::default());
         }
-        
+
         self.values[key] = value;
     }
 
