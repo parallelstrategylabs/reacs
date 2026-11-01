@@ -63,7 +63,6 @@ fn add_static(tp: &mut TypeParam) {
     }
 }
 
-/// `Some(T)` when the type is exactly one of the struct's own type parameters.
 fn leaf_ident(ty: &Type, params: &[Ident]) -> Option<Ident> {
     match ty {
         Type::Path(p) if p.qself.is_none() => {
@@ -73,7 +72,6 @@ fn leaf_ident(ty: &Type, params: &[Ident]) -> Option<Ident> {
     }
 }
 
-/// `Resource<DirectMap<C>>` -> `Resource<'lt, DirectMap<C>, MODE>`
 fn rewrite_path(ty: &Type, lt: &Lifetime, mode: &Type) -> syn::Result<Type> {
     let Type::Path(path) = ty else {
         return Err(syn::Error::new(
@@ -191,13 +189,11 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
         ));
     }
 
-    // ---- generics ------------------------------------------------------------------------
     let mut base = input.generics.clone();
     for tp in base.type_params_mut() {
         add_static(tp);
     }
 
-    // Struct: Name<'w, T: 'static, M: Mode = Read>
     let mut struct_generics = base.clone();
     struct_generics.params.insert(0, parse_quote!('w));
     struct_generics
@@ -207,7 +203,6 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
 
     let ty_with = |lt: &Lifetime, mode: &Type| quote!(#name<#lt, #(#user_args,)* #mode>);
 
-    // ---- WithMode (makes `Mut<Name>` work) ----------------------------------------------
     let with_mode = if modes != Modes::Read {
         let mut g = base.clone();
         g.params.insert(0, parse_quote!('w));
@@ -227,7 +222,6 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
         None
     };
 
-    // ---- Deref / DerefMut (single-field structs only) ------------------------------------
     let deref = if infos.len() == 1 {
         let info = &infos[0];
         let f_ty = rewrite_path(&info.ty, &w, &mode_of(info.pin, &m))?;
@@ -272,7 +266,6 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
         None
     };
 
-    // ---- SystemParam ---------------------------------------------------------------------
     let (sp_mode, sp_mode_param): (Type, Option<GenericParam>) = match modes {
         Modes::Both => (
             parse_quote!(M),

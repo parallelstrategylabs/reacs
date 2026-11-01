@@ -1,6 +1,7 @@
 use std::ops::{Deref, DerefMut};
 
 use reacs_derive::{param, resource};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     direct_map::DirectMap,
@@ -10,6 +11,9 @@ use crate::{
     world::World,
 };
 
+#[derive(
+    Clone, Copy, Default, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub struct Entity {
     bits: u64,
 }

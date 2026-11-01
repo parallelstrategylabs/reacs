@@ -5,7 +5,7 @@ pub trait Hashed {
 }
 
 const OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
-const PRIME: u128 = 0x0000000001000000000000000000013B;
+pub const PRIME: u128 = 0x0000000001000000000000000000013B;
 
 const fn fnv(mut h: u128, bytes: &[u8]) -> u128 {
     let mut i = 0;

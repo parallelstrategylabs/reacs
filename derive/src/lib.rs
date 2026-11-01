@@ -150,3 +150,51 @@ pub fn param(attr: TokenStream, item: TokenStream) -> TokenStream {
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
+
+#[proc_macro_attribute]
+pub fn signal(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as DeriveInput);
+    let name = &input.ident;
+
+    if !input.generics.params.is_empty() {
+        return syn::Error::new(
+            input.generics.span(),
+            "#[signal] does not support generic signals",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let snake_name = format_ident!("{}", name.to_string().to_lowercase());
+    let ctor_fn = format_ident!("__register_signal_{}", snake_name);
+
+    let expanded = quote! {
+        #[derive(
+            ::core::default::Default,
+            ::reacs::hashed::Hashed,
+            ::core::clone::Clone,
+            ::core::marker::Copy,
+            ::serde::Serialize,
+            ::serde::Deserialize,
+        )]
+        #input
+
+        impl ::reacs::signal::SignalType for #name {}
+
+        #[::ctor::ctor]
+        #[allow(non_snake_case)]
+        fn #ctor_fn() {
+            type Signals = ::reacs::signal::Signals<#name>;
+            type Data = ::reacs::signal::SignalData<#name>;
+            ::reacs::registry::register_entry::<Signals>(
+                <Signals as ::reacs::hashed::Hashed>::TYPE_UUID,
+            );
+            ::reacs::registry::register_entry::<Data>(
+                <Data as ::reacs::hashed::Hashed>::TYPE_UUID,
+            );
+            ::reacs::signal::register_signal::<#name>();
+        }
+    };
+
+    TokenStream::from(expanded)
+}
