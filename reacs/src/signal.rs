@@ -16,10 +16,8 @@ use crate::{
     world::World,
 };
 
-/// Implemented by `#[signal]`. Named `SignalType` so `Signal` can be the system param.
 pub trait SignalType: 'static + Copy + Default + Hashed + Serialize + DeserializeOwned {}
 
-/// Half-open tick window `[start, end)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignalWindow {
     pub start: u64,
@@ -59,20 +57,15 @@ pub struct SignalInstance<S> {
 #[derive(Default, Hashed, Serialize, Deserialize)]
 #[serde(bound = "")]
 pub struct SignalData<S: SignalType> {
-    /// Id of the first transient signal not yet received.
     pub cursor: u64,
-    /// Id handed to the next sent signal.
     pub next: u64,
     phantom: PhantomData<S>,
 }
 
-/// All lists are kept sorted by id: ids are monotonic and `cleanup` merges preserving order.
 #[derive(Default, Hashed, Serialize, Deserialize)]
 #[serde(bound = "")]
 pub struct Signals<S: SignalType> {
-    /// Sent last tick, still readable by systems that ran before the sender.
     pub transient: Vec<SignalInstance<S>>,
-    /// Sent this tick.
     pub transient_buffer: Vec<SignalInstance<S>>,
 
     pub transitory_active: Vec<(SignalWindow, SignalInstance<S>)>,
@@ -83,7 +76,6 @@ pub struct Signals<S: SignalType> {
 }
 
 impl<S: SignalType> Signals<S> {
-    /// Returns `None` when the window is empty or already over.
     pub fn send(
         &mut self,
         data: &mut SignalData<S>,
@@ -101,12 +93,10 @@ impl<S: SignalType> Signals<S> {
         };
         data.next += 1;
 
-        // Delivered this tick.
         if window.start <= tick {
             self.transient_buffer.push(instance);
         }
 
-        // Still has ticks left after this one.
         if window.end > tick + 1 {
             self.transitory_inactive.push((window, instance));
         }
@@ -114,7 +104,6 @@ impl<S: SignalType> Signals<S> {
         Some(instance.id)
     }
 
-    /// Modifies a pending or active transitory signal. Transient copies are not affected.
     pub fn modify(&mut self, id: u64) -> Option<&mut S> {
         for list in [&mut self.transitory_active, &mut self.transitory_inactive] {
             if let Ok(i) = list.binary_search_by(|x| x.1.id.cmp(&id)) {
@@ -146,8 +135,6 @@ impl<S: SignalType> Signals<S> {
             .chain(self.transitory_active.iter().map(|x| &x.1.payload))
     }
 
-    /// End of `tick`: rotates the transient buffers and merges the transitory lists.
-    /// Must run before the global `Tick` advances.
     pub fn cleanup(&mut self, tick: u64) {
         std::mem::swap(&mut self.transient, &mut self.transient_buffer);
         self.transient_buffer.clear();
@@ -214,7 +201,6 @@ impl<S: SignalType> Signals<S> {
     }
 }
 
-/// Sends and receives signals of type `S`. Write only: receiving advances the cursor.
 #[param(write)]
 pub struct Signal<S: SignalType> {
     pub signals: Resource<Signals<S>>,
@@ -224,8 +210,6 @@ pub struct Signal<S: SignalType> {
 }
 
 impl<'w, S: SignalType> Signal<'w, S, Write> {
-    /// Sends `signal`, delivered on every tick inside `window` (absolute ticks).
-    /// Returns the signal id, or `None` if the window is empty or already over.
     #[inline]
     pub fn send(&mut self, signal: S, window: impl RangeBounds<u64>) -> Option<u64> {
         let tick = self.tick();
@@ -237,7 +221,6 @@ impl<'w, S: SignalType> Signal<'w, S, Write> {
         )
     }
 
-    /// Sends `signal` for the current tick only.
     #[inline]
     pub fn emit(&mut self, signal: S) -> u64 {
         let tick = self.tick();
@@ -250,7 +233,6 @@ impl<'w, S: SignalType> Signal<'w, S, Write> {
         self.signals.modify(id)
     }
 
-    /// Unread transient signals followed by every active transitory signal.
     #[inline]
     pub fn receive(&mut self) -> impl Iterator<Item = &S> {
         self.signals.receive(&mut self.data)
@@ -264,7 +246,6 @@ impl<'w, S: SignalType> Signal<'w, S, Write> {
 
 pub static mut SIGNAL_REGISTRY: Option<Vec<fn(&World)>> = None;
 
-/// Called by `#[signal]` so `World::cleanup_signals` can reach every signal type.
 pub fn register_signal<S: SignalType>() {
     unsafe {
         let ptr = addr_of_mut!(SIGNAL_REGISTRY);
@@ -309,14 +290,11 @@ impl World {
         self.fetch_param::<Mut<Signal<S>>>()
     }
 
-    /// Ends the tick for one signal type. No-op if it was never initialized.
     #[inline]
     pub fn cleanup_signal<S: SignalType>(&self) {
         cleanup_in_world::<S>(self);
     }
 
-    /// Ends the tick for every initialized signal type. Call once per tick, after all
-    /// systems and before advancing the global `Tick`.
     #[inline]
     pub fn cleanup_signals(&self) {
         for cleanup in get_registered_signals() {
@@ -355,7 +333,6 @@ mod tests {
         world.signal::<NumSignal>().receive().map(|s| s.0).collect()
     }
 
-    /// Runs `ticks` ticks, returning what one receive per tick saw.
     fn run_ticks(world: &World, ticks: u64) -> Vec<Vec<u64>> {
         (0..ticks)
             .map(|_| {
@@ -487,12 +464,10 @@ mod tests {
             .send(NumSignal(1), 1..3)
             .unwrap();
 
-        // Pending (inactive).
         *world.signal::<NumSignal>().modify(id).unwrap() = NumSignal(2);
         end_tick(&world);
         assert_eq!(receive(&world), vec![2]);
 
-        // Active.
         *world.signal::<NumSignal>().modify(id).unwrap() = NumSignal(3);
         assert_eq!(receive(&world), vec![3]);
 
@@ -532,7 +507,6 @@ mod tests {
             .iter()
             .map(|x| x.1.payload.0)
             .collect();
-        // Tick 4: 0, 1, 3 still open; 102 (3..5) and 103 (4..6) active; 104 (5..7) pending.
         assert_eq!(active, vec![0, 1, 3, 102, 103]);
     }
 
