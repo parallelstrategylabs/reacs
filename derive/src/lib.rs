@@ -1,7 +1,8 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    DeriveInput, FnArg, GenericParam, ItemFn, parse_macro_input, parse_quote, spanned::Spanned,
+    DeriveInput, FnArg, GenericParam, ItemFn, Path, parse_macro_input, parse_quote,
+    spanned::Spanned,
 };
 
 mod param_impl;
@@ -108,8 +109,26 @@ pub fn component(_attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 #[proc_macro_attribute]
-pub fn system(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn system(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let mut run_before: Vec<Path> = Vec::new();
+    let mut run_after: Vec<Path> = Vec::new();
+    let attr_parser = syn::meta::parser(|meta| {
+        let targets = if meta.path.is_ident("run_before") {
+            &mut run_before
+        } else if meta.path.is_ident("run_after") {
+            &mut run_after
+        } else {
+            return Err(meta.error("expected `run_before(...)` or `run_after(...)`"));
+        };
+        meta.parse_nested_meta(|target| {
+            targets.push(target.path);
+            Ok(())
+        })
+    });
+    parse_macro_input!(attr with attr_parser);
+
     let input = parse_macro_input!(item as ItemFn);
+    let vis = &input.vis;
     let name = &input.sig.ident;
     let name_str = name.to_string();
     let ctor_fn = format_ident!("__register_system_{}", name);
@@ -132,13 +151,24 @@ pub fn system(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let expanded = quote! {
         #input
 
+        #[allow(non_camel_case_types, dead_code)]
+        #vis enum #name {}
+
+        impl ::reacs::schedule::SystemId for #name {
+            const UUID: u128 = ::reacs::hashed::hash_path(::core::module_path!(), #name_str);
+        }
+
         #[::ctor::ctor]
         #[allow(non_snake_case)]
         fn #ctor_fn() {
+            #( let _ = #run_before; )*
+            #( let _ = #run_after; )*
             let f: for<'w> fn(#(<#param_types as ::reacs::schedule::SystemParam>::Item<'w>),*) = #name;
             ::reacs::schedule::register_system(
                 ::reacs::schedule::IntoSystem::into_system(f)
                     .named(::core::module_path!(), #name_str)
+                    .run_before(&[#(<#run_before as ::reacs::schedule::SystemId>::UUID),*])
+                    .run_after(&[#(<#run_after as ::reacs::schedule::SystemId>::UUID),*])
             );
         }
     };

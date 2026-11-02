@@ -2,6 +2,8 @@ use crate::hashed::{Hashed, hash_path};
 use crate::world::World;
 
 use std::cell::{Ref, RefMut};
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::ops::Deref;
 use std::ptr::{addr_of, addr_of_mut};
 
@@ -19,10 +21,16 @@ pub fn system_graph() -> &'static SystemGraph {
 
 const ANONYMOUS_SYSTEM: u128 = 0;
 
+pub trait SystemId {
+    const UUID: u128;
+}
+
 pub struct SystemEntry {
     pub uuid: u128,
     pub module: &'static str,
     pub name: &'static str,
+    pub before: Vec<u128>,
+    pub after: Vec<u128>,
     pub init_fn: Box<dyn Fn(&mut World)>,
     pub run_fn: Box<dyn Fn(&mut World)>,
 }
@@ -32,6 +40,16 @@ impl SystemEntry {
         self.uuid = hash_path(module, name);
         self.module = module;
         self.name = name;
+        self
+    }
+
+    pub fn run_before(mut self, targets: &[u128]) -> Self {
+        self.before.extend_from_slice(targets);
+        self
+    }
+
+    pub fn run_after(mut self, targets: &[u128]) -> Self {
+        self.after.extend_from_slice(targets);
         self
     }
 
@@ -60,12 +78,83 @@ impl SystemGraph {
             system.name
         );
 
-        match self.nodes.binary_search_by_key(&system.uuid, |x| x.uuid) {
-            Ok(i) => panic!(
+        if let Some(other) = self.nodes.iter().find(|x| x.uuid == system.uuid) {
+            panic!(
                 "system id collision: `{}::{}` and `{}::{}` share id {:#034x}",
-                self.nodes[i].module, self.nodes[i].name, system.module, system.name, system.uuid
-            ),
-            Err(i) => self.nodes.insert(i, system),
+                other.module, other.name, system.module, system.name, system.uuid
+            );
+        }
+
+        self.nodes.push(system);
+        self.sort();
+    }
+
+    fn sort(&mut self) {
+        self.nodes.sort_unstable_by_key(|x| x.uuid);
+
+        let count = self.nodes.len();
+        let mut successors = vec![Vec::new(); count];
+        let mut blockers = vec![0usize; count];
+
+        let index_of = |uuid: &u128| self.nodes.binary_search_by_key(uuid, |x| x.uuid).ok();
+        for (i, system) in self.nodes.iter().enumerate() {
+            for next in system.before.iter().filter_map(index_of) {
+                successors[i].push(next);
+                blockers[next] += 1;
+            }
+            for previous in system.after.iter().filter_map(index_of) {
+                successors[previous].push(i);
+                blockers[i] += 1;
+            }
+        }
+
+        let mut ready: BinaryHeap<_> = (0..count)
+            .filter(|&i| blockers[i] == 0)
+            .map(Reverse)
+            .collect();
+        let mut order = Vec::with_capacity(count);
+
+        while let Some(Reverse(i)) = ready.pop() {
+            order.push(i);
+            for &next in &successors[i] {
+                blockers[next] -= 1;
+                if blockers[next] == 0 {
+                    ready.push(Reverse(next));
+                }
+            }
+        }
+
+        if order.len() != count {
+            panic!(
+                "system ordering cycle: {}",
+                self.describe_cycle(&successors, &blockers)
+            );
+        }
+
+        let mut slots: Vec<_> = self.nodes.drain(..).map(Some).collect();
+        self.nodes
+            .extend(order.into_iter().map(|i| slots[i].take().unwrap()));
+    }
+
+    fn describe_cycle(&self, successors: &[Vec<usize>], blockers: &[usize]) -> String {
+        let start = blockers.iter().position(|&count| count > 0).unwrap();
+        let mut path = vec![start];
+
+        loop {
+            let current = path[path.len() - 1];
+            let previous = (0..self.nodes.len())
+                .find(|&i| blockers[i] > 0 && successors[i].contains(&current))
+                .unwrap();
+
+            if let Some(first) = path.iter().position(|&i| i == previous) {
+                return std::iter::once(&previous)
+                    .chain(path[first..].iter().rev())
+                    .map(|&i| format!("`{}::{}`", self.nodes[i].module, self.nodes[i].name))
+                    .collect::<Vec<_>>()
+                    .join(" -> ");
+            }
+
+            path.push(previous);
         }
     }
 
@@ -111,6 +200,8 @@ macro_rules! impl_into_system_tuples {
                     uuid: ANONYMOUS_SYSTEM,
                     module: "",
                     name: std::any::type_name::<F>(),
+                    before: Vec::new(),
+                    after: Vec::new(),
                     init_fn: Box::new(move |world: &mut World| {
                         $( $param::init(world); )*
                     }),
@@ -346,7 +437,15 @@ mod tests {
 
     #[test]
     fn registered_systems_stay_sorted_by_uuid() {
-        let uuids: Vec<u128> = system_graph().iter().map(|s| s.uuid).collect();
+        let targets: Vec<u128> = system_graph()
+            .iter()
+            .flat_map(|s| s.before.iter().chain(&s.after).copied())
+            .collect();
+        let uuids: Vec<u128> = system_graph()
+            .iter()
+            .filter(|s| s.before.is_empty() && s.after.is_empty() && !targets.contains(&s.uuid))
+            .map(|s| s.uuid)
+            .collect();
 
         assert!(uuids.len() >= UUID_ORDER.len());
         assert!(uuids.windows(2).all(|w| w[0] < w[1]));
@@ -475,5 +574,235 @@ mod tests {
         world.remove_resource::<ExecLog>();
 
         graph.run(&mut world);
+    }
+
+    fn id(name: &str) -> u128 {
+        hash_path(module_path!(), name)
+    }
+
+    fn entry(name: &'static str, before: &[&str], after: &[&str]) -> SystemEntry {
+        let mut entry = logging_entries()
+            .into_iter()
+            .find(|e| e.name == name)
+            .unwrap();
+        entry.before = before.iter().map(|n| id(n)).collect();
+        entry.after = after.iter().map(|n| id(n)).collect();
+        entry
+    }
+
+    fn names(graph: &SystemGraph) -> Vec<&'static str> {
+        graph.iter().map(|s| s.name).collect()
+    }
+
+    fn graph_of(entries: Vec<SystemEntry>) -> SystemGraph {
+        let mut graph = SystemGraph::new();
+        for entry in entries {
+            graph.insert(entry);
+        }
+        graph
+    }
+
+    #[test]
+    fn run_after_overrides_uuid_order() {
+        let graph = graph_of(vec![
+            entry("physics", &[], &["render"]),
+            entry("input", &[], &[]),
+            entry("logic", &[], &[]),
+            entry("audio", &[], &[]),
+            entry("render", &[], &[]),
+        ]);
+
+        assert_eq!(
+            names(&graph),
+            ["input", "logic", "audio", "render", "physics"]
+        );
+    }
+
+    #[test]
+    fn run_before_overrides_uuid_order() {
+        let graph = graph_of(vec![
+            entry("physics", &[], &[]),
+            entry("input", &[], &[]),
+            entry("logic", &[], &[]),
+            entry("audio", &[], &[]),
+            entry("render", &["physics"], &[]),
+        ]);
+
+        assert_eq!(
+            names(&graph),
+            ["input", "logic", "audio", "render", "physics"]
+        );
+    }
+
+    #[test]
+    fn uuid_breaks_ties_between_unordered_systems() {
+        let graph = graph_of(vec![
+            entry("physics", &[], &[]),
+            entry("input", &[], &[]),
+            entry("logic", &[], &[]),
+            entry("audio", &["input"], &[]),
+            entry("render", &[], &[]),
+        ]);
+
+        assert_eq!(
+            names(&graph),
+            ["physics", "logic", "audio", "input", "render"]
+        );
+    }
+
+    #[test]
+    fn ordering_is_transitive() {
+        let graph = graph_of(vec![
+            entry("render", &["audio"], &[]),
+            entry("audio", &[], &[]),
+            entry("logic", &[], &["audio"]),
+            entry("input", &["render"], &[]),
+            entry("physics", &[], &["logic"]),
+        ]);
+
+        assert_eq!(
+            names(&graph),
+            ["input", "render", "audio", "logic", "physics"]
+        );
+    }
+
+    #[test]
+    fn insertion_order_never_changes_constrained_order() {
+        let expected = ["input", "render", "audio", "logic", "physics"];
+
+        for order in permutations(&[0, 1, 2, 3, 4]) {
+            let mut slots: Vec<_> = vec![
+                entry("render", &["audio"], &[]),
+                entry("audio", &[], &[]),
+                entry("logic", &[], &["audio"]),
+                entry("input", &["render"], &[]),
+                entry("physics", &[], &["logic"]),
+            ]
+            .into_iter()
+            .map(Some)
+            .collect();
+
+            let mut graph = SystemGraph::new();
+            for &i in &order {
+                graph.insert(slots[i].take().unwrap());
+            }
+
+            assert_eq!(names(&graph), expected, "insertion order {order:?}");
+        }
+    }
+
+    #[test]
+    fn constrained_graph_runs_in_stored_order() {
+        let graph = graph_of(vec![
+            entry("physics", &[], &["render"]),
+            entry("render", &[], &[]),
+        ]);
+        let mut world = World::new();
+
+        graph.run(&mut world);
+
+        assert_eq!(
+            world.get_resource::<ExecLog>().unwrap().0,
+            ["render", "physics"]
+        );
+    }
+
+    #[test]
+    fn targets_outside_the_graph_are_ignored() {
+        let graph = graph_of(vec![
+            entry("physics", &[], &["audio"]),
+            entry("input", &["audio"], &[]),
+        ]);
+
+        assert_eq!(names(&graph), ["physics", "input"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "system ordering cycle: `reacs::schedule::tests::input` -> ")]
+    fn ordering_cycle_panics() {
+        graph_of(vec![
+            entry("input", &["logic"], &[]),
+            entry("logic", &["input"], &[]),
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "system ordering cycle")]
+    fn longer_ordering_cycle_panics() {
+        graph_of(vec![
+            entry("input", &["logic"], &[]),
+            entry("logic", &["audio"], &[]),
+            entry("audio", &["input"], &[]),
+            entry("render", &[], &["audio"]),
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "system ordering cycle")]
+    fn system_ordered_against_itself_panics() {
+        graph_of(vec![entry("input", &["input"], &[])]);
+    }
+
+    #[test]
+    #[should_panic(expected = "system ordering cycle")]
+    fn before_and_after_same_target_panics() {
+        graph_of(vec![
+            entry("input", &["logic"], &["logic"]),
+            entry("logic", &[], &[]),
+        ]);
+    }
+
+    mod ordered {
+        use crate::prelude::*;
+
+        #[system]
+        pub fn nested_first() {}
+    }
+
+    use ordered::nested_first as renamed_first;
+
+    #[system]
+    fn ordered_group() {}
+
+    #[system(run_after(ordered::nested_first), run_before(ordered_group))]
+    fn ordered_middle() {}
+
+    #[system(run_after(ordered_middle, self::ordered_group))]
+    fn ordered_last() {}
+
+    #[system(
+        run_after(renamed_first),
+        run_before(crate::schedule::tests::ordered_middle)
+    )]
+    fn ordered_early() {}
+
+    #[test]
+    fn attributes_order_registered_systems() {
+        let position = |uuid: u128| system_graph().iter().position(|s| s.uuid == uuid).unwrap();
+
+        let first = position(hash_path("reacs::schedule::tests::ordered", "nested_first"));
+        let early = position(id("ordered_early"));
+        let middle = position(id("ordered_middle"));
+        let group = position(id("ordered_group"));
+        let last = position(id("ordered_last"));
+
+        assert!(first < early);
+        assert!(early < middle);
+        assert!(middle < group);
+        assert!(group < last);
+    }
+
+    #[test]
+    fn attributes_store_resolved_targets() {
+        let middle = system_graph()
+            .iter()
+            .find(|s| s.uuid == id("ordered_middle"))
+            .unwrap();
+
+        assert_eq!(middle.before, [id("ordered_group")]);
+        assert_eq!(
+            middle.after,
+            [hash_path("reacs::schedule::tests::ordered", "nested_first")]
+        );
     }
 }
