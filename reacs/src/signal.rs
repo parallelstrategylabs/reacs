@@ -701,6 +701,25 @@ mod tests {
     }
 
     #[test]
+    fn identical_signals_sent_after_receiver_ran_all_arrive_next_tick() {
+        let mut world = world();
+        let (a, _) = receivers(&mut world);
+
+        a.run(&mut world);
+        {
+            let mut s = world.signal::<NumSignal>();
+            s.emit(NumSignal(5));
+            s.emit(NumSignal(5));
+            s.send(NumSignal(5), 0..2);
+            s.send(NumSignal(5), 0..2);
+        }
+        end_tick(&world);
+
+        a.run(&mut world);
+        assert_eq!(take_a(&world), vec![5, 5, 5, 5]);
+    }
+
+    #[test]
     fn dedup_only_skips_signals_in_both_lists() {
         let world = world();
         world.signal::<NumSignal>().send(NumSignal(10), 0..);
