@@ -61,7 +61,8 @@ impl World {
     pub fn get_resource<R: 'static + Hashed>(&self) -> Option<Ref<'_, R>> {
         let id = R::TYPE_UUID;
         let i = self.resources.binary_search_by(|x| x.0.cmp(&id)).ok()?;
-        Ref::filter_map(self.resources[i].1.borrow(), |any| any.downcast_ref::<R>()).ok()
+        let resource = self.resources[i].1.try_borrow().ok()?;
+        Ref::filter_map(resource, |any| any.downcast_ref::<R>()).ok()
     }
 
     #[inline]
@@ -73,10 +74,8 @@ impl World {
     pub(crate) fn get_resource_mut_silent<R: 'static + Hashed>(&self) -> Option<RefMut<'_, R>> {
         let id = R::TYPE_UUID;
         let i = self.resources.binary_search_by(|x| x.0.cmp(&id)).ok()?;
-        RefMut::filter_map(self.resources[i].1.borrow_mut(), |any| {
-            any.downcast_mut::<R>()
-        })
-        .ok()
+        let resource = self.resources[i].1.try_borrow_mut().ok()?;
+        RefMut::filter_map(resource, |any| any.downcast_mut::<R>()).ok()
     }
 }
 
@@ -90,6 +89,27 @@ mod tests {
 
     #[resource]
     struct IntResource(pub u64);
+
+    #[test]
+    fn get_resource_returns_none_while_mutably_borrowed() {
+        let mut world = World::new();
+        world.init_resource::<IntResource>();
+
+        let _guard = world.get_resource_mut::<IntResource>().unwrap();
+
+        assert!(world.get_resource::<IntResource>().is_none());
+    }
+
+    #[test]
+    fn get_resource_mut_returns_none_while_borrowed() {
+        let mut world = World::new();
+        world.init_resource::<IntResource>();
+
+        let _guard = world.get_resource::<IntResource>().unwrap();
+
+        assert!(world.get_resource_mut::<IntResource>().is_none());
+        assert!(world.get_resource::<IntResource>().is_some());
+    }
 
     #[test]
     fn world_inserts_resource() {

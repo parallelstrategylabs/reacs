@@ -292,6 +292,8 @@ impl World {
 mod tests {
     use super::{SystemEntry, SystemGraph, system_graph};
     use crate::{hashed::hash_path, prelude::*, registry::get_registry_entry};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[resource]
     struct IntResource(pub u64);
@@ -305,17 +307,22 @@ mod tests {
         pub active: bool,
     }
 
+    #[resource]
+    struct ParamOnlyResource(pub u64);
+
     #[test]
     fn world_initializes_param_through_system() {
         #[system]
-        fn param_system(_res: Resource<IntResource>) {}
+        fn param_system(_res: Resource<ParamOnlyResource>) {}
 
         let world = World::new();
-        assert!(world.has_resource::<IntResource>());
+        assert!(world.has_resource::<ParamOnlyResource>());
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(
+        expected = "Resource `reacs::schedule::tests::IntResource` is missing or already borrowed"
+    )]
     fn system_panics_with_conflict() {
         #[system]
         fn conflicting_system(_res: Resource<IntResource>, _res_mut: Mut<Resource<IntResource>>) {}
@@ -325,35 +332,62 @@ mod tests {
     }
 
     #[test]
-    fn system_runs_with_no_params() {
+    #[should_panic(
+        expected = "Resource `reacs::schedule::tests::IntResource` is missing or already borrowed"
+    )]
+    fn system_panics_with_conflict_when_write_comes_first() {
         #[system]
-        fn no_param_system() {}
+        fn write_first_system(_res_mut: Mut<Resource<IntResource>>, _res: Resource<IntResource>) {}
 
         let mut world = World::new();
+        write_first_system.into_system().run(&mut world);
+    }
+
+    #[test]
+    fn system_runs_with_no_params() {
+        static RAN: AtomicBool = AtomicBool::new(false);
+
+        #[system]
+        fn no_param_system() {
+            RAN.store(true, Ordering::Relaxed);
+        }
+
+        let mut world = World::new();
+        assert!(!RAN.load(Ordering::Relaxed));
+
         no_param_system.into_system().run(&mut world);
+        assert!(RAN.load(Ordering::Relaxed));
     }
 
     #[test]
     fn system_runs_with_many_params() {
         #[system]
         fn two_param_system(
-            _res_mut_bool: Mut<Resource<BoolResource>>,
-            _res_int: Resource<IntResource>,
+            mut res_mut_bool: Mut<Resource<BoolResource>>,
+            res_int: Resource<IntResource>,
         ) {
+            (*res_mut_bool).0 = (*res_int).0 == 7;
         }
 
         #[system]
         fn three_param_system(
-            _res_custom: Mut<Resource<CustomResource>>,
-            _res_int: Resource<IntResource>,
-            _res_bool: Resource<BoolResource>,
+            mut res_custom: Mut<Resource<CustomResource>>,
+            res_int: Resource<IntResource>,
+            res_bool: Resource<BoolResource>,
         ) {
+            (*res_custom).value = (*res_int).0 as i32;
+            (*res_custom).active = (*res_bool).0;
         }
 
         let mut world = World::new();
+        world.insert_resource(IntResource(7));
 
         two_param_system.into_system().run(&mut world);
         three_param_system.into_system().run(&mut world);
+
+        let custom = world.get_resource::<CustomResource>().unwrap();
+        assert_eq!((*custom).value, 7);
+        assert!((*custom).active);
     }
 
     #[resource]
@@ -602,6 +636,25 @@ mod tests {
         graph
     }
 
+    fn position(uuid: u128) -> usize {
+        system_graph().iter().position(|s| s.uuid == uuid).unwrap()
+    }
+
+    fn cycle_panic(entries: Vec<SystemEntry>) -> String {
+        let payload = catch_unwind(AssertUnwindSafe(|| graph_of(entries)))
+            .err()
+            .expect("graph should panic with a cycle");
+        payload.downcast_ref::<String>().unwrap().clone()
+    }
+
+    fn cycle_message(path: &[&str]) -> String {
+        let path: Vec<String> = path
+            .iter()
+            .map(|name| format!("`{}::{name}`", module_path!()))
+            .collect();
+        format!("system ordering cycle: {}", path.join(" -> "))
+    }
+
     #[test]
     fn run_after_overrides_uuid_order() {
         let graph = graph_of(vec![
@@ -668,15 +721,15 @@ mod tests {
 
     #[test]
     fn insertion_order_never_changes_constrained_order() {
-        let expected = ["input", "render", "audio", "logic", "physics"];
+        let expected = ["logic", "audio", "input", "render", "physics"];
 
         for order in permutations(&[0, 1, 2, 3, 4]) {
             let mut slots: Vec<_> = vec![
-                entry("render", &["audio"], &[]),
-                entry("audio", &[], &[]),
-                entry("logic", &[], &["audio"]),
-                entry("input", &["render"], &[]),
-                entry("physics", &[], &["logic"]),
+                entry("physics", &[], &["render"]),
+                entry("input", &[], &[]),
+                entry("logic", &[], &[]),
+                entry("audio", &["input"], &[]),
+                entry("render", &[], &[]),
             ]
             .into_iter()
             .map(Some)
@@ -718,38 +771,91 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "system ordering cycle: `reacs::schedule::tests::input` -> ")]
+    fn system_waits_for_every_target_it_runs_after() {
+        let graph = graph_of(vec![
+            entry("physics", &[], &["render", "input"]),
+            entry("input", &[], &[]),
+            entry("render", &[], &[]),
+        ]);
+
+        assert_eq!(names(&graph), ["input", "render", "physics"]);
+    }
+
+    #[test]
+    fn repeated_target_counts_as_one_constraint() {
+        let graph = graph_of(vec![
+            entry("physics", &[], &["render", "render"]),
+            entry("render", &[], &[]),
+        ]);
+
+        assert_eq!(names(&graph), ["render", "physics"]);
+    }
+
+    #[test]
+    fn same_constraint_can_be_declared_from_both_sides() {
+        let graph = graph_of(vec![
+            entry("physics", &[], &["render"]),
+            entry("render", &["physics"], &[]),
+        ]);
+
+        assert_eq!(names(&graph), ["render", "physics"]);
+    }
+
+    #[test]
     fn ordering_cycle_panics() {
-        graph_of(vec![
+        let message = cycle_panic(vec![
             entry("input", &["logic"], &[]),
             entry("logic", &["input"], &[]),
         ]);
+
+        assert_eq!(message, cycle_message(&["input", "logic", "input"]));
     }
 
     #[test]
-    #[should_panic(expected = "system ordering cycle")]
-    fn longer_ordering_cycle_panics() {
-        graph_of(vec![
+    fn cycle_message_follows_execution_direction() {
+        let message = cycle_panic(vec![
             entry("input", &["logic"], &[]),
             entry("logic", &["audio"], &[]),
             entry("audio", &["input"], &[]),
-            entry("render", &[], &["audio"]),
         ]);
+
+        assert_eq!(
+            message,
+            cycle_message(&["input", "logic", "audio", "input"])
+        );
     }
 
     #[test]
-    #[should_panic(expected = "system ordering cycle")]
+    fn cycle_message_excludes_systems_outside_the_cycle() {
+        let message = cycle_panic(vec![
+            entry("physics", &[], &["audio"]),
+            entry("render", &[], &["audio"]),
+            entry("input", &["logic"], &[]),
+            entry("logic", &["audio"], &[]),
+            entry("audio", &["input"], &[]),
+        ]);
+
+        assert_eq!(
+            message,
+            cycle_message(&["audio", "input", "logic", "audio"])
+        );
+    }
+
+    #[test]
     fn system_ordered_against_itself_panics() {
-        graph_of(vec![entry("input", &["input"], &[])]);
+        let message = cycle_panic(vec![entry("input", &["input"], &[])]);
+
+        assert_eq!(message, cycle_message(&["input", "input"]));
     }
 
     #[test]
-    #[should_panic(expected = "system ordering cycle")]
     fn before_and_after_same_target_panics() {
-        graph_of(vec![
+        let message = cycle_panic(vec![
             entry("input", &["logic"], &["logic"]),
             entry("logic", &[], &[]),
         ]);
+
+        assert_eq!(message, cycle_message(&["input", "logic", "input"]));
     }
 
     mod ordered {
@@ -774,12 +880,66 @@ mod tests {
         run_after(renamed_first),
         run_before(crate::schedule::tests::ordered_middle)
     )]
+
     fn ordered_early() {}
+
+    #[system]
+    fn against_after_target() {}
+
+    #[system(run_after(against_after_target))]
+    fn against_after() {}
+
+    #[system]
+    fn opposed_before_target() {}
+
+    #[system(run_before(opposed_before_target))]
+    fn opposed_before() {}
+
+    #[system]
+    fn repeated_first() {}
+
+    #[system]
+    fn repeated_second() {}
+
+    #[system]
+    fn repeated_third() {}
+
+    #[system]
+    fn repeated_fourth() {}
+
+    #[system(
+        run_after(repeated_first),
+        run_after(repeated_second),
+        run_before(repeated_third),
+        run_before(repeated_fourth)
+    )]
+    fn repeated_lists() {}
+
+    #[test]
+    fn run_after_attribute_overrides_uuid_order() {
+        assert!(id("against_after") < id("against_after_target"));
+        assert!(position(id("against_after_target")) < position(id("against_after")));
+    }
+
+    #[test]
+    fn run_before_attribute_overrides_uuid_order() {
+        assert!(id("opposed_before_target") < id("opposed_before"));
+        assert!(position(id("opposed_before")) < position(id("opposed_before_target")));
+    }
+
+    #[test]
+    fn repeated_attribute_lists_accumulate() {
+        let system = system_graph()
+            .iter()
+            .find(|s| s.uuid == id("repeated_lists"))
+            .unwrap();
+
+        assert_eq!(system.after, [id("repeated_first"), id("repeated_second")]);
+        assert_eq!(system.before, [id("repeated_third"), id("repeated_fourth")]);
+    }
 
     #[test]
     fn attributes_order_registered_systems() {
-        let position = |uuid: u128| system_graph().iter().position(|s| s.uuid == uuid).unwrap();
-
         let first = position(hash_path("reacs::schedule::tests::ordered", "nested_first"));
         let early = position(id("ordered_early"));
         let middle = position(id("ordered_middle"));
