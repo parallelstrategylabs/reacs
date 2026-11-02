@@ -81,14 +81,14 @@ mod tests {
             c_int.insert(KEY, IntComponent(967));
         }
         #[system]
-        fn check(c: Component<IntComponent>) {
+        fn check_inserted(c: Component<IntComponent>) {
             assert_eq!(c.map.get(KEY).map(|c| c.0), Some(967));
         }
 
         let mut world = World::new();
 
         write.into_system().run(&mut world);
-        check.into_system().run(&mut world);
+        check_inserted.into_system().run(&mut world);
     }
 
     #[test]
@@ -100,7 +100,7 @@ mod tests {
             c_int.remove(KEY);
         }
         #[system]
-        fn check(c: Component<IntComponent>) {
+        fn check_removed(c: Component<IntComponent>) {
             assert!(c.map.get(KEY).is_none());
         }
 
@@ -108,6 +108,6 @@ mod tests {
         world.set_component(KEY, IntComponent(344));
 
         remove.into_system().run(&mut world);
-        check.into_system().run(&mut world);
+        check_removed.into_system().run(&mut world);
     }
 }

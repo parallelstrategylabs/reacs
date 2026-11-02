@@ -533,8 +533,8 @@ mod tests {
         }
 
         let mut world = World::new();
-        let mut sender = sender.into_system();
-        let mut receiver = receiver.into_system();
+        let sender = sender.into_system();
+        let receiver = receiver.into_system();
 
         sender.run(&mut world);
         receiver.run(&mut world);

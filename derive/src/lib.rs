@@ -111,6 +111,7 @@ pub fn component(_attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn system(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);
     let name = &input.sig.ident;
+    let name_str = name.to_string();
     let ctor_fn = format_ident!("__register_system_{}", name);
 
     let mut param_types = Vec::new();
@@ -137,6 +138,7 @@ pub fn system(_attr: TokenStream, item: TokenStream) -> TokenStream {
             let f: for<'w> fn(#(<#param_types as ::reacs::schedule::SystemParam>::Item<'w>),*) = #name;
             ::reacs::schedule::register_system(
                 ::reacs::schedule::IntoSystem::into_system(f)
+                    .named(::core::module_path!(), #name_str)
             );
         }
     };

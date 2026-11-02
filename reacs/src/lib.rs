@@ -19,11 +19,13 @@ pub mod prelude {
     pub use crate::entity::EntityManager;
     pub use crate::hashed::Hashed;
     pub use crate::resource::Resource;
-    pub use crate::schedule::{IntoSystem, Mut, SystemParam};
+    pub use crate::schedule::{
+        IntoSystem, Mut, SystemEntry, SystemGraph, SystemParam, system_graph,
+    };
     pub use crate::signal::{Signal, SignalType};
     pub use crate::world::World;
 
-    pub use reacs_derive::{Hashed as DeriveHashed, component, resource, signal, system};
+    pub use reacs_derive::{Hashed as DeriveHashed, component, param, resource, signal, system};
 }
 
 #[resource]

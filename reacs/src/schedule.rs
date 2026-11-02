@@ -1,38 +1,88 @@
-use crate::hashed::Hashed;
+use crate::hashed::{Hashed, hash_path};
 use crate::world::World;
 
 use std::cell::{Ref, RefMut};
 use std::ops::Deref;
-use std::ptr::addr_of_mut;
+use std::ptr::{addr_of, addr_of_mut};
 
-pub static mut SYSTEM_REGISTRY: Option<Vec<SystemEntry>> = None;
+static mut SYSTEM_GRAPH: SystemGraph = SystemGraph::new();
 
 pub fn register_system(system: SystemEntry) {
     unsafe {
-        let ptr = addr_of_mut!(SYSTEM_REGISTRY);
-        (*ptr).get_or_insert_with(Vec::new).push(system);
+        (&mut *addr_of_mut!(SYSTEM_GRAPH)).insert(system);
     }
 }
 
-pub fn get_registered_systems() -> &'static mut Vec<SystemEntry> {
-    unsafe {
-        let ptr = addr_of_mut!(SYSTEM_REGISTRY);
-        (*ptr).get_or_insert_with(Vec::new)
-    }
+pub fn system_graph() -> &'static SystemGraph {
+    unsafe { &*addr_of!(SYSTEM_GRAPH) }
 }
+
+const ANONYMOUS_SYSTEM: u128 = 0;
 
 pub struct SystemEntry {
-    pub init_fn: Box<dyn FnMut(&mut World)>,
-    pub run_fn: Box<dyn FnMut(&mut World)>,
+    pub uuid: u128,
+    pub module: &'static str,
+    pub name: &'static str,
+    pub init_fn: Box<dyn Fn(&mut World)>,
+    pub run_fn: Box<dyn Fn(&mut World)>,
 }
 
 impl SystemEntry {
-    pub fn init(&mut self, world: &mut World) {
+    pub fn named(mut self, module: &'static str, name: &'static str) -> Self {
+        self.uuid = hash_path(module, name);
+        self.module = module;
+        self.name = name;
+        self
+    }
+
+    pub fn init(&self, world: &mut World) {
         (self.init_fn)(world);
     }
 
-    pub fn run(&mut self, world: &mut World) {
+    pub fn run(&self, world: &mut World) {
         (self.run_fn)(world);
+    }
+}
+
+pub struct SystemGraph {
+    nodes: Vec<SystemEntry>,
+}
+
+impl SystemGraph {
+    pub const fn new() -> Self {
+        Self { nodes: Vec::new() }
+    }
+
+    pub fn insert(&mut self, system: SystemEntry) {
+        assert!(
+            system.uuid != ANONYMOUS_SYSTEM,
+            "system `{}` has no stable id, use #[system] or SystemEntry::named",
+            system.name
+        );
+
+        match self.nodes.binary_search_by_key(&system.uuid, |x| x.uuid) {
+            Ok(i) => panic!(
+                "system id collision: `{}::{}` and `{}::{}` share id {:#034x}",
+                self.nodes[i].module, self.nodes[i].name, system.module, system.name, system.uuid
+            ),
+            Err(i) => self.nodes.insert(i, system),
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &SystemEntry> {
+        self.nodes.iter()
+    }
+
+    pub fn init(&self, world: &mut World) {
+        for system in self.iter() {
+            system.init(world);
+        }
+    }
+
+    pub fn run(&self, world: &mut World) {
+        for system in self.iter() {
+            system.run(world);
+        }
     }
 }
 
@@ -51,27 +101,30 @@ macro_rules! impl_into_system_tuples {
     ($($param:ident),*) => {
         impl<F, $($param),*> IntoSystem<($($param,)*)> for F
         where
-            F: FnMut($($param),*) + 'static,
-            F: for<'w> FnMut($($param::Item<'w>),*),
+            F: Fn($($param),*) + 'static,
+            F: for<'w> Fn($($param::Item<'w>),*),
             $($param: SystemParam),*
         {
-            #[allow(nonstandard_style, unused_variables, unused_mut)]
-            fn into_system(mut self) -> SystemEntry {
+            #[allow(nonstandard_style, unused_variables)]
+            fn into_system(self) -> SystemEntry {
                 SystemEntry {
+                    uuid: ANONYMOUS_SYSTEM,
+                    module: "",
+                    name: std::any::type_name::<F>(),
                     init_fn: Box::new(move |world: &mut World| {
                         $( $param::init(world); )*
                     }),
 
                     run_fn: Box::new(move |world: &mut World| {
                         fn call_inner<$($param),*>(
-                            mut f: impl FnMut($($param),*),
+                            f: impl Fn($($param),*),
                             $($param: $param),*
                         ) {
                             f($($param),*)
                         }
 
                         $( let $param = $param::fetch(world); )*
-                        call_inner(&mut self, $($param),*);
+                        call_inner(&self, $($param),*);
                     }),
                 }
             }
@@ -137,11 +190,17 @@ impl World {
     pub fn fetch_param<P: SystemParam>(&self) -> P::Item<'_> {
         P::fetch(self)
     }
+
+    #[inline]
+    pub fn run_systems(&mut self) {
+        system_graph().run(self);
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::prelude::*;
+    use super::{SystemEntry, SystemGraph, system_graph};
+    use crate::{hashed::hash_path, prelude::*, registry::get_registry_entry};
 
     #[resource]
     struct IntResource(pub u64);
@@ -158,7 +217,7 @@ mod tests {
     #[test]
     fn world_initializes_param_through_system() {
         #[system]
-        fn system(_res: Resource<IntResource>) {}
+        fn param_system(_res: Resource<IntResource>) {}
 
         let world = World::new();
         assert!(world.has_resource::<IntResource>());
@@ -177,10 +236,10 @@ mod tests {
     #[test]
     fn system_runs_with_no_params() {
         #[system]
-        fn system() {}
+        fn no_param_system() {}
 
         let mut world = World::new();
-        system.into_system().run(&mut world);
+        no_param_system.into_system().run(&mut world);
     }
 
     #[test]
@@ -204,5 +263,217 @@ mod tests {
 
         two_param_system.into_system().run(&mut world);
         three_param_system.into_system().run(&mut world);
+    }
+
+    #[resource]
+    struct ExecLog(pub Vec<String>);
+
+    macro_rules! logging_systems {
+        ($($name:ident),*) => {
+            $(
+                #[system]
+                fn $name(mut log: Mut<Resource<ExecLog>>) {
+                    (*log).0.push(stringify!($name).to_string());
+                }
+            )*
+
+            fn logging_entries() -> Vec<SystemEntry> {
+                vec![$($name.into_system().named(module_path!(), stringify!($name))),*]
+            }
+        };
+    }
+
+    logging_systems!(input, logic, physics, audio, render);
+
+    const UUID_ORDER: [&str; 5] = ["physics", "input", "logic", "audio", "render"];
+
+    fn permutations(items: &[usize]) -> Vec<Vec<usize>> {
+        if items.len() <= 1 {
+            return vec![items.to_vec()];
+        }
+
+        let mut result = Vec::new();
+        for (i, &head) in items.iter().enumerate() {
+            let mut rest = items.to_vec();
+            rest.remove(i);
+            for mut tail in permutations(&rest) {
+                tail.insert(0, head);
+                result.push(tail);
+            }
+        }
+        result
+    }
+
+    fn graph_in_order(order: &[usize]) -> SystemGraph {
+        let mut slots: Vec<_> = logging_entries().into_iter().map(Some).collect();
+        let mut graph = SystemGraph::new();
+        for &i in order {
+            graph.insert(slots[i].take().unwrap());
+        }
+        graph
+    }
+
+    #[test]
+    fn hash_path_matches_pinned_values() {
+        const MODULE: &str = "reacs::schedule::tests";
+        assert_eq!(
+            hash_path(MODULE, "physics"),
+            0x0690cfe3b21ce294a3cb775e212c1f0e
+        );
+        assert_eq!(
+            hash_path(MODULE, "render"),
+            0xa12ad1e77e1e295aae76e13a45d20d39
+        );
+    }
+
+    #[test]
+    fn named_system_uuid_comes_from_module_and_name() {
+        let entry = physics.into_system().named(module_path!(), "physics");
+
+        assert_eq!(entry.uuid, hash_path("reacs::schedule::tests", "physics"));
+        assert_eq!(entry.module, "reacs::schedule::tests");
+        assert_eq!(entry.name, "physics");
+    }
+
+    #[test]
+    fn macro_registers_system_with_same_uuid_as_named() {
+        let uuid = hash_path(module_path!(), "physics");
+        let registered = system_graph().iter().find(|s| s.uuid == uuid).unwrap();
+
+        assert_eq!(registered.module, module_path!());
+        assert_eq!(registered.name, "physics");
+    }
+
+    #[test]
+    fn registered_systems_stay_sorted_by_uuid() {
+        let uuids: Vec<u128> = system_graph().iter().map(|s| s.uuid).collect();
+
+        assert!(uuids.len() >= UUID_ORDER.len());
+        assert!(uuids.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn graph_is_ordered_after_every_insert() {
+        let mut graph = SystemGraph::new();
+
+        for (count, entry) in logging_entries().into_iter().enumerate() {
+            graph.insert(entry);
+
+            let uuids: Vec<u128> = graph.iter().map(|s| s.uuid).collect();
+            assert_eq!(uuids.len(), count + 1);
+            assert!(uuids.windows(2).all(|w| w[0] < w[1]));
+        }
+    }
+
+    #[test]
+    fn insertion_order_never_changes_execution_order() {
+        let orders = permutations(&[0, 1, 2, 3, 4]);
+        assert_eq!(orders.len(), 120);
+
+        for order in orders {
+            let graph = graph_in_order(&order);
+            let mut world = World::new();
+            graph.run(&mut world);
+
+            let log = world.get_resource::<ExecLog>().unwrap();
+            assert_eq!(log.0, UUID_ORDER, "insertion order {order:?}");
+        }
+    }
+
+    #[test]
+    fn graph_init_restores_param_resources() {
+        let graph = graph_in_order(&[0, 1, 2, 3, 4]);
+        let mut world = World::new();
+        world.remove_resource::<ExecLog>();
+        assert!(!world.has_resource::<ExecLog>());
+
+        graph.init(&mut world);
+
+        assert!(world.has_resource::<ExecLog>());
+    }
+
+    #[test]
+    #[should_panic(expected = "system id collision")]
+    fn inserting_same_path_twice_panics() {
+        let mut graph = SystemGraph::new();
+        graph.insert(input.into_system().named(module_path!(), "input"));
+        graph.insert(logic.into_system().named(module_path!(), "input"));
+    }
+
+    #[test]
+    #[should_panic(expected = "no stable id")]
+    fn inserting_anonymous_system_panics() {
+        SystemGraph::new().insert(input.into_system());
+    }
+
+    #[test]
+    fn global_graph_keeps_pinned_order_and_uuids() {
+        let names: Vec<&str> = system_graph()
+            .iter()
+            .map(|s| s.name)
+            .filter(|name| UUID_ORDER.contains(name))
+            .collect();
+        assert_eq!(names, UUID_ORDER);
+
+        for name in UUID_ORDER {
+            let system = system_graph().iter().find(|s| s.name == name).unwrap();
+            assert_eq!(system.uuid, hash_path(module_path!(), name));
+        }
+    }
+
+    #[test]
+    fn graph_runs_each_system_once_per_run() {
+        let graph = graph_in_order(&[4, 2, 0, 3, 1]);
+        let mut world = World::new();
+
+        graph.run(&mut world);
+        assert_eq!(world.get_resource::<ExecLog>().unwrap().0, UUID_ORDER);
+
+        graph.run(&mut world);
+        let expected: Vec<&str> = UUID_ORDER.iter().chain(&UUID_ORDER).copied().collect();
+        assert_eq!(world.get_resource::<ExecLog>().unwrap().0, expected);
+    }
+
+    #[test]
+    fn worlds_share_systems_but_not_state() {
+        let graph = graph_in_order(&[0, 1, 2, 3, 4]);
+        let mut first = World::new();
+        let mut second = World::new();
+
+        graph.run(&mut first);
+        graph.run(&mut first);
+        graph.run(&mut second);
+
+        let count = |world: &World| world.get_resource::<ExecLog>().unwrap().0.len();
+        assert_eq!(count(&first), 2 * UUID_ORDER.len());
+        assert_eq!(count(&second), UUID_ORDER.len());
+    }
+
+    #[test]
+    fn insertion_order_never_changes_serialized_state() {
+        let snapshot = |order: &[usize]| -> Vec<(u128, Vec<u8>)> {
+            let mut world = World::new();
+            graph_in_order(order).run(&mut world);
+            world
+                .resources
+                .iter()
+                .map(|(id, resource)| {
+                    let entry = get_registry_entry(*id).unwrap();
+                    (*id, (entry.serialize)(&*resource.borrow()))
+                })
+                .collect()
+        };
+
+        assert_eq!(snapshot(&[0, 1, 2, 3, 4]), snapshot(&[4, 3, 2, 1, 0]));
+    }
+
+    #[test]
+    #[should_panic(expected = "is missing or already borrowed")]
+    fn running_without_a_required_resource_panics() {
+        let graph = graph_in_order(&[0, 1, 2, 3, 4]);
+        let mut world = World::new();
+        world.remove_resource::<ExecLog>();
+
+        graph.run(&mut world);
     }
 }
