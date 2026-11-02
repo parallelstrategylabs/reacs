@@ -12,7 +12,7 @@ use crate::{
     hashed::Hashed,
     registry::get_registry_entry,
     resource::Resource,
-    schedule::{Mut, Write},
+    schedule::{CurrentSystem, Mut, Write},
     world::World,
 };
 
@@ -57,7 +57,7 @@ pub struct SignalInstance<S> {
 #[derive(Default, Hashed, Serialize, Deserialize)]
 #[serde(bound = "")]
 pub struct SignalData<S: SignalType> {
-    pub cursor: u64,
+    pub cursors: Vec<(u128, u64)>,
     pub next: u64,
     phantom: PhantomData<S>,
 }
@@ -116,8 +116,10 @@ impl<S: SignalType> Signals<S> {
     pub fn receive<'a>(
         &'a self,
         data: &mut SignalData<S>,
+        system: u128,
     ) -> impl Iterator<Item = &'a S> + use<'a, S> {
-        let cursor = data.cursor;
+        let slot = data.cursors.binary_search_by_key(&system, |x| x.0);
+        let cursor = slot.map_or(0, |i| data.cursors[i].1);
         let unread =
             |list: &'a [SignalInstance<S>]| &list[list.partition_point(|x| x.id < cursor)..];
 
@@ -125,11 +127,28 @@ impl<S: SignalType> Signals<S> {
         let transient_buffer = unread(&self.transient_buffer);
 
         if let Some(last) = transient_buffer.last().or_else(|| transient.last()) {
-            data.cursor = last.id + 1;
+            match slot {
+                Ok(i) => data.cursors[i].1 = last.id + 1,
+                Err(i) => data.cursors.insert(i, (system, last.id + 1)),
+            }
         }
+
+        let mut windowed: &[(SignalWindow, SignalInstance<S>)] = match transient.first() {
+            Some(first) => {
+                let active = &self.transitory_active;
+                &active[active.partition_point(|x| x.1.id < first.id)..]
+            }
+            None => &[],
+        };
 
         transient
             .iter()
+            .filter(move |x| {
+                while windowed.first().is_some_and(|w| w.1.id < x.id) {
+                    windowed = &windowed[1..];
+                }
+                !windowed.first().is_some_and(|w| w.1.id == x.id)
+            })
             .chain(transient_buffer)
             .map(|x| &x.payload)
             .chain(self.transitory_active.iter().map(|x| &x.1.payload))
@@ -207,6 +226,8 @@ pub struct Signal<S: SignalType> {
     pub data: Resource<SignalData<S>>,
     #[read]
     pub tick: Resource<Tick>,
+    #[read]
+    pub current: Resource<CurrentSystem>,
 }
 
 impl<'w, S: SignalType> Signal<'w, S, Write> {
@@ -235,7 +256,7 @@ impl<'w, S: SignalType> Signal<'w, S, Write> {
 
     #[inline]
     pub fn receive(&mut self) -> impl Iterator<Item = &S> {
-        self.signals.receive(&mut self.data)
+        self.signals.receive(&mut self.data, (*self.current).0)
     }
 
     #[inline]
@@ -306,7 +327,9 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::{SignalData, Signals};
-    use crate::{Tick, entity::Entity, prelude::*, registry::get_registry_entry};
+    use crate::{
+        Tick, entity::Entity, prelude::*, registry::get_registry_entry, schedule::CurrentSystem,
+    };
 
     #[signal]
     pub struct TestSignal(pub Entity);
@@ -543,6 +566,171 @@ mod tests {
 
         let received = world.get_resource::<Received>().unwrap();
         assert_eq!(received.0, vec![Entity::new(4, 1)]);
+    }
+
+    #[resource]
+    struct ReceivedA(pub Vec<u64>);
+
+    #[resource]
+    struct ReceivedB(pub Vec<u64>);
+
+    fn receiver_a(mut signal: Mut<Signal<NumSignal>>, mut received: Mut<Resource<ReceivedA>>) {
+        (*received).0.extend(signal.receive().map(|s| s.0));
+    }
+
+    fn receiver_b(mut signal: Mut<Signal<NumSignal>>, mut received: Mut<Resource<ReceivedB>>) {
+        (*received).0.extend(signal.receive().map(|s| s.0));
+    }
+
+    fn receivers(world: &mut World) -> (SystemEntry, SystemEntry) {
+        world.init_resource::<ReceivedA>();
+        world.init_resource::<ReceivedB>();
+        (
+            receiver_a.into_system().named(module_path!(), "receiver_a"),
+            receiver_b.into_system().named(module_path!(), "receiver_b"),
+        )
+    }
+
+    fn take_a(world: &World) -> Vec<u64> {
+        std::mem::take(&mut world.get_resource_mut::<ReceivedA>().unwrap().0)
+    }
+
+    fn take_b(world: &World) -> Vec<u64> {
+        std::mem::take(&mut world.get_resource_mut::<ReceivedB>().unwrap().0)
+    }
+
+    #[test]
+    fn every_receiver_sees_transient_signal_once() {
+        let mut world = world();
+        let (a, b) = receivers(&mut world);
+
+        world.signal::<NumSignal>().emit(NumSignal(7));
+        a.run(&mut world);
+        b.run(&mut world);
+        assert_eq!(take_a(&world), vec![7]);
+        assert_eq!(take_b(&world), vec![7]);
+
+        a.run(&mut world);
+        end_tick(&world);
+        a.run(&mut world);
+        b.run(&mut world);
+        assert_eq!(take_a(&world), Vec::<u64>::new());
+        assert_eq!(take_b(&world), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn receiver_before_sender_gets_signal_next_tick() {
+        let mut world = world();
+        let (a, b) = receivers(&mut world);
+
+        a.run(&mut world);
+        world.signal::<NumSignal>().emit(NumSignal(3));
+        b.run(&mut world);
+        assert_eq!(take_a(&world), Vec::<u64>::new());
+        assert_eq!(take_b(&world), vec![3]);
+
+        end_tick(&world);
+        a.run(&mut world);
+        b.run(&mut world);
+        assert_eq!(take_a(&world), vec![3]);
+        assert_eq!(take_b(&world), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn calls_outside_systems_keep_their_own_cursor() {
+        let mut world = world();
+        let (a, _) = receivers(&mut world);
+
+        world.signal::<NumSignal>().emit(NumSignal(1));
+        assert_eq!(receive(&world), vec![1]);
+
+        a.run(&mut world);
+        assert_eq!(take_a(&world), vec![1]);
+        assert_eq!((*world.get_resource::<CurrentSystem>().unwrap()).0, 0);
+
+        world.signal::<NumSignal>().emit(NumSignal(2));
+        assert_eq!(receive(&world), vec![2]);
+        a.run(&mut world);
+        assert_eq!(take_a(&world), vec![2]);
+    }
+
+    #[test]
+    fn cursors_stay_sorted_and_skip_senders() {
+        let mut world = world();
+        let (a, b) = receivers(&mut world);
+
+        world.signal::<NumSignal>().emit(NumSignal(1));
+        assert!(
+            world
+                .get_resource::<SignalData<NumSignal>>()
+                .unwrap()
+                .cursors
+                .is_empty()
+        );
+
+        b.run(&mut world);
+        a.run(&mut world);
+        receive(&world);
+
+        let data = world.get_resource::<SignalData<NumSignal>>().unwrap();
+        assert_eq!(data.cursors.len(), 3);
+        assert!(data.cursors.windows(2).all(|w| w[0].0 < w[1].0));
+    }
+
+    #[test]
+    fn window_sent_after_receiver_ran_is_not_delivered_twice() {
+        let mut world = world();
+        let (a, b) = receivers(&mut world);
+
+        a.run(&mut world);
+        world.signal::<NumSignal>().send(NumSignal(5), 0..3);
+        b.run(&mut world);
+
+        let mut late = vec![take_a(&world)];
+        let mut early = vec![take_b(&world)];
+        for _ in 0..3 {
+            end_tick(&world);
+            a.run(&mut world);
+            b.run(&mut world);
+            late.push(take_a(&world));
+            early.push(take_b(&world));
+        }
+
+        assert_eq!(late, vec![vec![], vec![5], vec![5], vec![]]);
+        assert_eq!(early, vec![vec![5], vec![5], vec![5], vec![]]);
+    }
+
+    #[test]
+    fn dedup_only_skips_signals_in_both_lists() {
+        let world = world();
+        world.signal::<NumSignal>().send(NumSignal(10), 0..);
+        receive(&world);
+        end_tick(&world);
+
+        receive(&world);
+        {
+            let mut s = world.signal::<NumSignal>();
+            s.emit(NumSignal(1));
+            s.send(NumSignal(2), 1..4);
+            s.emit(NumSignal(3));
+        }
+        end_tick(&world);
+
+        assert_eq!(receive(&world), vec![1, 3, 10, 2]);
+    }
+
+    #[test]
+    fn dedup_delivers_modified_payload() {
+        let world = world();
+        receive(&world);
+        let id = world
+            .signal::<NumSignal>()
+            .send(NumSignal(1), 0..3)
+            .unwrap();
+        end_tick(&world);
+
+        *world.signal::<NumSignal>().modify(id).unwrap() = NumSignal(2);
+        assert_eq!(receive(&world), vec![2]);
     }
 
     #[test]

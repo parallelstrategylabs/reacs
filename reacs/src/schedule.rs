@@ -1,6 +1,7 @@
 use crate::hashed::{Hashed, hash_path};
 use crate::world::World;
 
+use reacs_derive::resource;
 use std::cell::{Ref, RefMut};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -20,6 +21,9 @@ pub fn system_graph() -> &'static SystemGraph {
 }
 
 const ANONYMOUS_SYSTEM: u128 = 0;
+
+#[resource]
+pub struct CurrentSystem(pub u128);
 
 pub trait SystemId {
     const UUID: u128;
@@ -64,7 +68,15 @@ impl SystemEntry {
     }
 
     pub fn run(&self, world: &mut World) {
+        set_current_system(world, self.uuid);
         (self.run_fn)(world);
+        set_current_system(world, ANONYMOUS_SYSTEM);
+    }
+}
+
+fn set_current_system(world: &World, uuid: u128) {
+    if let Some(mut current) = world.get_resource_mut_silent::<CurrentSystem>() {
+        current.0 = uuid;
     }
 }
 

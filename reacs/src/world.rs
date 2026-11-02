@@ -3,7 +3,10 @@ use std::{
     cell::{Ref, RefCell, RefMut},
 };
 
-use crate::{hashed::Hashed, schedule::system_graph};
+use crate::{
+    hashed::Hashed,
+    schedule::{CurrentSystem, system_graph},
+};
 pub struct World {
     pub resources: Vec<(u128, Box<RefCell<dyn Any>>)>,
 }
@@ -15,6 +18,7 @@ impl World {
             resources: Vec::new(),
         };
 
+        world.init_resource::<CurrentSystem>();
         system_graph().init(&mut world);
 
         world
