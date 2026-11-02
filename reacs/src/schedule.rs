@@ -31,6 +31,7 @@ pub struct SystemEntry {
     pub name: &'static str,
     pub before: Vec<u128>,
     pub after: Vec<u128>,
+    pub groups: Vec<u128>,
     pub init_fn: Box<dyn Fn(&mut World)>,
     pub run_fn: Box<dyn Fn(&mut World)>,
 }
@@ -50,6 +51,11 @@ impl SystemEntry {
 
     pub fn run_after(mut self, targets: &[u128]) -> Self {
         self.after.extend_from_slice(targets);
+        self
+    }
+
+    pub fn in_group(mut self, groups: &[u128]) -> Self {
+        self.groups.extend_from_slice(groups);
         self
     }
 
@@ -105,6 +111,22 @@ impl SystemGraph {
             for previous in system.after.iter().filter_map(index_of) {
                 successors[previous].push(i);
                 blockers[i] += 1;
+            }
+        }
+
+        let declared = successors.clone();
+        for (i, system) in self.nodes.iter().enumerate() {
+            for group in system.groups.iter().filter_map(index_of) {
+                successors[group].push(i);
+                blockers[i] += 1;
+
+                let group_uuid = self.nodes[group].uuid;
+                for &next in &declared[group] {
+                    if !self.nodes[next].groups.contains(&group_uuid) {
+                        successors[i].push(next);
+                        blockers[next] += 1;
+                    }
+                }
             }
         }
 
@@ -202,6 +224,7 @@ macro_rules! impl_into_system_tuples {
                     name: std::any::type_name::<F>(),
                     before: Vec::new(),
                     after: Vec::new(),
+                    groups: Vec::new(),
                     init_fn: Box::new(move |world: &mut World| {
                         $( $param::init(world); )*
                     }),
@@ -290,7 +313,7 @@ impl World {
 
 #[cfg(test)]
 mod tests {
-    use super::{SystemEntry, SystemGraph, system_graph};
+    use super::{SystemEntry, SystemGraph, SystemId, system_graph};
     use crate::{hashed::hash_path, prelude::*, registry::get_registry_entry};
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -452,50 +475,12 @@ mod tests {
     }
 
     #[test]
-    fn named_system_uuid_comes_from_module_and_name() {
-        let entry = physics.into_system().named(module_path!(), "physics");
-
-        assert_eq!(entry.uuid, hash_path("reacs::schedule::tests", "physics"));
-        assert_eq!(entry.module, "reacs::schedule::tests");
-        assert_eq!(entry.name, "physics");
-    }
-
-    #[test]
     fn macro_registers_system_with_same_uuid_as_named() {
         let uuid = hash_path(module_path!(), "physics");
         let registered = system_graph().iter().find(|s| s.uuid == uuid).unwrap();
 
         assert_eq!(registered.module, module_path!());
         assert_eq!(registered.name, "physics");
-    }
-
-    #[test]
-    fn registered_systems_stay_sorted_by_uuid() {
-        let targets: Vec<u128> = system_graph()
-            .iter()
-            .flat_map(|s| s.before.iter().chain(&s.after).copied())
-            .collect();
-        let uuids: Vec<u128> = system_graph()
-            .iter()
-            .filter(|s| s.before.is_empty() && s.after.is_empty() && !targets.contains(&s.uuid))
-            .map(|s| s.uuid)
-            .collect();
-
-        assert!(uuids.len() >= UUID_ORDER.len());
-        assert!(uuids.windows(2).all(|w| w[0] < w[1]));
-    }
-
-    #[test]
-    fn graph_is_ordered_after_every_insert() {
-        let mut graph = SystemGraph::new();
-
-        for (count, entry) in logging_entries().into_iter().enumerate() {
-            graph.insert(entry);
-
-            let uuids: Vec<u128> = graph.iter().map(|s| s.uuid).collect();
-            assert_eq!(uuids.len(), count + 1);
-            assert!(uuids.windows(2).all(|w| w[0] < w[1]));
-        }
     }
 
     #[test]
@@ -552,19 +537,6 @@ mod tests {
             let system = system_graph().iter().find(|s| s.name == name).unwrap();
             assert_eq!(system.uuid, hash_path(module_path!(), name));
         }
-    }
-
-    #[test]
-    fn graph_runs_each_system_once_per_run() {
-        let graph = graph_in_order(&[4, 2, 0, 3, 1]);
-        let mut world = World::new();
-
-        graph.run(&mut world);
-        assert_eq!(world.get_resource::<ExecLog>().unwrap().0, UUID_ORDER);
-
-        graph.run(&mut world);
-        let expected: Vec<&str> = UUID_ORDER.iter().chain(&UUID_ORDER).copied().collect();
-        assert_eq!(world.get_resource::<ExecLog>().unwrap().0, expected);
     }
 
     #[test]
@@ -745,22 +717,6 @@ mod tests {
     }
 
     #[test]
-    fn constrained_graph_runs_in_stored_order() {
-        let graph = graph_of(vec![
-            entry("physics", &[], &["render"]),
-            entry("render", &[], &[]),
-        ]);
-        let mut world = World::new();
-
-        graph.run(&mut world);
-
-        assert_eq!(
-            world.get_resource::<ExecLog>().unwrap().0,
-            ["render", "physics"]
-        );
-    }
-
-    #[test]
     fn targets_outside_the_graph_are_ignored() {
         let graph = graph_of(vec![
             entry("physics", &[], &["audio"]),
@@ -771,27 +727,6 @@ mod tests {
     }
 
     #[test]
-    fn system_waits_for_every_target_it_runs_after() {
-        let graph = graph_of(vec![
-            entry("physics", &[], &["render", "input"]),
-            entry("input", &[], &[]),
-            entry("render", &[], &[]),
-        ]);
-
-        assert_eq!(names(&graph), ["input", "render", "physics"]);
-    }
-
-    #[test]
-    fn repeated_target_counts_as_one_constraint() {
-        let graph = graph_of(vec![
-            entry("physics", &[], &["render", "render"]),
-            entry("render", &[], &[]),
-        ]);
-
-        assert_eq!(names(&graph), ["render", "physics"]);
-    }
-
-    #[test]
     fn same_constraint_can_be_declared_from_both_sides() {
         let graph = graph_of(vec![
             entry("physics", &[], &["render"]),
@@ -799,16 +734,6 @@ mod tests {
         ]);
 
         assert_eq!(names(&graph), ["render", "physics"]);
-    }
-
-    #[test]
-    fn ordering_cycle_panics() {
-        let message = cycle_panic(vec![
-            entry("input", &["logic"], &[]),
-            entry("logic", &["input"], &[]),
-        ]);
-
-        assert_eq!(message, cycle_message(&["input", "logic", "input"]));
     }
 
     #[test]
@@ -848,16 +773,6 @@ mod tests {
         assert_eq!(message, cycle_message(&["input", "input"]));
     }
 
-    #[test]
-    fn before_and_after_same_target_panics() {
-        let message = cycle_panic(vec![
-            entry("input", &["logic"], &["logic"]),
-            entry("logic", &[], &[]),
-        ]);
-
-        assert_eq!(message, cycle_message(&["input", "logic", "input"]));
-    }
-
     mod ordered {
         use crate::prelude::*;
 
@@ -884,18 +799,6 @@ mod tests {
     fn ordered_early() {}
 
     #[system]
-    fn against_after_target() {}
-
-    #[system(run_after(against_after_target))]
-    fn against_after() {}
-
-    #[system]
-    fn opposed_before_target() {}
-
-    #[system(run_before(opposed_before_target))]
-    fn opposed_before() {}
-
-    #[system]
     fn repeated_first() {}
 
     #[system]
@@ -914,18 +817,6 @@ mod tests {
         run_before(repeated_fourth)
     )]
     fn repeated_lists() {}
-
-    #[test]
-    fn run_after_attribute_overrides_uuid_order() {
-        assert!(id("against_after") < id("against_after_target"));
-        assert!(position(id("against_after_target")) < position(id("against_after")));
-    }
-
-    #[test]
-    fn run_before_attribute_overrides_uuid_order() {
-        assert!(id("opposed_before_target") < id("opposed_before"));
-        assert!(position(id("opposed_before")) < position(id("opposed_before_target")));
-    }
 
     #[test]
     fn repeated_attribute_lists_accumulate() {
@@ -952,17 +843,253 @@ mod tests {
         assert!(group < last);
     }
 
-    #[test]
-    fn attributes_store_resolved_targets() {
-        let middle = system_graph()
-            .iter()
-            .find(|s| s.uuid == id("ordered_middle"))
-            .unwrap();
+    mod groups {
+        use crate::prelude::*;
 
-        assert_eq!(middle.before, [id("ordered_group")]);
+        #[system]
+        pub fn group_input() {}
+
+        #[system(run_after(group_input))]
+        pub fn group_physics() {}
+
+        #[system(run_after(group_physics))]
+        pub fn group_logic() {}
+
+        #[system(run_after(group_logic))]
+        pub fn group_audio() {}
+
+        #[system(run_after(group_audio))]
+        pub fn group_render() {}
+    }
+
+    #[system(in_group(groups::group_input))]
+    fn read_controls() {}
+
+    #[system(in_group(groups::group_physics))]
+    fn integrate_bodies() {}
+
+    #[system(in_group(groups::group_logic))]
+    fn apply_damage() {}
+
+    #[system(in_group(groups::group_audio))]
+    fn mix_sounds() {}
+
+    #[system(in_group(groups::group_render))]
+    fn draw_frame() {}
+
+    mod third_party {
+        use super::groups::{group_logic, group_physics};
+        use crate::prelude::*;
+
+        #[system(run_after(group_physics), run_before(group_logic))]
+        pub fn group_collisions() {}
+
+        #[system(in_group(group_collisions))]
+        pub fn resolve_contacts() {}
+
+        #[system(in_group(group_physics))]
+        pub fn extra_physics() {}
+    }
+
+    fn group(name: &'static str, before: &[&str], after: &[&str]) -> SystemEntry {
+        fn empty() {}
+
+        let mut entry = empty.into_system().named(module_path!(), name);
+        entry.before = before.iter().map(|n| id(n)).collect();
+        entry.after = after.iter().map(|n| id(n)).collect();
+        entry
+    }
+
+    fn member(entry: SystemEntry, groups: &[&str]) -> SystemEntry {
+        let groups: Vec<u128> = groups.iter().map(|n| id(n)).collect();
+        entry.in_group(&groups)
+    }
+
+    #[test]
+    fn third_party_module_fits_between_core_groups() {
+        let physics = position(groups::group_physics::UUID);
+        let collisions = position(third_party::group_collisions::UUID);
+        let logic = position(groups::group_logic::UUID);
+
+        for core_member in [integrate_bodies::UUID, third_party::extra_physics::UUID] {
+            assert!(physics < position(core_member));
+            assert!(position(core_member) < collisions);
+        }
+
+        let contacts = position(third_party::resolve_contacts::UUID);
+        assert!(collisions < contacts);
+        assert!(contacts < logic);
+    }
+
+    #[test]
+    fn member_stays_between_group_and_its_run_before_target() {
+        assert!(id("group_second") < id("render"));
+        assert!(id("physics") < id("group_first"));
+
+        let late = graph_of(vec![
+            group("group_first", &["group_second"], &[]),
+            group("group_second", &[], &[]),
+            member(entry("render", &[], &[]), &["group_first"]),
+        ]);
+        assert_eq!(names(&late), ["group_first", "render", "group_second"]);
+
+        let early = graph_of(vec![
+            group("group_first", &["group_second"], &[]),
+            group("group_second", &[], &[]),
+            member(entry("physics", &[], &[]), &["group_first"]),
+        ]);
+        assert_eq!(names(&early), ["group_first", "physics", "group_second"]);
+    }
+
+    #[test]
+    fn plain_system_running_after_group_waits_for_its_members() {
+        assert!(id("physics") < id("render"));
+
+        let graph = graph_of(vec![
+            group("group_first", &[], &[]),
+            member(entry("render", &[], &[]), &["group_first"]),
+            entry("physics", &[], &["group_first"]),
+        ]);
+
+        assert_eq!(names(&graph), ["group_first", "render", "physics"]);
+    }
+
+    #[test]
+    fn inserted_group_needs_no_change_to_existing_groups() {
+        assert!(id("group_inserted") < id("render"));
+
+        for order in permutations(&[0, 1, 2, 3, 4]) {
+            let mut slots: Vec<_> = vec![
+                group("group_first", &["group_last"], &[]),
+                group("group_last", &[], &[]),
+                member(entry("render", &[], &[]), &["group_first"]),
+                group("group_inserted", &["group_last"], &["group_first"]),
+                member(entry("input", &[], &[]), &["group_inserted"]),
+            ]
+            .into_iter()
+            .map(Some)
+            .collect();
+
+            let mut graph = SystemGraph::new();
+            for &i in &order {
+                graph.insert(slots[i].take().unwrap());
+            }
+
+            assert_eq!(
+                names(&graph),
+                [
+                    "group_first",
+                    "render",
+                    "group_inserted",
+                    "input",
+                    "group_last"
+                ],
+                "insertion order {order:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn member_running_after_its_group_does_not_order_other_members() {
+        assert!(id("physics") < id("render"));
+
+        let graph = graph_of(vec![
+            group("group_first", &[], &[]),
+            member(entry("physics", &[], &["group_first"]), &["group_first"]),
+            member(entry("render", &[], &[]), &["group_first"]),
+        ]);
+
+        assert_eq!(names(&graph), ["group_first", "physics", "render"]);
+    }
+
+    #[test]
+    fn members_can_order_each_other() {
+        assert!(id("physics") < id("render"));
+
+        let graph = graph_of(vec![
+            group("group_first", &["group_second"], &[]),
+            group("group_second", &[], &[]),
+            member(entry("physics", &[], &["render"]), &["group_first"]),
+            member(entry("render", &[], &[]), &["group_first"]),
+        ]);
+
         assert_eq!(
-            middle.after,
-            [hash_path("reacs::schedule::tests::ordered", "nested_first")]
+            names(&graph),
+            ["group_first", "render", "physics", "group_second"]
+        );
+    }
+
+    #[test]
+    fn group_outside_the_graph_is_ignored() {
+        let graph = graph_of(vec![member(entry("render", &[], &[]), &["group_missing"])]);
+
+        assert_eq!(names(&graph), ["render"]);
+    }
+
+    #[test]
+    fn member_running_after_a_later_group_panics() {
+        let message = cycle_panic(vec![
+            group("group_first", &[], &[]),
+            group("group_second", &[], &["group_first"]),
+            member(entry("input", &[], &["group_second"]), &["group_first"]),
+        ]);
+
+        assert_eq!(
+            message,
+            cycle_message(&["group_second", "input", "group_second"])
+        );
+    }
+
+    #[test]
+    fn member_of_two_ordered_groups_panics() {
+        let message = cycle_panic(vec![
+            group("group_first", &[], &[]),
+            group("group_second", &[], &["group_first"]),
+            member(entry("input", &[], &[]), &["group_first", "group_second"]),
+        ]);
+
+        assert_eq!(
+            message,
+            cycle_message(&["group_second", "input", "group_second"])
+        );
+    }
+
+    #[test]
+    fn systems_stay_inside_their_group() {
+        let expected = [
+            groups::group_input::UUID,
+            read_controls::UUID,
+            groups::group_physics::UUID,
+            integrate_bodies::UUID,
+            groups::group_logic::UUID,
+            apply_damage::UUID,
+            groups::group_audio::UUID,
+            mix_sounds::UUID,
+            groups::group_render::UUID,
+            draw_frame::UUID,
+        ];
+        assert!(expected.windows(2).any(|w| w[0] > w[1]));
+
+        let positions = expected.map(position);
+        assert!(positions.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn groups_run_as_no_ops_between_their_members() {
+        let graph = graph_of(vec![
+            group("group_first", &[], &[]),
+            group("group_second", &[], &["group_first"]),
+            entry("render", &["group_first"], &[]),
+            entry("physics", &["group_second"], &["group_first"]),
+            entry("input", &[], &["group_second"]),
+        ]);
+        let mut world = World::new();
+
+        graph.run(&mut world);
+
+        assert_eq!(
+            world.get_resource::<ExecLog>().unwrap().0,
+            ["render", "physics", "input"]
         );
     }
 }

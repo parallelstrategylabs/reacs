@@ -112,13 +112,18 @@ pub fn component(_attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn system(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut run_before: Vec<Path> = Vec::new();
     let mut run_after: Vec<Path> = Vec::new();
+    let mut in_group: Vec<Path> = Vec::new();
     let attr_parser = syn::meta::parser(|meta| {
         let targets = if meta.path.is_ident("run_before") {
             &mut run_before
         } else if meta.path.is_ident("run_after") {
             &mut run_after
+        } else if meta.path.is_ident("in_group") {
+            &mut in_group
         } else {
-            return Err(meta.error("expected `run_before(...)` or `run_after(...)`"));
+            return Err(
+                meta.error("expected `run_before(...)`, `run_after(...)` or `in_group(...)`")
+            );
         };
         meta.parse_nested_meta(|target| {
             targets.push(target.path);
@@ -163,12 +168,14 @@ pub fn system(attr: TokenStream, item: TokenStream) -> TokenStream {
         fn #ctor_fn() {
             #( let _ = #run_before; )*
             #( let _ = #run_after; )*
+            #( let _ = #in_group; )*
             let f: for<'w> fn(#(<#param_types as ::reacs::schedule::SystemParam>::Item<'w>),*) = #name;
             ::reacs::schedule::register_system(
                 ::reacs::schedule::IntoSystem::into_system(f)
                     .named(::core::module_path!(), #name_str)
                     .run_before(&[#(<#run_before as ::reacs::schedule::SystemId>::UUID),*])
                     .run_after(&[#(<#run_after as ::reacs::schedule::SystemId>::UUID),*])
+                    .in_group(&[#(<#in_group as ::reacs::schedule::SystemId>::UUID),*])
             );
         }
     };
