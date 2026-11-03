@@ -337,7 +337,7 @@ mod tests {
 
     #[test]
     fn component_mut_inserts() {
-        const KEY: Entity = Entity::new(18, 0);
+        const KEY: Entity = Entity::new(18, 1);
 
         #[system]
         fn write(mut c_int: Mut<Component<IntComponent>>) {
@@ -356,7 +356,7 @@ mod tests {
 
     #[test]
     fn component_mut_removes() {
-        const KEY: Entity = Entity::new(7, 0);
+        const KEY: Entity = Entity::new(7, 1);
 
         #[system]
         fn remove(mut c_int: Mut<Component<IntComponent>>) {
@@ -377,7 +377,7 @@ mod tests {
 
     #[test]
     fn component_mut_changes_value_in_place() {
-        let entity = Entity::new(3, 0);
+        let entity = Entity::new(3, 1);
         let mut world = World::new();
         world.init_component::<IntComponent>();
         world.set_component(entity, IntComponent(1));
@@ -393,7 +393,7 @@ mod tests {
 
     #[test]
     fn mask_handles_bits_past_the_first_word() {
-        let entity = Entity::new(2, 0);
+        let entity = Entity::new(2, 1);
         let mut masks = ComponentMasks::default();
 
         masks.set(entity, 70, true, 2);
@@ -406,8 +406,8 @@ mod tests {
 
     #[test]
     fn mask_clear_only_affects_that_row() {
-        let first = Entity::new(0, 0);
-        let second = Entity::new(1, 0);
+        let first = Entity::new(0, 1);
+        let second = Entity::new(1, 1);
         let mut masks = ComponentMasks::default();
 
         masks.set(first, 1, true, 2);
@@ -423,13 +423,13 @@ mod tests {
 
     #[test]
     fn mask_clear_handles_row_that_was_never_written() {
-        let entity = Entity::new(9, 0);
+        let entity = Entity::new(9, 1);
         let mut masks = ComponentMasks::default();
-        masks.set(Entity::new(0, 0), 1, true, 2);
+        masks.set(Entity::new(0, 1), 1, true, 2);
 
         masks.clear(entity, 2);
 
-        assert_eq!(masks.word(Entity::new(0, 0), 0, 2), 1 << 1);
+        assert_eq!(masks.word(Entity::new(0, 1), 0, 2), 1 << 1);
         assert_eq!(masks.word(entity, 0, 2), 0);
     }
 

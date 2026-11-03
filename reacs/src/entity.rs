@@ -59,13 +59,15 @@ impl DerefMut for EntityFreeList {
     }
 }
 
+const FIRST_GENERATION: u32 = 1;
+
 #[resource]
 pub(crate) struct EntityGenerations(pub DirectMap<u32>);
 
 impl EntityGenerations {
     #[inline]
     pub(crate) fn current(&self, index: usize) -> u32 {
-        self.get(index).copied().unwrap_or(0)
+        self.get(index).copied().unwrap_or(FIRST_GENERATION)
     }
 }
 
@@ -158,18 +160,18 @@ mod tests {
 
     #[test]
     fn read_only_entity_manager_checks_entities() {
-        const ALIVE: Entity = Entity::new(0, 0);
-        const DEAD: Entity = Entity::new(1, 0);
+        const ALIVE: Entity = Entity::new(0, 1);
+        const DEAD: Entity = Entity::new(1, 1);
 
         #[system]
         fn read_entities(em: EntityManager, health: Component<Health>) {
             assert!(em.is_alive(ALIVE));
             assert!(health.has(ALIVE));
             assert_eq!(em.components(ALIVE).count(), 1);
-            assert_eq!(em.generation(ALIVE.index()), 0);
+            assert_eq!(em.generation(ALIVE.index()), 1);
 
             assert!(!em.is_alive(DEAD));
-            assert_eq!(em.generation(DEAD.index()), 1);
+            assert_eq!(em.generation(DEAD.index()), 2);
             assert_eq!(em.components(DEAD).count(), 0);
         }
 
@@ -194,8 +196,8 @@ mod tests {
 
         #[system]
         fn read_view(view: AliveHealth) {
-            assert!(!view.entities.is_alive(Entity::new(5, 0)));
-            assert!(!view.health.has(Entity::new(5, 0)));
+            assert!(!view.entities.is_alive(Entity::new(5, 1)));
+            assert!(!view.health.has(Entity::new(5, 1)));
         }
 
         let mut world = world_with_components();
@@ -368,12 +370,53 @@ mod tests {
 
         let entity = em.spawn();
         assert_eq!(entity.index(), 25);
-        assert_eq!(entity.generation(), 0);
+        assert_eq!(entity.generation(), 1);
 
         em.despawn(entity);
 
         let entity = em.spawn();
         assert_eq!(entity.index(), 25);
-        assert_eq!(entity.generation(), 1);
+        assert_eq!(entity.generation(), 2);
+    }
+
+    #[test]
+    fn default_entity_is_never_alive() {
+        let mut world = world_with_components();
+        let default = Entity::default();
+        assert!(!world.entity_manager().is_alive(default));
+
+        let first = world.entity_manager().spawn();
+
+        assert_eq!(first.index(), default.index());
+        assert_ne!(first, default);
+        assert!(!world.entity_manager().is_alive(default));
+    }
+
+    #[test]
+    fn component_on_default_entity_does_not_reach_spawned_entity() {
+        let mut world = world_with_components();
+        world.set_component(Entity::default(), Health(1));
+
+        let first = world.entity_manager().spawn();
+
+        assert!(!world.has_component::<Health>(first));
+        assert_eq!(world.entity_manager().components(first).count(), 0);
+    }
+
+    #[test]
+    fn default_entity_cannot_change_live_entity() {
+        let mut world = world_with_components();
+        let first = world.entity_manager().spawn();
+        world.set_component(first, Health(1));
+        let default = Entity::default();
+
+        assert!(!world.has_component::<Health>(default));
+        world.set_component(default, Health(2));
+        world.remove_component::<Health>(default);
+        world.entity_manager().despawn(default);
+
+        assert!(world.entity_manager().is_alive(first));
+        assert_eq!(world.get_component::<Health>(first).unwrap().0, 1);
+        assert_eq!(world.entity_manager().components(first).count(), 1);
     }
 }
