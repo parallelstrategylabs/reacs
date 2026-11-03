@@ -146,10 +146,11 @@ pub fn component(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #[allow(non_snake_case)]
         fn #ctor_fn() {
         #link
-        type Map = ::reacs::direct_map::DirectMap<#name>;
+        type Map = ::reacs::component::ComponentMap<#name>;
         ::reacs::registry::register_entry::<Map>(
             <Map as ::reacs::hashed::Hashed>::TYPE_UUID,
             );
+        ::reacs::component::register_component::<#name>();
         }
     };
 
@@ -219,7 +220,7 @@ pub fn system(attr: TokenStream, item: TokenStream) -> TokenStream {
             #( let _ = #run_before; )*
             #( let _ = #run_after; )*
             #( let _ = #in_group; )*
-            let f: for<'w> fn(#(<#param_types as ::reacs::schedule::SystemParam>::Item<'w>),*) = #name;
+            let f: for<'w> fn(#(<#param_types as ::reacs::schedule::SystemArg>::Item<'w>),*) = #name;
             ::reacs::schedule::register_system(
                 ::reacs::schedule::IntoSystem::into_system(f)
                     .named(::core::module_path!(), #name_str)

@@ -22,11 +22,11 @@ pub mod __private {
 
 pub mod prelude {
     pub use crate::component::Component;
-    pub use crate::entity::EntityManager;
+    pub use crate::entity::{Entity, EntityManager};
     pub use crate::hashed::Hashed;
     pub use crate::resource::Resource;
     pub use crate::schedule::{
-        IntoSystem, Mut, SystemEntry, SystemGraph, SystemParam, system_graph,
+        IntoSystem, Mut, SystemEntry, SystemGraph, SystemParam, WorldAccess, system_graph,
     };
     pub use crate::signal::{Signal, SignalType};
     pub use crate::world::World;

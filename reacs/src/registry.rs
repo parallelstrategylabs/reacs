@@ -43,7 +43,7 @@ pub fn get_registry_entry(id: u128) -> Option<&'static RegistryEntry> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{direct_map::DirectMap, prelude::*, registry::get_registry_entry};
+    use crate::{component::ComponentMap, prelude::*, registry::get_registry_entry};
 
     #[resource]
     struct IntResource(pub u64);
@@ -74,7 +74,7 @@ mod tests {
 
     #[test]
     fn component_auto_registers_in_registry() {
-        let entry = get_registry_entry(DirectMap::<IntComponent>::TYPE_UUID);
+        let entry = get_registry_entry(ComponentMap::<IntComponent>::TYPE_UUID);
         assert!(entry.is_some(), "Component registration failed!");
     }
 }

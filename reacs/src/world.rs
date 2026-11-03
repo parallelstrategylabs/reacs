@@ -205,7 +205,7 @@ mod tests {
 
     #[test]
     fn world_sets_component() {
-        const KEY: usize = 18;
+        const KEY: Entity = Entity::new(18, 0);
         const VALUE: i32 = 967;
 
         let mut world = World::new();
@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn world_removes_component() {
-        const KEY: usize = 7;
+        const KEY: Entity = Entity::new(7, 0);
 
         let mut world = World::new();
         world.init_component::<IntComponent>();
@@ -247,17 +247,18 @@ mod tests {
     fn init_component_keeps_existing_components() {
         let mut world = World::new();
         world.init_component::<IntComponent>();
-        world.set_component(1, IntComponent(5));
+        let entity = Entity::new(1, 0);
+        world.set_component(entity, IntComponent(5));
 
         world.init_component::<IntComponent>();
 
-        assert_eq!(world.get_component::<IntComponent>(1).unwrap().0, 5);
+        assert_eq!(world.get_component::<IntComponent>(entity).unwrap().0, 5);
     }
 
     #[test]
     #[should_panic(expected = "not initialized")]
     fn get_component_panics_when_not_initialized() {
         let world = World::new();
-        world.get_component::<IntComponent>(1);
+        world.get_component::<IntComponent>(Entity::new(1, 0));
     }
 }

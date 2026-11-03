@@ -25,6 +25,11 @@ impl<T: Copy + Default> DirectMap<T> {
     }
 
     #[inline]
+    pub fn get_mut(&mut self, key: usize) -> Option<&mut T> {
+        self.has(key).then(|| &mut self.values[key])
+    }
+
+    #[inline]
     pub fn insert(&mut self, key: usize, value: T) {
         self.active.set(key, true);
         let len = self.values.len();

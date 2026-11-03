@@ -5,7 +5,7 @@ use reacs_derive::resource;
 use std::cell::{Ref, RefMut};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::ptr::{addr_of, addr_of_mut};
 
 static mut SYSTEM_GRAPH: SystemGraph = SystemGraph::new();
@@ -273,11 +273,13 @@ pub struct Write;
 
 pub trait Mode {
     type Guard<'w, T: 'w>: Deref<Target = T>;
+    type WorldGuard<'w>: Deref<Target = World>;
     fn fetch<'w, T: 'static + Hashed>(world: &'w World) -> Self::Guard<'w, T>;
 }
 
 impl Mode for Read {
     type Guard<'w, T: 'w> = Ref<'w, T>;
+    type WorldGuard<'w> = &'w World;
     fn fetch<'w, T: 'static + Hashed>(world: &'w World) -> Ref<'w, T> {
         world.get_resource::<T>().unwrap_or_else(|| conflict::<T>())
     }
@@ -285,6 +287,7 @@ impl Mode for Read {
 
 impl Mode for Write {
     type Guard<'w, T: 'w> = RefMut<'w, T>;
+    type WorldGuard<'w> = &'w mut World;
     fn fetch<'w, T: 'static + Hashed>(world: &'w World) -> RefMut<'w, T> {
         world
             .get_resource_mut_silent::<T>()
@@ -298,8 +301,69 @@ pub trait WithMode<M: Mode> {
 
 pub type Mut<P> = <P as WithMode<Write>>::Out;
 
+pub struct WorldAccess<'w, M: Mode = Read>(M::WorldGuard<'w>);
+
+impl<'w, M0: Mode, M: Mode> WithMode<M> for WorldAccess<'w, M0> {
+    type Out = WorldAccess<'w, M>;
+}
+
+impl<M: Mode> Deref for WorldAccess<'_, M> {
+    type Target = World;
+    fn deref(&self) -> &World {
+        &self.0
+    }
+}
+
+impl DerefMut for WorldAccess<'_, Write> {
+    fn deref_mut(&mut self) -> &mut World {
+        self.0
+    }
+}
+
+impl SystemParam for WorldAccess<'_, Read> {
+    type Item<'w> = WorldAccess<'w, Read>;
+
+    fn init(_world: &mut World) {}
+
+    fn fetch<'w>(world: &'w World) -> WorldAccess<'w, Read> {
+        WorldAccess(world)
+    }
+}
+
+pub trait SystemArg {
+    type Item<'w>;
+}
+
+impl<P: SystemParam> SystemArg for P {
+    type Item<'w> = P::Item<'w>;
+}
+
+impl SystemArg for WorldAccess<'_, Write> {
+    type Item<'w> = WorldAccess<'w, Write>;
+}
+
+pub struct ExclusiveSystem;
+
+impl<F> IntoSystem<ExclusiveSystem> for F
+where
+    F: for<'w> Fn(WorldAccess<'w, Write>) + 'static,
+{
+    fn into_system(self) -> SystemEntry {
+        SystemEntry {
+            uuid: ANONYMOUS_SYSTEM,
+            module: "",
+            name: std::any::type_name::<F>(),
+            before: Vec::new(),
+            after: Vec::new(),
+            groups: Vec::new(),
+            init_fn: Box::new(|_world: &mut World| {}),
+            run_fn: Box::new(move |world: &mut World| self(WorldAccess(world))),
+        }
+    }
+}
+
 #[cold]
-fn conflict<T>() -> ! {
+pub(crate) fn conflict<T>() -> ! {
     panic!(
         "Resource `{}` is missing or already borrowed (conflicting params?)",
         std::any::type_name::<T>()
@@ -582,6 +646,67 @@ mod tests {
         };
 
         assert_eq!(snapshot(&[0, 1, 2, 3, 4]), snapshot(&[4, 3, 2, 1, 0]));
+    }
+
+    #[test]
+    fn read_world_access_runs_beside_other_params() {
+        #[system]
+        fn read_world(
+            world: WorldAccess,
+            res: Resource<IntResource>,
+            _flag: Mut<Resource<BoolResource>>,
+        ) {
+            assert_eq!(world.get_resource::<IntResource>().unwrap().0, (*res).0);
+            assert!(world.get_resource::<BoolResource>().is_none());
+        }
+
+        let mut world = World::new();
+        world.insert_resource(IntResource(4));
+        world.init_resource::<BoolResource>();
+
+        read_world.into_system().run(&mut world);
+    }
+
+    #[test]
+    fn mut_world_access_changes_the_world_directly() {
+        #[component]
+        struct Health(pub i32);
+
+        #[system]
+        fn write_world(mut world: Mut<WorldAccess>) {
+            world.insert_resource(IntResource(9));
+            world.init_param::<Mut<EntityManager>>();
+            world.init_component::<Health>();
+
+            let entity = world.entity_manager().spawn();
+            world.set_component(entity, Health(3));
+            assert_eq!(world.get_component::<Health>(entity).unwrap().0, 3);
+        }
+
+        let mut world = World::new();
+
+        write_world.into_system().run(&mut world);
+
+        assert_eq!(world.get_resource::<IntResource>().unwrap().0, 9);
+    }
+
+    #[test]
+    fn mut_world_access_sees_the_current_system() {
+        #[system]
+        fn current(world: Mut<WorldAccess>) {
+            let current = world
+                .get_resource::<crate::schedule::CurrentSystem>()
+                .unwrap();
+            assert_eq!(current.0, <current as crate::schedule::SystemId>::UUID);
+        }
+
+        let mut world = World::new();
+        let entry = system_graph()
+            .iter()
+            .find(|system| system.name == "current")
+            .unwrap();
+
+        entry.run(&mut world);
     }
 
     #[test]

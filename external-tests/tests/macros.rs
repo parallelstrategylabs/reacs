@@ -1,4 +1,4 @@
-use reacs::direct_map::DirectMap;
+use reacs::component::ComponentMap;
 use reacs::prelude::*;
 use reacs::registry::get_registry_entry;
 use reacs::signal::Signals;
@@ -29,7 +29,7 @@ fn member(_view: ScoreView) {}
 #[test]
 fn macros_register_types_with_only_reacs_as_dependency() {
     assert!(get_registry_entry(Score::TYPE_UUID).is_some());
-    assert!(get_registry_entry(DirectMap::<Health>::TYPE_UUID).is_some());
+    assert!(get_registry_entry(ComponentMap::<Health>::TYPE_UUID).is_some());
     assert!(get_registry_entry(Signals::<Hit>::TYPE_UUID).is_some());
     assert_ne!(Plain::TYPE_UUID, Score::TYPE_UUID);
 }
