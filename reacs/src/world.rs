@@ -232,6 +232,12 @@ impl World {
                 let entry = get_registry_entry(*id).unwrap_or_else(|| {
                     panic!("Failed to load save: it has an unknown resource {id:#034x}")
                 });
+                if self.resources.binary_search_by_key(id, |x| x.0).is_err() {
+                    panic!(
+                        "Failed to load save: it has resource `{}` ({id:#034x}), which isn't in this world",
+                        entry.type_name
+                    );
+                }
                 (*id, (entry.restore)(bytes))
             })
             .collect();
@@ -457,15 +463,14 @@ mod tests {
     }
 
     #[test]
-    fn load_adds_resources_the_world_does_not_have() {
+    #[should_panic(expected = "which isn't in this world")]
+    fn load_panics_when_world_misses_a_saved_resource() {
         let mut source = World::new();
         source.insert_resource(OtherResource(true));
         let save = source.save();
 
         let mut target = World::new();
         target.load(&save);
-
-        assert!(target.get_resource::<OtherResource>().unwrap().0);
     }
 
     #[test]
@@ -531,6 +536,7 @@ mod tests {
 
         let mut target = World::new();
         target.set_app_version(3);
+        target.init_resource::<IntResource>();
         target.load(&save);
 
         assert_eq!(target.get_resource::<IntResource>().unwrap().0, 5);
