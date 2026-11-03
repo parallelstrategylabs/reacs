@@ -2,15 +2,16 @@ use reacs_derive::{Hashed, param};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    bit_set::BitSet,
     direct_map::DirectMap,
-    entity::Entity,
+    entity::{Entity, EntityGenerations},
     prelude::*,
     registry::get_registry_entry,
+    resource::ResourceCell,
     schedule::{Mode, Read, Write, conflict},
 };
 use std::{
-    any::Any,
-    cell::{Ref, RefCell, RefMut},
+    cell::{Ref, RefMut},
     marker::PhantomData,
     ops::Deref,
     ptr::addr_of_mut,
@@ -81,48 +82,34 @@ impl<C: Copy + Default> ComponentMap<C> {
 #[resource]
 pub(crate) struct ComponentMasks {
     #[serde(skip)]
-    words: Vec<u64>,
-    #[serde(skip)]
-    generations: Vec<u32>,
+    bits: BitSet,
 }
 
 impl ComponentMasks {
+    #[inline]
     fn set(&mut self, entity: Entity, bit: usize, on: bool, row_words: usize) {
-        let index = entity.index() as usize;
-        if index >= self.generations.len() {
-            self.generations.resize(index + 1, 0);
-            self.words.resize((index + 1) * row_words, 0);
-        }
-
-        let row = index * row_words;
-        let generation = entity.generation();
-        if self.generations[index] > generation {
-            return;
-        }
-        if self.generations[index] < generation {
-            self.words[row..row + row_words].fill(0);
-            self.generations[index] = generation;
-        }
-
-        let word = &mut self.words[row + bit / 64];
-        let mask = 1u64 << (bit % 64);
-        if on {
-            *word |= mask;
-        } else {
-            *word &= !mask;
-        }
+        let row = entity.index() as usize * row_words;
+        self.bits.set(row * 64 + bit, on);
     }
 
+    #[inline]
     fn word(&self, entity: Entity, word: usize, row_words: usize) -> u64 {
-        let index = entity.index() as usize;
-        if self.generations.get(index) != Some(&entity.generation()) {
-            return 0;
+        let row = entity.index() as usize * row_words;
+        self.bits.get_word(row + word).unwrap_or(0)
+    }
+
+    #[inline]
+    pub(crate) fn clear(&mut self, entity: Entity, row_words: usize) {
+        let row = entity.index() as usize * row_words;
+        let words = &mut self.bits.words;
+        let end = (row + row_words).min(words.len());
+        if row < end {
+            words[row..end].fill(0);
         }
-        self.words[index * row_words + word]
     }
 }
 
-fn row_words() -> usize {
+pub(crate) fn row_words() -> usize {
     registered_components().len().div_ceil(64)
 }
 
@@ -136,7 +123,8 @@ fn component_bit<C: Hashed>() -> usize {
 }
 
 pub(crate) struct ComponentMaskRef<'w, C, M: Mode = Read> {
-    cell: &'w RefCell<dyn Any>,
+    masks: ResourceCell<'w, ComponentMasks>,
+    generations: ResourceCell<'w, EntityGenerations>,
     bit: usize,
     marker: PhantomData<(C, M)>,
 }
@@ -144,11 +132,10 @@ pub(crate) struct ComponentMaskRef<'w, C, M: Mode = Read> {
 impl<C, M: Mode> ComponentMaskRef<'_, C, M> {
     #[inline]
     fn set(&self, entity: Entity, on: bool) {
-        self.cell
-            .borrow_mut()
-            .downcast_mut::<ComponentMasks>()
-            .expect("component mask resource has the wrong type")
-            .set(entity, self.bit, on, row_words());
+        let current = self.generations.read().current(entity.index() as usize);
+        if current == entity.generation() {
+            self.masks.write().set(entity, self.bit, on, row_words());
+        }
     }
 }
 
@@ -157,15 +144,13 @@ impl<C: 'static + Hashed, M: Mode> SystemParam for ComponentMaskRef<'_, C, M> {
 
     fn init(world: &mut World) {
         world.init_resource::<ComponentMasks>();
+        world.init_resource::<EntityGenerations>();
     }
 
     fn fetch<'w>(world: &'w World) -> ComponentMaskRef<'w, C, M> {
-        let i = world
-            .resources
-            .binary_search_by_key(&ComponentMasks::TYPE_UUID, |resource| resource.0)
-            .unwrap_or_else(|_| conflict::<ComponentMasks>());
         ComponentMaskRef {
-            cell: &*world.resources[i].1,
+            masks: <ResourceCell<ComponentMasks> as SystemParam>::fetch(world),
+            generations: <ResourceCell<EntityGenerations> as SystemParam>::fetch(world),
             bit: component_bit::<C>(),
             marker: PhantomData,
         }
@@ -234,15 +219,15 @@ fn registered_components() -> &'static [ComponentInfo] {
     unsafe { &*addr_of_mut!(COMPONENT_REGISTRY) }
 }
 
-pub(crate) fn live_components(
-    world: &World,
+pub(crate) fn live_components<'a>(
+    masks: &'a ResourceCell<'_, ComponentMasks>,
     entity: Entity,
-) -> impl Iterator<Item = ComponentInfo> + '_ {
+    alive: bool,
+) -> impl Iterator<Item = ComponentInfo> + 'a {
     let row_words = row_words();
-    (0..row_words).flat_map(move |w| {
-        let mut word = world
-            .get_resource::<ComponentMasks>()
-            .map_or(0, |masks| masks.word(entity, w, row_words));
+    let words = if alive { row_words } else { 0 };
+    (0..words).flat_map(move |w| {
+        let mut word = masks.read().word(entity, w, row_words);
         std::iter::from_fn(move || {
             if word == 0 {
                 return None;
@@ -267,6 +252,7 @@ impl World {
             self.insert_resource(ComponentMap::<C>::new());
         }
         self.init_resource::<ComponentMasks>();
+        self.init_resource::<EntityGenerations>();
     }
 
     #[inline]
@@ -313,9 +299,15 @@ impl World {
     }
 
     fn set_component_mask<C: Hashed>(&self, entity: Entity, on: bool) {
-        self.get_resource_mut::<ComponentMasks>()
-            .unwrap_or_else(|| conflict::<ComponentMasks>())
-            .set(entity, component_bit::<C>(), on, row_words());
+        let current = self
+            .get_resource::<EntityGenerations>()
+            .unwrap_or_else(|| conflict::<EntityGenerations>())
+            .current(entity.index() as usize);
+        if current == entity.generation() {
+            self.get_resource_mut::<ComponentMasks>()
+                .unwrap_or_else(|| conflict::<ComponentMasks>())
+                .set(entity, component_bit::<C>(), on, row_words());
+        }
     }
 
     #[inline]
@@ -413,20 +405,32 @@ mod tests {
     }
 
     #[test]
-    fn mask_row_resets_for_newer_generation_and_ignores_older() {
-        let old = Entity::new(0, 0);
-        let new = Entity::new(0, 1);
+    fn mask_clear_only_affects_that_row() {
+        let first = Entity::new(0, 0);
+        let second = Entity::new(1, 0);
         let mut masks = ComponentMasks::default();
 
-        masks.set(old, 1, true, 1);
-        assert_eq!(masks.word(new, 0, 1), 0);
+        masks.set(first, 1, true, 2);
+        masks.set(first, 70, true, 2);
+        masks.set(second, 2, true, 2);
 
-        masks.set(new, 2, true, 1);
-        assert_eq!(masks.word(new, 0, 1), 1 << 2);
-        assert_eq!(masks.word(old, 0, 1), 0);
+        masks.clear(first, 2);
 
-        masks.set(old, 3, true, 1);
-        assert_eq!(masks.word(new, 0, 1), 1 << 2);
+        assert_eq!(masks.word(first, 0, 2), 0);
+        assert_eq!(masks.word(first, 1, 2), 0);
+        assert_eq!(masks.word(second, 0, 2), 1 << 2);
+    }
+
+    #[test]
+    fn mask_clear_handles_row_that_was_never_written() {
+        let entity = Entity::new(9, 0);
+        let mut masks = ComponentMasks::default();
+        masks.set(Entity::new(0, 0), 1, true, 2);
+
+        masks.clear(entity, 2);
+
+        assert_eq!(masks.word(Entity::new(0, 0), 0, 2), 1 << 1);
+        assert_eq!(masks.word(entity, 0, 2), 0);
     }
 
     fn world_with_reused_index() -> (World, Entity, Entity) {

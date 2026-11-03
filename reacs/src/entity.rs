@@ -4,11 +4,11 @@ use reacs_derive::{param, resource};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    component::{ComponentInfo, live_components},
+    component::{ComponentInfo, ComponentMasks, live_components, row_words},
     direct_map::DirectMap,
     free_list::FreeList,
-    resource::Resource,
-    schedule::{Mut, WorldAccess, Write},
+    resource::{Resource, ResourceCell},
+    schedule::{Mode, Mut, Write},
     world::World,
 };
 
@@ -60,7 +60,14 @@ impl DerefMut for EntityFreeList {
 }
 
 #[resource]
-pub struct EntityGenerations(pub DirectMap<u32>);
+pub(crate) struct EntityGenerations(pub DirectMap<u32>);
+
+impl EntityGenerations {
+    #[inline]
+    pub(crate) fn current(&self, index: usize) -> u32 {
+        self.get(index).copied().unwrap_or(0)
+    }
+}
 
 impl Deref for EntityGenerations {
     type Target = DirectMap<u32>;
@@ -75,46 +82,49 @@ impl DerefMut for EntityGenerations {
     }
 }
 
-#[param(write)]
+#[param]
 pub struct EntityManager {
     free_list: Resource<EntityFreeList>,
-    generations: Resource<EntityGenerations>,
     #[read]
-    world: WorldAccess,
+    generations: ResourceCell<EntityGenerations>,
+    #[read]
+    masks: ResourceCell<ComponentMasks>,
 }
 
-impl<'w> EntityManager<'w, Write> {
+impl<M: Mode> EntityManager<'_, M> {
+    #[inline]
+    pub fn generation(&self, index: u32) -> u32 {
+        self.generations.read().current(index as usize)
+    }
+
+    #[inline]
+    pub fn is_alive(&self, entity: Entity) -> bool {
+        self.free_list.bitset.get(entity.index() as usize)
+            && self.generation(entity.index()) == entity.generation()
+    }
+
+    pub fn components(&self, entity: Entity) -> impl Iterator<Item = ComponentInfo> + '_ {
+        live_components(&self.masks, entity, self.is_alive(entity))
+    }
+}
+
+impl EntityManager<'_, Write> {
     #[inline]
     pub fn spawn(&mut self) -> Entity {
         let free_index = self.free_list.reserve();
-        let generation = self
-            .generations
-            .get(free_index as usize)
-            .copied()
-            .unwrap_or(0);
+        let generation = self.generations.read().current(free_index as usize);
         Entity::new(free_index as u32, generation)
     }
 
     #[inline]
     pub fn despawn(&mut self, entity: Entity) {
         let index = entity.index() as usize;
-        let current = self.generations.get(index).copied().unwrap_or(0);
+        let current = self.generations.read().current(index);
         if current == entity.generation() {
-            self.generations.insert(index, current + 1);
+            self.generations.write().insert(index, current + 1);
             self.free_list.free(index);
+            self.masks.write().clear(entity, row_words());
         }
-    }
-
-    #[inline]
-    pub fn is_alive(&self, entity: Entity) -> bool {
-        let index = entity.index() as usize;
-        self.free_list.bitset.get(index)
-            && self.generations.get(index).copied().unwrap_or(0) == entity.generation()
-    }
-
-    pub fn components(&self, entity: Entity) -> impl Iterator<Item = ComponentInfo> + '_ {
-        let alive = self.is_alive(entity);
-        live_components(&self.world, entity).filter(move |_| alive)
     }
 }
 
@@ -144,6 +154,62 @@ mod tests {
         world.init_component::<Health>();
         world.init_component::<Armor>();
         world
+    }
+
+    #[test]
+    fn read_only_entity_manager_checks_entities() {
+        const ALIVE: Entity = Entity::new(0, 0);
+        const DEAD: Entity = Entity::new(1, 0);
+
+        #[system]
+        fn read_entities(em: EntityManager, health: Component<Health>) {
+            assert!(em.is_alive(ALIVE));
+            assert!(health.has(ALIVE));
+            assert_eq!(em.components(ALIVE).count(), 1);
+            assert_eq!(em.generation(ALIVE.index()), 0);
+
+            assert!(!em.is_alive(DEAD));
+            assert_eq!(em.generation(DEAD.index()), 1);
+            assert_eq!(em.components(DEAD).count(), 0);
+        }
+
+        let mut world = world_with_components();
+        let alive = world.entity_manager().spawn();
+        let dead = world.entity_manager().spawn();
+        assert_eq!((alive, dead), (ALIVE, DEAD));
+        world.set_component(alive, Health(1));
+        world.entity_manager().despawn(dead);
+
+        read_entities.into_system().run(&mut world);
+    }
+
+    #[test]
+    fn read_only_entity_manager_works_inside_custom_param() {
+        #[param]
+        struct AliveHealth {
+            health: Component<Health>,
+            #[read]
+            entities: EntityManager,
+        }
+
+        #[system]
+        fn read_view(view: AliveHealth) {
+            assert!(!view.entities.is_alive(Entity::new(5, 0)));
+            assert!(!view.health.has(Entity::new(5, 0)));
+        }
+
+        let mut world = world_with_components();
+        read_view.into_system().run(&mut world);
+    }
+
+    #[test]
+    #[should_panic(expected = "already borrowed")]
+    fn read_and_write_entity_manager_in_one_system_panics() {
+        #[system]
+        fn both(_read: EntityManager, _write: Mut<EntityManager>) {}
+
+        let mut world = world_with_components();
+        both.into_system().run(&mut world);
     }
 
     #[test]
