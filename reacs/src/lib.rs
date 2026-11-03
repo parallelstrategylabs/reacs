@@ -14,6 +14,12 @@ pub mod schedule;
 pub mod signal;
 pub mod world;
 
+#[doc(hidden)]
+pub mod __private {
+    pub use ctor;
+    pub use serde;
+}
+
 pub mod prelude {
     pub use crate::component::Component;
     pub use crate::entity::EntityManager;

@@ -104,12 +104,13 @@ pub fn resource(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #[derive(
             ::core::default::Default,
             ::reacs::hashed::Hashed,
-            ::serde::Serialize,
-            ::serde::Deserialize,
+            ::reacs::__private::serde::Serialize,
+            ::reacs::__private::serde::Deserialize,
         )]
+        #[serde(crate = "::reacs::__private::serde")]
         #input
 
-        #[::ctor::ctor]
+        #[::reacs::__private::ctor::ctor]
         fn #ctor_fn() {
             #link
             ::reacs::registry::register_entry::<#name>(
@@ -135,12 +136,13 @@ pub fn component(_attr: TokenStream, item: TokenStream) -> TokenStream {
             ::reacs::hashed::Hashed,
             ::core::clone::Clone,
             ::core::marker::Copy,
-            ::serde::Serialize,
-            ::serde::Deserialize,
+            ::reacs::__private::serde::Serialize,
+            ::reacs::__private::serde::Deserialize,
         )]
+        #[serde(crate = "::reacs::__private::serde")]
         #input
 
-        #[::ctor::ctor]
+        #[::reacs::__private::ctor::ctor]
         #[allow(non_snake_case)]
         fn #ctor_fn() {
         #link
@@ -210,7 +212,7 @@ pub fn system(attr: TokenStream, item: TokenStream) -> TokenStream {
             const UUID: u128 = ::reacs::hashed::hash_path(::core::module_path!(), #name_str);
         }
 
-        #[::ctor::ctor]
+        #[::reacs::__private::ctor::ctor]
         #[allow(non_snake_case)]
         fn #ctor_fn() {
             #link
@@ -262,14 +264,15 @@ pub fn signal(_attr: TokenStream, item: TokenStream) -> TokenStream {
             ::reacs::hashed::Hashed,
             ::core::clone::Clone,
             ::core::marker::Copy,
-            ::serde::Serialize,
-            ::serde::Deserialize,
+            ::reacs::__private::serde::Serialize,
+            ::reacs::__private::serde::Deserialize,
         )]
+        #[serde(crate = "::reacs::__private::serde")]
         #input
 
         impl ::reacs::signal::SignalType for #name {}
 
-        #[::ctor::ctor]
+        #[::reacs::__private::ctor::ctor]
         #[allow(non_snake_case)]
         fn #ctor_fn() {
             #link
