@@ -202,7 +202,6 @@ pub fn component(_attr: TokenStream, item: TokenStream) -> TokenStream {
         ::reacs::registry::register_entry::<Map>(
             <Map as ::reacs::hashed::Hashed>::TYPE_UUID,
             );
-        ::reacs::component::register_component::<#name>();
         }
     };
 

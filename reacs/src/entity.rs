@@ -4,7 +4,6 @@ use reacs_derive::{param, resource};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    component::{ComponentInfo, ComponentMasks, live_components, row_words},
     direct_map::DirectMap,
     free_list::FreeList,
     resource::{Resource, ResourceCell},
@@ -89,8 +88,6 @@ pub struct EntityManager {
     free_list: Resource<EntityFreeList>,
     #[read]
     generations: ResourceCell<EntityGenerations>,
-    #[read]
-    masks: ResourceCell<ComponentMasks>,
 }
 
 impl<M: Mode> EntityManager<'_, M> {
@@ -103,10 +100,6 @@ impl<M: Mode> EntityManager<'_, M> {
     pub fn is_alive(&self, entity: Entity) -> bool {
         self.free_list.bitset.get(entity.index() as usize)
             && self.generation(entity.index()) == entity.generation()
-    }
-
-    pub fn components(&self, entity: Entity) -> impl Iterator<Item = ComponentInfo> + '_ {
-        live_components(&self.masks, entity, self.is_alive(entity))
     }
 }
 
@@ -125,7 +118,6 @@ impl EntityManager<'_, Write> {
         if current == entity.generation() {
             self.generations.write().insert(index, current + 1);
             self.free_list.free(index);
-            self.masks.write().clear(entity, row_words());
         }
     }
 }
@@ -144,17 +136,10 @@ mod tests {
     #[component]
     struct Health(pub i32);
 
-    #[component]
-    struct Armor(pub i32);
-
-    #[component]
-    struct Unused(pub i32);
-
     fn world_with_components() -> World {
         let mut world = World::new();
         world.init_param::<Mut<EntityManager>>();
         world.init_component::<Health>();
-        world.init_component::<Armor>();
         world
     }
 
@@ -167,12 +152,10 @@ mod tests {
         fn read_entities(em: EntityManager, health: Component<Health>) {
             assert!(em.is_alive(ALIVE));
             assert!(health.has(ALIVE));
-            assert_eq!(em.components(ALIVE).count(), 1);
             assert_eq!(em.generation(ALIVE.index()), 1);
 
             assert!(!em.is_alive(DEAD));
             assert_eq!(em.generation(DEAD.index()), 2);
-            assert_eq!(em.components(DEAD).count(), 0);
         }
 
         let mut world = world_with_components();
@@ -232,132 +215,6 @@ mod tests {
     }
 
     #[test]
-    fn components_lists_what_the_entity_has() {
-        let mut world = world_with_components();
-        let entity = world.entity_manager().spawn();
-        let other = world.entity_manager().spawn();
-        world.set_component(entity, Health(1));
-        world.set_component(entity, Armor(2));
-        world.set_component(other, Armor(3));
-
-        let em = world.entity_manager();
-        let uuids: Vec<u128> = em.components(entity).map(|c| c.uuid).collect();
-        let mut expected = vec![Health::TYPE_UUID, Armor::TYPE_UUID];
-        expected.sort_unstable();
-        assert_eq!(uuids, expected);
-
-        let names: Vec<&str> = em.components(other).map(|c| c.type_name).collect();
-        assert_eq!(names, vec![std::any::type_name::<Armor>()]);
-    }
-
-    #[test]
-    fn components_skips_removed_and_uninitialized_components() {
-        let mut world = world_with_components();
-        let entity = world.entity_manager().spawn();
-        world.set_component(entity, Health(1));
-        world.remove_component::<Health>(entity);
-
-        assert_eq!(world.entity_manager().components(entity).count(), 0);
-        assert!(!world.has_resource::<crate::component::ComponentMap<Unused>>());
-    }
-
-    #[test]
-    fn components_is_empty_for_despawned_entity() {
-        let mut world = world_with_components();
-        let entity = world.entity_manager().spawn();
-        world.set_component(entity, Health(1));
-        world.entity_manager().despawn(entity);
-
-        assert_eq!(world.entity_manager().components(entity).count(), 0);
-    }
-
-    #[test]
-    fn components_updates_immediately_while_maps_are_held() {
-        #[system]
-        fn change_and_list(
-            mut health: Mut<Component<Health>>,
-            mut armor: Mut<Component<Armor>>,
-            mut em: Mut<EntityManager>,
-        ) {
-            let entity = em.spawn();
-            assert_eq!(em.components(entity).count(), 0);
-
-            health.insert(entity, Health(1));
-            armor.insert(entity, Armor(2));
-            assert_eq!(em.components(entity).count(), 2);
-
-            health.remove(entity);
-            let names: Vec<&str> = em.components(entity).map(|c| c.type_name).collect();
-            assert_eq!(names, vec![std::any::type_name::<Armor>()]);
-        }
-
-        let mut world = world_with_components();
-        change_and_list.into_system().run(&mut world);
-    }
-
-    #[test]
-    fn components_can_be_looped_while_changing_components() {
-        #[system]
-        fn loop_and_change(
-            mut health: Mut<Component<Health>>,
-            mut armor: Mut<Component<Armor>>,
-            mut em: Mut<EntityManager>,
-        ) {
-            let entity = em.spawn();
-            health.insert(entity, Health(1));
-            armor.insert(entity, Armor(2));
-
-            for _ in em.components(entity) {
-                health.remove(entity);
-                armor.remove(entity);
-            }
-            assert_eq!(em.components(entity).count(), 0);
-        }
-
-        let mut world = world_with_components();
-        loop_and_change.into_system().run(&mut world);
-    }
-
-    #[test]
-    fn reused_index_starts_with_no_components_in_mask() {
-        let mut world = world_with_components();
-        let old = world.entity_manager().spawn();
-        world.set_component(old, Health(1));
-        world.entity_manager().despawn(old);
-
-        let new = world.entity_manager().spawn();
-        assert_eq!(new.index(), old.index());
-        assert_eq!(world.entity_manager().components(new).count(), 0);
-
-        world.set_component(new, Armor(1));
-        let names: Vec<&str> = world
-            .entity_manager()
-            .components(new)
-            .map(|c| c.type_name)
-            .collect();
-        assert_eq!(names, vec![std::any::type_name::<Armor>()]);
-    }
-
-    #[test]
-    fn rejected_insert_from_old_entity_does_not_change_mask() {
-        let mut world = world_with_components();
-        let old = world.entity_manager().spawn();
-        world.entity_manager().despawn(old);
-        let new = world.entity_manager().spawn();
-        world.set_component(new, Health(1));
-
-        world.set_component(old, Health(2));
-        world.set_component(old, Armor(2));
-
-        let uuids: Vec<u128> = world
-            .entity_manager()
-            .components(new)
-            .map(|c| c.uuid)
-            .collect();
-        assert_eq!(uuids, vec![Health::TYPE_UUID]);
-    }
-
-    #[test]
     fn entity_spawns_with_correct_bits() {
         let mut world = World::new();
         world.init_param::<Mut<EntityManager>>();
@@ -400,7 +257,6 @@ mod tests {
         let first = world.entity_manager().spawn();
 
         assert!(!world.has_component::<Health>(first));
-        assert_eq!(world.entity_manager().components(first).count(), 0);
     }
 
     #[test]
@@ -417,6 +273,5 @@ mod tests {
 
         assert!(world.entity_manager().is_alive(first));
         assert_eq!(world.get_component::<Health>(first).unwrap().0, 1);
-        assert_eq!(world.entity_manager().components(first).count(), 1);
     }
 }
