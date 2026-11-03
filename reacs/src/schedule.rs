@@ -116,6 +116,25 @@ impl SystemGraph {
         let mut blockers = vec![0usize; count];
 
         let index_of = |uuid: &u128| self.nodes.binary_search_by_key(uuid, |x| x.uuid).ok();
+
+        for system in &self.nodes {
+            for inner in system.groups.iter().filter_map(index_of) {
+                let inner = &self.nodes[inner];
+                if let Some(outer) = inner.groups.iter().find_map(index_of) {
+                    let outer = &self.nodes[outer];
+                    panic!(
+                        "nested groups aren't supported: `{}::{}` is in group `{}::{}`, which is in group `{}::{}`",
+                        system.module,
+                        system.name,
+                        inner.module,
+                        inner.name,
+                        outer.module,
+                        outer.name
+                    );
+                }
+            }
+        }
+
         for (i, system) in self.nodes.iter().enumerate() {
             for next in system.before.iter().filter_map(index_of) {
                 successors[i].push(next);
@@ -1201,6 +1220,24 @@ mod tests {
             message,
             cycle_message(&["group_second", "input", "group_second"])
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "nested groups aren't supported")]
+    fn nested_group_panics() {
+        graph_of(vec![
+            group("outer", &[], &[]),
+            member(group("inner", &[], &[]), &["outer"]),
+            member(group("leaf", &[], &[]), &["inner"]),
+        ]);
+    }
+
+    #[test]
+    fn member_with_no_members_of_its_own_is_not_nested() {
+        graph_of(vec![
+            group("outer", &[], &[]),
+            member(group("inner", &[], &[]), &["outer"]),
+        ]);
     }
 
     #[test]
