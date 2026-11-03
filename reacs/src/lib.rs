@@ -24,7 +24,7 @@ pub mod prelude {
     pub use crate::component::Component;
     pub use crate::entity::{Entity, EntityManager};
     pub use crate::hashed::Hashed;
-    pub use crate::resource::Resource;
+    pub use crate::resource::{LocalResource, Resource};
     pub use crate::schedule::{
         IntoSystem, Mut, SystemEntry, SystemGraph, SystemParam, WorldAccess, system_graph,
     };

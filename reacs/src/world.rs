@@ -1,14 +1,16 @@
 use std::{
-    any::Any,
+    any::{Any, TypeId},
     cell::{Ref, RefCell, RefMut},
 };
 
 use crate::{
     hashed::Hashed,
+    resource::LocalResourceType,
     schedule::{CurrentSystem, system_graph},
 };
 pub struct World {
     pub resources: Vec<(u128, Box<RefCell<dyn Any>>)>,
+    local_resources: Vec<(TypeId, Box<RefCell<dyn Any>>)>,
 }
 
 impl World {
@@ -16,6 +18,7 @@ impl World {
     pub fn new() -> Self {
         let mut world = Self {
             resources: Vec::new(),
+            local_resources: Vec::new(),
         };
 
         world.init_resource::<CurrentSystem>();
@@ -79,6 +82,61 @@ impl World {
         let id = R::TYPE_UUID;
         let i = self.resources.binary_search_by(|x| x.0.cmp(&id)).ok()?;
         let resource = self.resources[i].1.try_borrow_mut().ok()?;
+        RefMut::filter_map(resource, |any| any.downcast_mut::<R>()).ok()
+    }
+
+    #[inline]
+    fn find_local_resource<R: LocalResourceType>(&self) -> Result<usize, usize> {
+        let id = TypeId::of::<R>();
+        self.local_resources.binary_search_by(|x| x.0.cmp(&id))
+    }
+
+    #[inline]
+    pub fn init_local_resource<R: LocalResourceType>(&mut self) {
+        if !self.has_local_resource::<R>() {
+            self.insert_local_resource(R::default());
+        }
+    }
+
+    #[inline]
+    pub fn insert_local_resource<R: LocalResourceType>(&mut self, resource: R) {
+        let new_resource = Box::new(RefCell::new(resource));
+
+        match self.find_local_resource::<R>() {
+            Ok(i) => self.local_resources[i].1 = new_resource,
+            Err(i) => self
+                .local_resources
+                .insert(i, (TypeId::of::<R>(), new_resource)),
+        }
+    }
+
+    #[inline]
+    pub fn remove_local_resource<R: LocalResourceType>(&mut self) -> bool {
+        let search_result = self.find_local_resource::<R>();
+
+        if let Ok(i) = search_result {
+            self.local_resources.remove(i);
+        }
+
+        search_result.is_ok()
+    }
+
+    #[inline]
+    pub fn has_local_resource<R: LocalResourceType>(&self) -> bool {
+        self.find_local_resource::<R>().is_ok()
+    }
+
+    #[inline]
+    pub fn get_local_resource<R: LocalResourceType>(&self) -> Option<Ref<'_, R>> {
+        let i = self.find_local_resource::<R>().ok()?;
+        let resource = self.local_resources[i].1.try_borrow().ok()?;
+        Ref::filter_map(resource, |any| any.downcast_ref::<R>()).ok()
+    }
+
+    #[inline]
+    pub fn get_local_resource_mut<R: LocalResourceType>(&self) -> Option<RefMut<'_, R>> {
+        let i = self.find_local_resource::<R>().ok()?;
+        let resource = self.local_resources[i].1.try_borrow_mut().ok()?;
         RefMut::filter_map(resource, |any| any.downcast_mut::<R>()).ok()
     }
 }

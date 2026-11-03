@@ -93,12 +93,45 @@ pub fn derive_hashed_def(input: TokenStream) -> TokenStream {
 }
 
 #[proc_macro_attribute]
-pub fn resource(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let mut local = false;
+    let attr_parser = syn::meta::parser(|meta| {
+        if meta.path.is_ident("local") {
+            local = true;
+            Ok(())
+        } else {
+            Err(meta.error("expected `local`"))
+        }
+    });
+    parse_macro_input!(attr with attr_parser);
+
     let input = parse_macro_input!(item as DeriveInput);
     let name = &input.ident;
     let snake_name = format_ident!("{}", name.to_string().to_lowercase());
     let ctor_fn = format_ident!("__register_type_{}", snake_name);
     let link = linked_crates();
+
+    if local {
+        if !input.generics.params.is_empty() {
+            return syn::Error::new(
+                input.generics.span(),
+                "#[resource(local)] does not support generic resources",
+            )
+            .to_compile_error()
+            .into();
+        }
+
+        return TokenStream::from(quote! {
+            #[derive(::core::default::Default)]
+            #input
+
+            impl ::reacs::resource::LocalResourceType for #name {}
+
+            const _: () = {
+                #link
+            };
+        });
+    }
 
     let expanded = quote! {
         #[derive(

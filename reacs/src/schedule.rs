@@ -1,4 +1,5 @@
 use crate::hashed::{Hashed, hash_path};
+use crate::resource::LocalResourceType;
 use crate::world::World;
 
 use reacs_derive::resource;
@@ -275,6 +276,7 @@ pub trait Mode {
     type Guard<'w, T: 'w>: Deref<Target = T>;
     type WorldGuard<'w>: Deref<Target = World>;
     fn fetch<'w, T: 'static + Hashed>(world: &'w World) -> Self::Guard<'w, T>;
+    fn fetch_local<'w, T: LocalResourceType>(world: &'w World) -> Self::Guard<'w, T>;
 }
 
 impl Mode for Read {
@@ -282,6 +284,11 @@ impl Mode for Read {
     type WorldGuard<'w> = &'w World;
     fn fetch<'w, T: 'static + Hashed>(world: &'w World) -> Ref<'w, T> {
         world.get_resource::<T>().unwrap_or_else(|| conflict::<T>())
+    }
+    fn fetch_local<'w, T: LocalResourceType>(world: &'w World) -> Ref<'w, T> {
+        world
+            .get_local_resource::<T>()
+            .unwrap_or_else(|| conflict::<T>())
     }
 }
 
@@ -291,6 +298,11 @@ impl Mode for Write {
     fn fetch<'w, T: 'static + Hashed>(world: &'w World) -> RefMut<'w, T> {
         world
             .get_resource_mut_silent::<T>()
+            .unwrap_or_else(|| conflict::<T>())
+    }
+    fn fetch_local<'w, T: LocalResourceType>(world: &'w World) -> RefMut<'w, T> {
+        world
+            .get_local_resource_mut::<T>()
             .unwrap_or_else(|| conflict::<T>())
     }
 }
