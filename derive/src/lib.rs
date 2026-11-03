@@ -95,15 +95,25 @@ pub fn derive_hashed_def(input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut local = false;
+    let mut on_load: Option<syn::Ident> = None;
     let attr_parser = syn::meta::parser(|meta| {
         if meta.path.is_ident("local") {
             local = true;
             Ok(())
+        } else if meta.path.is_ident("on_load") {
+            on_load = Some(meta.value()?.parse()?);
+            Ok(())
         } else {
-            Err(meta.error("expected `local`"))
+            Err(meta.error("expected `local` or `on_load = method`"))
         }
     });
     parse_macro_input!(attr with attr_parser);
+
+    if let (Some(hook), false) = (&on_load, local) {
+        return syn::Error::new(hook.span(), "`on_load` requires `local`")
+            .to_compile_error()
+            .into();
+    }
 
     let input = parse_macro_input!(item as DeriveInput);
     let name = &input.ident;
@@ -121,11 +131,20 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
             .into();
         }
 
+        let on_load = on_load.map(|hook| {
+            quote! {
+                const ON_LOAD: ::core::option::Option<fn(&mut Self, &::reacs::world::World)> =
+                    ::core::option::Option::Some(Self::#hook);
+            }
+        });
+
         return TokenStream::from(quote! {
             #[derive(::core::default::Default)]
             #input
 
-            impl ::reacs::resource::LocalResourceType for #name {}
+            impl ::reacs::resource::LocalResourceType for #name {
+                #on_load
+            }
 
             const _: () = {
                 #link

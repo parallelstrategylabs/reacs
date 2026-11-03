@@ -48,7 +48,9 @@ impl<T: 'static + Default + Hashed, M: Mode> SystemParam for Resource<'_, T, M> 
     message = "`{Self}` is not a local resource",
     note = "declare it with #[resource(local)]"
 )]
-pub trait LocalResourceType: 'static + Default {}
+pub trait LocalResourceType: 'static + Default {
+    const ON_LOAD: Option<fn(&mut Self, &World)> = None;
+}
 
 pub struct LocalResource<'w, T: 'static, M: Mode = Read>(pub M::Guard<'w, T>);
 

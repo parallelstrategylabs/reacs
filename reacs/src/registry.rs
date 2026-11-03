@@ -1,11 +1,21 @@
 use std::collections::hash_map::Entry as MapEntry;
-use std::{any::Any, collections::HashMap, ptr::addr_of_mut};
+use std::{any::Any, cell::RefCell, collections::HashMap, ptr::addr_of_mut};
 
 #[derive(Debug)]
 pub struct RegistryEntry {
     pub type_name: &'static str,
     pub serialize: fn(&dyn Any) -> Vec<u8>,
     pub deserialize: fn(&[u8]) -> Box<dyn Any>,
+    pub(crate) restore: fn(&[u8]) -> Box<RefCell<dyn Any>>,
+}
+
+fn decode<T: for<'de> serde::Deserialize<'de>>(bytes: &[u8]) -> T {
+    bincode::deserialize(bytes).unwrap_or_else(|error| {
+        panic!(
+            "Failed to deserialize `{}`: {error}",
+            std::any::type_name::<T>()
+        )
+    })
 }
 
 pub static mut REGISTRY: Option<HashMap<u128, RegistryEntry>> = None;
@@ -27,7 +37,8 @@ where
                 slot.insert(RegistryEntry {
                     type_name: std::any::type_name::<T>(),
                     serialize: |v| bincode::serialize(v.downcast_ref::<T>().unwrap()).unwrap(),
-                    deserialize: |b| Box::new(bincode::deserialize::<T>(b).unwrap()),
+                    deserialize: |b| Box::new(decode::<T>(b)),
+                    restore: |b| Box::new(RefCell::new(decode::<T>(b))),
                 });
             }
         }

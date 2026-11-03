@@ -21,7 +21,7 @@ pub fn system_graph() -> &'static SystemGraph {
     unsafe { &*addr_of!(SYSTEM_GRAPH) }
 }
 
-const ANONYMOUS_SYSTEM: u128 = 0;
+pub(crate) const ANONYMOUS_SYSTEM: u128 = 0;
 
 #[resource]
 pub struct CurrentSystem(pub u128);
@@ -75,7 +75,7 @@ impl SystemEntry {
     }
 }
 
-fn set_current_system(world: &World, uuid: u128) {
+pub(crate) fn set_current_system(world: &World, uuid: u128) {
     if let Some(mut current) = world.get_resource_mut_silent::<CurrentSystem>() {
         current.0 = uuid;
     }
