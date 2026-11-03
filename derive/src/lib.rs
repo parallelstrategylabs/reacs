@@ -7,6 +7,48 @@ use syn::{
 
 mod param_impl;
 
+fn linked_crates() -> proc_macro2::TokenStream {
+    let mut args = Vec::new();
+    for arg in std::env::args_os().filter_map(|arg| arg.into_string().ok()) {
+        match arg.strip_prefix('@') {
+            Some(path) => args.extend(
+                std::fs::read_to_string(path)
+                    .unwrap_or_default()
+                    .lines()
+                    .map(String::from),
+            ),
+            None => args.push(arg),
+        }
+    }
+
+    let mut names: Vec<&str> = args
+        .windows(2)
+        .filter(|pair| pair[0] == "--extern")
+        .filter_map(|pair| pair[1].split('=').next()?.rsplit(':').next())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+
+    let names = names
+        .into_iter()
+        .filter_map(|name| syn::parse_str::<syn::Ident>(name).ok());
+
+    quote! { #( use #names as _; )* }
+}
+
+#[proc_macro]
+pub fn world(input: TokenStream) -> TokenStream {
+    parse_macro_input!(input as syn::parse::Nothing);
+    let link = linked_crates();
+
+    TokenStream::from(quote! {
+        {
+            #link
+            ::reacs::world::World::new()
+        }
+    })
+}
+
 #[proc_macro_derive(Hashed)]
 pub fn derive_hashed_def(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -56,6 +98,7 @@ pub fn resource(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let name = &input.ident;
     let snake_name = format_ident!("{}", name.to_string().to_lowercase());
     let ctor_fn = format_ident!("__register_type_{}", snake_name);
+    let link = linked_crates();
 
     let expanded = quote! {
         #[derive(
@@ -68,6 +111,7 @@ pub fn resource(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #[::ctor::ctor]
         fn #ctor_fn() {
+            #link
             ::reacs::registry::register_entry::<#name>(
                 <#name as ::reacs::hashed::Hashed>::TYPE_UUID
             );
@@ -83,6 +127,7 @@ pub fn component(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let name = &input.ident;
     let snake_name = format_ident!("{}", name.to_string().to_lowercase());
     let ctor_fn = format_ident!("__register_type_{}", snake_name);
+    let link = linked_crates();
 
     let expanded = quote! {
         #[derive(
@@ -98,6 +143,7 @@ pub fn component(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #[::ctor::ctor]
         #[allow(non_snake_case)]
         fn #ctor_fn() {
+        #link
         type Map = ::reacs::direct_map::DirectMap<#name>;
         ::reacs::registry::register_entry::<Map>(
             <Map as ::reacs::hashed::Hashed>::TYPE_UUID,
@@ -137,6 +183,7 @@ pub fn system(attr: TokenStream, item: TokenStream) -> TokenStream {
     let name = &input.sig.ident;
     let name_str = name.to_string();
     let ctor_fn = format_ident!("__register_system_{}", name);
+    let link = linked_crates();
 
     let mut param_types = Vec::new();
     for arg in &input.sig.inputs {
@@ -166,6 +213,7 @@ pub fn system(attr: TokenStream, item: TokenStream) -> TokenStream {
         #[::ctor::ctor]
         #[allow(non_snake_case)]
         fn #ctor_fn() {
+            #link
             #( let _ = #run_before; )*
             #( let _ = #run_after; )*
             #( let _ = #in_group; )*
@@ -206,6 +254,7 @@ pub fn signal(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let snake_name = format_ident!("{}", name.to_string().to_lowercase());
     let ctor_fn = format_ident!("__register_signal_{}", snake_name);
+    let link = linked_crates();
 
     let expanded = quote! {
         #[derive(
@@ -223,6 +272,7 @@ pub fn signal(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #[::ctor::ctor]
         #[allow(non_snake_case)]
         fn #ctor_fn() {
+            #link
             type Signals = ::reacs::signal::Signals<#name>;
             type Data = ::reacs::signal::SignalData<#name>;
             ::reacs::registry::register_entry::<Signals>(

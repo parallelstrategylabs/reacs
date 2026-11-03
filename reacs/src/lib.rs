@@ -25,7 +25,9 @@ pub mod prelude {
     pub use crate::signal::{Signal, SignalType};
     pub use crate::world::World;
 
-    pub use reacs_derive::{Hashed as DeriveHashed, component, param, resource, signal, system};
+    pub use reacs_derive::{
+        Hashed as DeriveHashed, component, param, resource, signal, system, world,
+    };
 }
 
 #[resource]

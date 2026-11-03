@@ -95,6 +95,13 @@ mod tests {
     struct IntResource(pub u64);
 
     #[test]
+    fn world_macro_creates_initialized_world() {
+        let world = world!();
+
+        assert!(world.has_resource::<crate::schedule::CurrentSystem>());
+    }
+
+    #[test]
     fn get_resource_returns_none_while_mutably_borrowed() {
         let mut world = World::new();
         world.init_resource::<IntResource>();
