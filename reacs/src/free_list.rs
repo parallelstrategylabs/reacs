@@ -91,3 +91,105 @@ impl FreeList {
         self.bitset.set(index, false);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reserves_sequentially_across_words() {
+        let mut list = FreeList::new();
+        for expected in 0..200 {
+            assert_eq!(list.reserve(), expected);
+        }
+        assert_eq!(list.bitset.words.len(), 4);
+    }
+
+    #[test]
+    fn reserve_and_free_update_the_index_bit() {
+        let mut list = FreeList::new();
+        let index = list.reserve() as usize;
+        assert!(list.bitset.get(index));
+        assert!(!list.bitset.get(index + 1));
+
+        list.free(index);
+        assert!(!list.bitset.get(index));
+    }
+
+    #[test]
+    fn lowest_freed_index_is_reused_first() {
+        let mut list = FreeList::new();
+        for _ in 0..130 {
+            list.reserve();
+        }
+        list.free(100);
+        list.free(10);
+        list.free(3);
+        assert_eq!(list.reserve(), 3);
+        assert_eq!(list.reserve(), 10);
+        assert_eq!(list.reserve(), 100);
+        assert_eq!(list.reserve(), 130);
+    }
+
+    #[test]
+    fn full_words_are_skipped() {
+        let mut list = FreeList::new();
+        for _ in 0..130 {
+            list.reserve();
+        }
+        list.free(70);
+        assert_eq!(list.reserve(), 70);
+        assert_eq!(list.reserve(), 130);
+    }
+
+    #[test]
+    fn first_bit_of_a_word_is_reused_when_it_is_the_only_free_one() {
+        let mut list = FreeList::new();
+        for _ in 0..64 {
+            list.reserve();
+        }
+        list.free(0);
+        assert_eq!(list.reserve(), 0);
+        assert_eq!(list.reserve(), 64);
+    }
+
+    #[test]
+    fn last_bit_of_a_word_is_reserved_before_a_new_word() {
+        let mut list = FreeList::new();
+        for _ in 0..64 {
+            list.reserve();
+        }
+        assert_eq!(list.bitset.words.len(), 1);
+        list.free(63);
+        assert_eq!(list.reserve(), 63);
+        assert_eq!(list.bitset.words.len(), 1);
+        assert_eq!(list.reserve(), 64);
+        assert_eq!(list.bitset.words.len(), 2);
+    }
+
+    #[test]
+    fn freeing_an_unreserved_index_does_nothing() {
+        let mut list = FreeList::new();
+        list.free(1_000);
+        assert!(list.bitset.words.is_empty());
+
+        assert_eq!(list.reserve(), 0);
+        list.free(5);
+        assert_eq!(list.reserve(), 1);
+    }
+
+    #[test]
+    fn serialization_round_trip_keeps_reservations() {
+        let mut list = FreeList::new();
+        for _ in 0..70 {
+            list.reserve();
+        }
+        list.free(5);
+
+        let bytes = bincode::serialize(&list).unwrap();
+        let mut restored: FreeList = bincode::deserialize(&bytes).unwrap();
+
+        assert_eq!(restored.reserve(), 5);
+        assert_eq!(restored.reserve(), 70);
+    }
+}
