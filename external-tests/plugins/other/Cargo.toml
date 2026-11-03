@@ -1,0 +1,9 @@
+[package]
+name = "plugin-other"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+reacs = { path = "../../../reacs" }
+plugin-leaf = { path = "../leaf" }

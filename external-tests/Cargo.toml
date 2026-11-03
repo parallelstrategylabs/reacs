@@ -1,0 +1,10 @@
+[package]
+name = "reacs-external-tests"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dev-dependencies]
+reacs = { path = "../reacs" }
+plugin-top = { path = "plugins/top" }
+plugin-other = { path = "plugins/other" }

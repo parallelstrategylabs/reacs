@@ -135,6 +135,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
+name = "plugin-leaf"
+version = "0.0.0"
+dependencies = [
+ "reacs",
+]
+
+[[package]]
+name = "plugin-mid"
+version = "0.0.0"
+dependencies = [
+ "plugin-leaf",
+ "reacs",
+]
+
+[[package]]
+name = "plugin-other"
+version = "0.0.0"
+dependencies = [
+ "plugin-leaf",
+ "reacs",
+]
+
+[[package]]
+name = "plugin-top"
+version = "0.0.0"
+dependencies = [
+ "plugin-mid",
+ "reacs",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -173,6 +204,15 @@ dependencies = [
  "sha2",
  "syn 2.0.119",
  "uuid",
+]
+
+[[package]]
+name = "reacs-external-tests"
+version = "0.0.0"
+dependencies = [
+ "plugin-other",
+ "plugin-top",
+ "reacs",
 ]
 
 [[package]]
