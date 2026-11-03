@@ -104,6 +104,13 @@ impl SystemGraph {
             );
         }
 
+        if system.groups.iter().any(|group| *group != system.groups[0]) {
+            panic!(
+                "system `{}::{}` is in more than one group: a system can only belong to one group, so keep one `in_group` target and use `run_after` or `run_before` to order it against the others",
+                system.module, system.name
+            );
+        }
+
         self.nodes.push(system);
         self.sort();
     }
@@ -185,9 +192,59 @@ impl SystemGraph {
             );
         }
 
+        let block_of: Vec<usize> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, system)| system.groups.iter().find_map(index_of).unwrap_or(i))
+            .collect();
+
+        let mut blocks = vec![Vec::new(); count];
+        for &i in &order {
+            blocks[block_of[i]].push(i);
+        }
+
+        let mut block_successors = vec![Vec::new(); count];
+        let mut block_blockers = vec![0usize; count];
+        for (i, nexts) in successors.iter().enumerate() {
+            for &next in nexts {
+                if block_of[i] != block_of[next] {
+                    block_successors[block_of[i]].push(block_of[next]);
+                    block_blockers[block_of[next]] += 1;
+                }
+            }
+        }
+
+        let mut ready: BinaryHeap<_> = (0..count)
+            .filter(|&i| block_of[i] == i && block_blockers[i] == 0)
+            .map(Reverse)
+            .collect();
+        let mut block_order = Vec::with_capacity(count);
+
+        while let Some(Reverse(i)) = ready.pop() {
+            block_order.push(i);
+            for &next in &block_successors[i] {
+                block_blockers[next] -= 1;
+                if block_blockers[next] == 0 {
+                    ready.push(Reverse(next));
+                }
+            }
+        }
+
+        if block_order.iter().map(|&i| blocks[i].len()).sum::<usize>() != count {
+            panic!(
+                "system ordering cycle: {} (a group and its members run as one block, so nothing else can run between them)",
+                self.describe_cycle(&block_successors, &block_blockers)
+            );
+        }
+
         let mut slots: Vec<_> = self.nodes.drain(..).map(Some).collect();
-        self.nodes
-            .extend(order.into_iter().map(|i| slots[i].take().unwrap()));
+        self.nodes.extend(
+            block_order
+                .into_iter()
+                .flat_map(|block| std::mem::take(&mut blocks[block]))
+                .map(|i| slots[i].take().unwrap()),
+        );
     }
 
     fn describe_cycle(&self, successors: &[Vec<usize>], blockers: &[usize]) -> String {
@@ -1209,17 +1266,77 @@ mod tests {
     }
 
     #[test]
-    fn member_of_two_ordered_groups_panics() {
-        let message = cycle_panic(vec![
+    #[should_panic(expected = "a system can only belong to one group")]
+    fn member_of_two_groups_panics() {
+        graph_of(vec![
             group("group_first", &[], &[]),
-            group("group_second", &[], &["group_first"]),
+            group("group_second", &[], &[]),
             member(entry("input", &[], &[]), &["group_first", "group_second"]),
         ]);
+    }
 
-        assert_eq!(
-            message,
-            cycle_message(&["group_second", "input", "group_second"])
+    #[test]
+    fn repeating_the_same_group_is_one_group() {
+        let graph = graph_of(vec![
+            group("group_first", &[], &[]),
+            member(entry("input", &[], &[]), &["group_first", "group_first"]),
+        ]);
+
+        assert_eq!(names(&graph), ["group_first", "input"]);
+    }
+
+    #[test]
+    fn unrelated_systems_never_run_inside_a_group() {
+        let unrelated = (0..200).map(|i| &*format!("unrelated{i}").leak());
+        let members = (0..6).map(|i| &*format!("member{i}").leak());
+
+        let mut entries = vec![group("group_first", &[], &[])];
+        entries.extend(members.map(|name| member(group(name, &[], &[]), &["group_first"])));
+        entries.extend(unrelated.map(|name| group(name, &[], &[])));
+        let graph = graph_of(entries);
+
+        let names = names(&graph);
+        let start = names.iter().position(|n| *n == "group_first").unwrap();
+        assert!(
+            names[start + 1..start + 7]
+                .iter()
+                .all(|n| n.starts_with("member"))
         );
+    }
+
+    #[test]
+    fn member_ordering_moves_the_whole_block() {
+        for entries in [
+            vec![
+                group("group_first", &[], &[]),
+                member(entry("render", &[], &["physics"]), &["group_first"]),
+                member(entry("input", &[], &[]), &["group_first"]),
+                entry("physics", &[], &[]),
+            ],
+            vec![
+                entry("physics", &[], &[]),
+                member(entry("input", &[], &[]), &["group_first"]),
+                member(entry("render", &[], &["physics"]), &["group_first"]),
+                group("group_first", &[], &[]),
+            ],
+        ] {
+            let graph = graph_of(entries);
+            let names = names(&graph);
+
+            assert_eq!(names[0], "physics");
+            assert_eq!(names[1], "group_first");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "run as one block")]
+    fn system_ordered_between_members_panics() {
+        graph_of(vec![
+            group("group_first", &[], &[]),
+            member(entry("input", &[], &[]), &["group_first"]),
+            member(entry("render", &[], &["physics"]), &["group_first"]),
+            entry("physics", &[], &["input"]),
+        ]);
     }
 
     #[test]
