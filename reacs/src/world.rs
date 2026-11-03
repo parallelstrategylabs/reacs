@@ -4,6 +4,7 @@ use std::{
 };
 
 use crate::{
+    Tick,
     hashed::Hashed,
     registry::get_registry_entry,
     resource::LocalResourceType,
@@ -47,6 +48,7 @@ impl World {
         };
 
         world.init_resource::<CurrentSystem>();
+        world.init_resource::<Tick>();
         system_graph().init(&mut world);
 
         world

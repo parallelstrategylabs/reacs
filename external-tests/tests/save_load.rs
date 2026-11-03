@@ -73,33 +73,21 @@ fn burner(
     }
 }
 
-fn step(world: &mut World) {
-    world.run_systems();
-    world.cleanup_signals();
-    world.get_resource_mut::<Tick>().unwrap().0 += 1;
-}
-
-fn new_world() -> World {
-    let mut world = World::new();
-    world.init_resource::<Tick>();
-    world
-}
-
 #[test]
 fn restored_run_matches_original() {
-    let mut original = new_world();
+    let mut original = World::new();
     for _ in 0..10 {
-        step(&mut original);
+        original.step();
     }
 
     let save = original.save();
-    let mut restored = new_world();
+    let mut restored = World::new();
     restored.load(&save);
     assert_eq!(restored.save(), save);
 
     for _ in 0..20 {
-        step(&mut original);
-        step(&mut restored);
+        original.step();
+        restored.step();
         assert_eq!(restored.save(), original.save());
     }
 
@@ -108,21 +96,21 @@ fn restored_run_matches_original() {
 
 #[test]
 fn loading_into_a_used_world_rewinds_it() {
-    let mut world = new_world();
+    let mut world = World::new();
     for _ in 0..7 {
-        step(&mut world);
+        world.step();
     }
 
     let save = world.save();
     let mut expected = Vec::new();
     for _ in 0..7 {
-        step(&mut world);
+        world.step();
         expected.push(world.save());
     }
 
     world.load(&save);
     for bytes in expected {
-        step(&mut world);
+        world.step();
         assert_eq!(world.save(), bytes);
     }
 }

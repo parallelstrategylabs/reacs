@@ -1,3 +1,4 @@
+use crate::Tick;
 use crate::hashed::{Hashed, hash_path};
 use crate::resource::LocalResourceType;
 use crate::world::World;
@@ -472,6 +473,14 @@ impl World {
     #[inline]
     pub fn run_systems(&mut self) {
         system_graph().run(self);
+    }
+
+    pub fn step(&mut self) {
+        self.run_systems();
+        self.cleanup_signals();
+        self.get_resource_mut::<Tick>()
+            .unwrap_or_else(|| conflict::<Tick>())
+            .0 += 1;
     }
 }
 
