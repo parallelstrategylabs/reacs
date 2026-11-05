@@ -133,11 +133,12 @@ enum ReceiveStage {
 
 struct ReceiveIter<'a, S: SignalType> {
     run: std::slice::Iter<'a, SignalInstance<S>>,
+    entries: std::slice::Iter<'a, (SignalWindow, SignalInstance<S>)>,
     stage: ReceiveStage,
     transient: std::slice::Iter<'a, SignalInstance<S>>,
     windowed: &'a [(SignalWindow, SignalInstance<S>)],
     transient_buffer: &'a [SignalInstance<S>],
-    active: std::slice::Iter<'a, (SignalWindow, SignalInstance<S>)>,
+    active: &'a [(SignalWindow, SignalInstance<S>)],
     permanent: &'a [SignalInstance<S>],
     write: usize,
     read: usize,
@@ -146,10 +147,23 @@ struct ReceiveIter<'a, S: SignalType> {
 }
 
 impl<'a, S: SignalType> ReceiveIter<'a, S> {
+    #[inline]
+    fn next_entry(&mut self) -> Option<&'a S> {
+        for entry in self.entries.by_ref() {
+            if !entry.0.is_cancelled() {
+                return Some(&entry.1.payload);
+            }
+        }
+        None
+    }
+
     fn next_slow(&mut self) -> Option<&'a S> {
         loop {
             if let Some(signal) = self.run.next() {
                 return Some(&signal.payload);
+            }
+            if let Some(signal) = self.next_entry() {
+                return Some(signal);
             }
 
             match self.stage {
@@ -175,16 +189,14 @@ impl<'a, S: SignalType> ReceiveIter<'a, S> {
                     self.run = self.transient_buffer.iter();
                     self.stage = ReceiveStage::Active;
                 }
-                ReceiveStage::Active => match self.active.find(|x| !x.0.is_cancelled()) {
-                    Some(x) => return Some(&x.1.payload),
-                    None => {
-                        self.stage = if self.cancelled.is_some() {
-                            ReceiveStage::PermanentCancelled
-                        } else {
-                            ReceiveStage::PermanentLeft
-                        };
-                    }
-                },
+                ReceiveStage::Active => {
+                    self.entries = self.active.iter();
+                    self.stage = if self.cancelled.is_some() {
+                        ReceiveStage::PermanentCancelled
+                    } else {
+                        ReceiveStage::PermanentLeft
+                    };
+                }
                 ReceiveStage::PermanentLeft => {
                     self.run = self.permanent[..self.write].iter();
                     self.stage = ReceiveStage::PermanentRight;
@@ -226,6 +238,9 @@ impl<'a, S: SignalType> Iterator for ReceiveIter<'a, S> {
     fn next(&mut self) -> Option<&'a S> {
         if let Some(signal) = self.run.next() {
             return Some(&signal.payload);
+        }
+        if let Some(signal) = self.next_entry() {
+            return Some(signal);
         }
         self.next_slow()
     }
@@ -372,7 +387,8 @@ impl<S: SignalType> Signals<S> {
             transient: transient.iter(),
             windowed,
             transient_buffer,
-            active: self.transitory_active.iter(),
+            entries: [].iter(),
+            active: &self.transitory_active,
             permanent: &self.permanent,
             write: self.permanent_write,
             read: self.permanent_read,
@@ -381,7 +397,7 @@ impl<S: SignalType> Signals<S> {
         }
     }
 
-    pub fn sweep(&mut self, budget: u64, mut keep: impl FnMut(&S) -> bool) -> (u64, bool) {
+    pub(crate) fn sweep(&mut self, budget: u64, mut keep: impl FnMut(&S) -> bool) -> (u64, bool) {
         let mut used = 0;
 
         while used < budget && self.permanent_read < self.permanent.len() {
@@ -409,27 +425,44 @@ impl<S: SignalType> Signals<S> {
         (used, finished)
     }
 
-    fn sort_permanent(&mut self, first_new: usize) {
-        let (write, read) = (self.permanent_write, self.permanent_read);
-        let next = (read < first_new).then(|| self.permanent[read].id);
+    fn merge_late_permanent(&mut self, first_new: usize) {
+        let joined = self.permanent[first_new..].to_vec();
+        let mut end = first_new;
 
-        let bits = std::mem::take(&mut self.permanent_cancelled_bits);
-        let mut i = 0;
-        self.permanent.retain(|_| {
-            let in_gap = (write..read).contains(&i);
-            let keep = !in_gap && !bits.get(i);
-            i += 1;
-            keep
-        });
-        self.permanent_cancelled = 0;
-        self.permanent.sort_by_key(|x| x.id);
+        for (i, signal) in joined.iter().enumerate().rev() {
+            let read = self.permanent_read;
+            let start = read + self.permanent[read..end].partition_point(|x| x.id < signal.id);
+            let shift = i + 1;
 
-        let read = next.map_or(0, |id| self.permanent.partition_point(|x| x.id < id));
-        self.permanent_write = read;
-        self.permanent_read = read;
+            self.shift_cancelled_bits(start, end, shift);
+            self.permanent.copy_within(start..end, start + shift);
+            self.permanent[start + i] = *signal;
+            end = start;
+        }
     }
 
-    pub fn cleanup(&mut self, tick: u64) -> bool {
+    fn shift_cancelled_bits(&mut self, start: usize, end: usize, shift: usize) {
+        if self.permanent_cancelled == 0 {
+            return;
+        }
+
+        let bits = &mut self.permanent_cancelled_bits;
+        let mut moved = Vec::new();
+        let mut position = bits.next_set(start, end);
+        while position < end {
+            moved.push(position);
+            position = bits.next_set(position + 1, end);
+        }
+
+        for &position in &moved {
+            bits.set(position, false);
+        }
+        for &position in &moved {
+            bits.set(position + shift, true);
+        }
+    }
+
+    pub fn cleanup(&mut self, tick: u64, keep: impl Fn(&S) -> bool) {
         std::mem::swap(&mut self.transient, &mut self.transient_buffer);
         self.transient_buffer.clear();
 
@@ -439,6 +472,8 @@ impl<S: SignalType> Signals<S> {
 
         let first_new = self.permanent.len();
         let newest = self.permanent.last().map(|x| x.id);
+        let newest_checked = self.permanent[..self.permanent_write].last().map(|x| x.id);
+        let behind_sweep = |id: u64| newest_checked.is_some_and(|checked| id < checked);
 
         let mut l = 0;
         let mut r = 0;
@@ -449,7 +484,14 @@ impl<S: SignalType> Signals<S> {
 
             if active_signal.id < inactive_signal.id {
                 if active_window.end == u64::MAX {
-                    self.permanent.push(active_signal);
+                    if keep(&active_signal.payload) {
+                        if behind_sweep(active_signal.id) {
+                            self.transitory_active_buffer
+                                .push((active_window, active_signal));
+                        } else {
+                            self.permanent.push(active_signal);
+                        }
+                    }
                 } else if active_window.end > next_tick {
                     self.transitory_active_buffer
                         .push((active_window, active_signal));
@@ -472,7 +514,13 @@ impl<S: SignalType> Signals<S> {
         if l < active.len() {
             for &(window, signal) in &active[l..] {
                 if window.end == u64::MAX {
-                    self.permanent.push(signal);
+                    if keep(&signal.payload) {
+                        if behind_sweep(signal.id) {
+                            self.transitory_active_buffer.push((window, signal));
+                        } else {
+                            self.permanent.push(signal);
+                        }
+                    }
                 } else if window.end > next_tick {
                     self.transitory_active_buffer.push((window, signal));
                 }
@@ -505,21 +553,18 @@ impl<S: SignalType> Signals<S> {
         );
         self.transitory_inactive_buffer.clear();
 
-        let joined = self.permanent.len() > first_new;
         let joined_late = self
             .permanent
             .get(first_new)
             .zip(newest)
             .is_some_and(|(joined, newest)| joined.id < newest);
         if joined_late {
-            self.sort_permanent(first_new);
+            self.merge_late_permanent(first_new);
         }
 
-        if !S::Filter::ACTIVE && self.permanent_cancelled > 0 {
+        if !S::Filter::ACTIVE && (self.permanent_cancelled > 0 || self.permanent_read > 0) {
             self.sweep(SWEEP_BUDGET, |_| true);
         }
-
-        joined
     }
 }
 
@@ -692,9 +737,14 @@ fn cleanup_in_world<S: SignalType>(world: &World) {
     ) else {
         return;
     };
-    let joined = signals.cleanup(tick.0);
+    let context = (!signals.transitory_active.is_empty()).then(|| S::Filter::fetch(world));
+    signals.cleanup(tick.0, |signal| {
+        context
+            .as_ref()
+            .is_none_or(|context| S::Filter::keep(context, signal))
+    });
 
-    if S::Filter::ACTIVE && (joined || signals.permanent_cancelled > 0) {
+    if S::Filter::ACTIVE && signals.permanent_cancelled > 0 {
         if let Some(mut cursor) = world.get_resource_mut::<SweepCursor>() {
             cursor.woken = true;
         }
@@ -1669,6 +1719,94 @@ mod tests {
     }
 
     #[test]
+    fn late_join_ahead_of_the_sweep_keeps_its_position_and_gap() {
+        let world = kept_world();
+        let entities = spawn_all(&world, 6);
+        for &entity in &entities[..4] {
+            world.signal::<Kept>().send(Kept(entity), ..);
+        }
+        world.signal::<Kept>().send(Kept(entities[4]), 3..);
+        world.signal::<Kept>().send(Kept(entities[5]), ..);
+        end_tick(&world);
+        end_tick(&world);
+        assert_eq!(sweep_kept(&world, 2, |s| s.0 != entities[0]), (2, false));
+
+        end_tick(&world);
+        end_tick(&world);
+
+        {
+            let signals = world.get_resource::<Signals<Kept>>().unwrap();
+            assert_eq!(signals.permanent_write, 1);
+            assert_eq!(signals.permanent_read, 2);
+        }
+        assert_eq!(received_kept(&world), entities[1..].to_vec());
+        assert!(world.signal::<Kept>().modify(4, Kept(entities[4])));
+        assert_eq!(sweep_kept(&world, 10, |_| true), (4, true));
+        assert_eq!(kept_ids(&world), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn late_signals_and_new_signals_joining_together_stay_sorted() {
+        let world = world();
+        let late_a = world.signal::<NumSignal>().send(NumSignal(1), 2..).unwrap();
+        send_open(&world, 2);
+        let late_b = world.signal::<NumSignal>().send(NumSignal(3), 2..).unwrap();
+        send_open(&world, 4);
+        run_ticks(&world, 1);
+        let newest = send_open(&world, 5);
+        run_ticks(&world, 1);
+        assert_eq!(permanent(&world), vec![(1, 2), (3, 4)]);
+
+        run_ticks(&world, 1);
+
+        assert_eq!(
+            permanent(&world),
+            vec![(late_a, 1), (1, 2), (late_b, 3), (3, 4), (newest, 5)]
+        );
+        for id in [late_a, late_b, newest, 1, 3] {
+            assert!(cancel(&world, id));
+        }
+    }
+
+    #[test]
+    fn late_join_with_pending_cancels_keeps_the_right_signals_cancelled() {
+        let world = kept_world();
+        let entities = spawn_all(&world, 4);
+        world.signal::<Kept>().send(Kept(entities[0]), 3..);
+        for &entity in &entities[1..] {
+            world.signal::<Kept>().send(Kept(entity), ..);
+        }
+        for _ in 0..3 {
+            end_tick(&world);
+        }
+        assert!(world.signal::<Kept>().cancel(2));
+
+        end_tick(&world);
+
+        assert_eq!(kept_ids(&world), vec![0, 1, 2, 3]);
+        assert_eq!(
+            received_kept(&world),
+            vec![entities[0], entities[1], entities[3]]
+        );
+        assert!(!world.signal::<Kept>().cancel(2));
+        assert!(world.signal::<Kept>().modify(3, Kept(entities[3])));
+
+        end_tick(&world);
+        end_tick(&world);
+
+        assert_eq!(kept_ids(&world), vec![0, 1, 3]);
+        let signals = world.get_resource::<Signals<Kept>>().unwrap();
+        assert_eq!(signals.permanent_cancelled, 0);
+        assert!(
+            signals
+                .permanent_cancelled_bits
+                .words
+                .iter()
+                .all(|&w| w == 0)
+        );
+    }
+
+    #[test]
     fn late_join_drops_cancelled_permanent_signals() {
         let world = world();
         let late = world.signal::<NumSignal>().send(NumSignal(9), 3..).unwrap();
@@ -1682,42 +1820,6 @@ mod tests {
 
         assert_eq!(permanent(&world), vec![(late, 9), (1, 1), (3, 3)]);
         assert_eq!(receive(&world), vec![9, 1, 3]);
-    }
-
-    #[test]
-    fn signal_joining_during_a_lap_is_kept_in_order() {
-        let world = permanent_world(4);
-        assert_eq!(sweep(&world, 2, |s| s.0 != 0), (2, false));
-
-        send_open(&world, 4);
-        run_ticks(&world, 2);
-
-        assert_eq!(receive(&world), vec![1, 2, 3, 4]);
-        assert_eq!(sweep(&world, 10, |_| true), (3, true));
-        assert_eq!(permanent(&world), vec![(1, 1), (2, 2), (3, 3), (4, 4)]);
-    }
-
-    #[test]
-    fn late_join_during_a_lap_keeps_the_sweep_position() {
-        let world = world();
-        let late = world.signal::<NumSignal>().send(NumSignal(9), 3..).unwrap();
-        for payload in 1..=4 {
-            send_open(&world, payload);
-        }
-        run_ticks(&world, 2);
-        assert_eq!(sweep(&world, 2, |s| s.0 != 1), (2, false));
-
-        run_ticks(&world, 2);
-
-        let signals = world.get_resource::<Signals<NumSignal>>().unwrap();
-        assert_eq!(signals.permanent_read, signals.permanent_write);
-        assert_eq!(
-            signals.permanent[signals.permanent_read].payload,
-            NumSignal(3)
-        );
-        drop(signals);
-        assert_eq!(receive(&world), vec![9, 2, 3, 4]);
-        assert!(world.signal::<NumSignal>().modify(late, NumSignal(8)));
     }
 
     #[signal(entity)]
@@ -1740,6 +1842,92 @@ mod tests {
 
     fn received_kept(world: &World) -> Vec<Entity> {
         world.signal::<Kept>().receive().map(|s| s.0).collect()
+    }
+
+    fn kept_ids(world: &World) -> Vec<u64> {
+        let signals = world.get_resource::<Signals<Kept>>().unwrap();
+        signals.permanent.iter().map(|x| x.id).collect()
+    }
+
+    fn sweep_kept(world: &World, budget: u64, keep: impl FnMut(&Kept) -> bool) -> (u64, bool) {
+        world
+            .get_resource_mut::<Signals<Kept>>()
+            .unwrap()
+            .sweep(budget, keep)
+    }
+
+    #[test]
+    fn signal_joining_during_a_lap_is_kept_in_order() {
+        let world = kept_world();
+        let entities = spawn_all(&world, 5);
+        for &entity in &entities[..4] {
+            world.signal::<Kept>().send(Kept(entity), ..);
+        }
+        end_tick(&world);
+        end_tick(&world);
+        assert_eq!(sweep_kept(&world, 2, |s| s.0 != entities[0]), (2, false));
+
+        world.signal::<Kept>().send(Kept(entities[4]), ..);
+        end_tick(&world);
+        end_tick(&world);
+
+        assert_eq!(received_kept(&world), entities[1..].to_vec());
+        assert_eq!(sweep_kept(&world, 10, |_| true), (3, true));
+        assert_eq!(kept_ids(&world), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn late_signal_behind_the_sweep_waits_in_active_until_the_lap_ends() {
+        let world = kept_world();
+        let entities = spawn_all(&world, 5);
+        world.signal::<Kept>().send(Kept(entities[0]), 3..);
+        for &entity in &entities[1..] {
+            world.signal::<Kept>().send(Kept(entity), ..);
+        }
+        end_tick(&world);
+        end_tick(&world);
+        assert_eq!(sweep_kept(&world, 2, |_| true), (2, false));
+
+        end_tick(&world);
+        end_tick(&world);
+
+        {
+            let signals = world.get_resource::<Signals<Kept>>().unwrap();
+            assert_eq!(signals.transitory_active.len(), 1);
+            assert_eq!(signals.permanent.len(), 4);
+        }
+        assert_eq!(received_kept(&world), entities);
+        assert!(world.signal::<Kept>().modify(0, Kept(entities[0])));
+
+        assert_eq!(sweep_kept(&world, 10, |_| true), (2, true));
+        end_tick(&world);
+
+        let signals = world.get_resource::<Signals<Kept>>().unwrap();
+        assert!(signals.transitory_active.is_empty());
+        assert_eq!(signals.permanent_read, 0);
+        drop(signals);
+        assert_eq!(kept_ids(&world), vec![0, 1, 2, 3, 4]);
+        assert_eq!(received_kept(&world), entities);
+    }
+
+    #[test]
+    fn lap_without_a_filter_finishes_after_its_cancels_are_gone() {
+        let count = SWEEP_BUDGET + 10;
+        let world = permanent_world(count);
+        assert!(cancel(&world, 0));
+
+        end_tick(&world);
+        {
+            let signals = world.get_resource::<Signals<NumSignal>>().unwrap();
+            assert_eq!(signals.permanent_cancelled, 0);
+            assert!(signals.permanent_read > 0);
+        }
+
+        end_tick(&world);
+        let signals = world.get_resource::<Signals<NumSignal>>().unwrap();
+        assert_eq!(signals.permanent_read, 0);
+        assert_eq!(signals.permanent_write, 0);
+        assert_eq!(signals.permanent.len() as u64, count - 1);
     }
 
     #[test]
@@ -1947,6 +2135,26 @@ mod tests {
                 .unwrap()
                 .permanent_read
                 > 0
+        );
+    }
+
+    #[test]
+    fn new_permanent_signal_does_not_wake_the_sweep() {
+        let (world, entities) = idle_world(2);
+        world.signal::<Kept>().send(Kept(entities[0]), ..);
+        for _ in 0..3 {
+            end_tick(&world);
+            let cursor = world.get_resource::<SweepCursor>().unwrap();
+            assert!(!cursor.running && !cursor.woken);
+        }
+
+        assert_eq!(
+            world
+                .get_resource::<Signals<Kept>>()
+                .unwrap()
+                .permanent
+                .len(),
+            3
         );
     }
 
