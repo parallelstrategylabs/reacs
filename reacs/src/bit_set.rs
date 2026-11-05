@@ -41,6 +41,23 @@ impl BitSet {
     }
 
     #[inline]
+    pub fn next_set(&self, from: usize, limit: usize) -> usize {
+        let mut index = from;
+        while index < limit {
+            let (bucket, bit) = self.extract(index);
+            let Some(&word) = self.words.get(bucket) else {
+                return limit;
+            };
+            let rest = word >> bit;
+            if rest != 0 {
+                return (index + rest.trailing_zeros() as usize).min(limit);
+            }
+            index = (bucket + 1) << 6;
+        }
+        limit
+    }
+
+    #[inline]
     pub fn get_word(&self, index: usize) -> Option<u64> {
         self.words.get(index).copied()
     }
@@ -62,6 +79,24 @@ impl BitSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn next_set_finds_bits_across_words_and_respects_limit() {
+        let mut set = BitSet::new();
+        for index in [3, 63, 64, 200] {
+            set.set(index, true);
+        }
+
+        assert_eq!(set.next_set(0, 300), 3);
+        assert_eq!(set.next_set(3, 300), 3);
+        assert_eq!(set.next_set(4, 300), 63);
+        assert_eq!(set.next_set(64, 300), 64);
+        assert_eq!(set.next_set(65, 300), 200);
+        assert_eq!(set.next_set(201, 300), 300);
+        assert_eq!(set.next_set(65, 100), 100);
+        assert_eq!(set.next_set(10, 10), 10);
+        assert_eq!(BitSet::new().next_set(5, 50), 50);
+    }
 
     #[test]
     fn new_set_has_no_words_and_no_bits() {

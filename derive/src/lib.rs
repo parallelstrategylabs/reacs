@@ -1,8 +1,8 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    DeriveInput, FnArg, GenericParam, ItemFn, Path, parse_macro_input, parse_quote,
-    spanned::Spanned,
+    Data, DeriveInput, FnArg, GenericParam, Index, ItemFn, Member, Path, Type, parse_macro_input,
+    parse_quote, spanned::Spanned,
 };
 
 mod param_impl;
@@ -292,8 +292,56 @@ pub fn param(attr: TokenStream, item: TokenStream) -> TokenStream {
         .into()
 }
 
+fn find_entity_field(input: &DeriveInput) -> syn::Result<Member> {
+    let Data::Struct(data) = &input.data else {
+        return Err(syn::Error::new(
+            input.ident.span(),
+            "#[signal(entity)] needs a struct",
+        ));
+    };
+
+    let mut entities = data.fields.iter().enumerate().filter(|(_, field)| {
+        matches!(&field.ty, Type::Path(ty)
+            if ty.path.segments.last().is_some_and(|segment| segment.ident == "Entity"))
+    });
+
+    let found = entities.next();
+    match (found, entities.next()) {
+        (Some((i, field)), None) => Ok(match &field.ident {
+            Some(ident) => Member::Named(ident.clone()),
+            None => Member::Unnamed(Index::from(i)),
+        }),
+        _ => Err(syn::Error::new(
+            input.ident.span(),
+            "#[signal(entity)] needs exactly one `Entity` field, otherwise name it with `entity = field`",
+        )),
+    }
+}
+
 #[proc_macro_attribute]
-pub fn signal(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn signal(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let mut keep: Option<Path> = None;
+    let mut entity: Option<Option<Member>> = None;
+
+    let attr_parser = syn::meta::parser(|meta| {
+        if meta.path.is_ident("keep") {
+            keep = Some(meta.value()?.parse()?);
+            Ok(())
+        } else if meta.path.is_ident("entity") {
+            entity = Some(if meta.input.peek(syn::Token![=]) {
+                Some(meta.value()?.parse()?)
+            } else {
+                None
+            });
+            Ok(())
+        } else {
+            Err(meta.error(
+                "unsupported #[signal] argument, expected `keep = function`, `entity` or `entity = field`",
+            ))
+        }
+    });
+    parse_macro_input!(attr with attr_parser);
+
     let input = parse_macro_input!(item as DeriveInput);
     let name = &input.ident;
 
@@ -309,6 +357,38 @@ pub fn signal(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let snake_name = format_ident!("{}", name.to_string().to_lowercase());
     let ctor_fn = format_ident!("__register_signal_{}", snake_name);
     let link = linked_crates();
+    let keep = match (keep, entity) {
+        (Some(_), Some(_)) => {
+            return syn::Error::new(
+                name.span(),
+                "#[signal] takes either `keep` or `entity`, not both",
+            )
+            .to_compile_error()
+            .into();
+        }
+        (Some(keep), None) => Some(quote! {
+            const KEEP: ::core::option::Option<
+                fn(&Self, &::reacs::entity::EntityManager) -> bool,
+            > = ::core::option::Option::Some(#keep);
+        }),
+        (None, Some(field)) => {
+            let field = match field.map_or_else(|| find_entity_field(&input), Ok) {
+                Ok(field) => field,
+                Err(error) => return error.to_compile_error().into(),
+            };
+            Some(quote! {
+                const KEEP: ::core::option::Option<
+                    fn(&Self, &::reacs::entity::EntityManager) -> bool,
+                > = {
+                    fn keep(signal: &#name, em: &::reacs::entity::EntityManager) -> bool {
+                        em.is_alive(signal.#field)
+                    }
+                    ::core::option::Option::Some(keep)
+                };
+            })
+        }
+        (None, None) => None,
+    };
 
     let expanded = quote! {
         #[derive(
@@ -322,7 +402,9 @@ pub fn signal(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #[serde(crate = "::reacs::__private::serde")]
         #input
 
-        impl ::reacs::signal::SignalType for #name {}
+        impl ::reacs::signal::SignalType for #name {
+            #keep
+        }
 
         #[::reacs::__private::ctor::ctor]
         #[allow(non_snake_case)]

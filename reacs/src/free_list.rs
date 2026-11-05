@@ -5,12 +5,14 @@ use crate::bit_set::BitSet;
 #[derive(Default, Serialize, Deserialize)]
 pub struct FreeList {
     pub bitset: BitSet,
+    pub frees: u64,
 }
 
 impl FreeList {
     pub fn new() -> Self {
         Self {
             bitset: BitSet::new(),
+            frees: 0,
         }
     }
 
@@ -89,6 +91,7 @@ impl FreeList {
 
     pub fn free(&mut self, index: usize) {
         self.bitset.set(index, false);
+        self.frees += 1;
     }
 }
 

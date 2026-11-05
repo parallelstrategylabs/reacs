@@ -5,7 +5,7 @@ use crate::{
 };
 use std::{
     any::Any,
-    cell::{Ref, RefCell, RefMut},
+    cell::{RefCell, RefMut},
     marker::PhantomData,
     ops::{Deref, DerefMut},
 };
@@ -87,25 +87,19 @@ impl<T: LocalResourceType, M: Mode> SystemParam for LocalResource<'_, T, M> {
 }
 
 pub(crate) struct ResourceCell<'w, T, M: Mode = Read> {
-    cell: &'w RefCell<dyn Any>,
-    marker: PhantomData<(T, M)>,
+    cell: &'w RefCell<T>,
+    marker: PhantomData<M>,
 }
 
 impl<'w, T: 'static, M: Mode> ResourceCell<'w, T, M> {
     #[inline]
-    pub(crate) fn read(&self) -> Ref<'w, T> {
-        Ref::map(self.cell.borrow(), |any| {
-            any.downcast_ref::<T>()
-                .expect("resource has the wrong type")
-        })
+    pub(crate) fn read(&self) -> &T {
+        unsafe { &*self.cell.as_ptr() }
     }
 
     #[inline]
     pub(crate) fn write(&self) -> RefMut<'w, T> {
-        RefMut::map(self.cell.borrow_mut(), |any| {
-            any.downcast_mut::<T>()
-                .expect("resource has the wrong type")
-        })
+        self.cell.borrow_mut()
     }
 }
 
@@ -121,8 +115,13 @@ impl<T: 'static + Default + Hashed, M: Mode> SystemParam for ResourceCell<'_, T,
             .resources
             .binary_search_by_key(&T::TYPE_UUID, |resource| resource.0)
             .unwrap_or_else(|_| conflict::<T>());
+        let cell: &RefCell<dyn Any> = &*world.resources[i].1;
+        assert!(
+            cell.try_borrow().map_or(true, |any| any.is::<T>()),
+            "resource has the wrong type"
+        );
         ResourceCell {
-            cell: &*world.resources[i].1,
+            cell: unsafe { &*(cell as *const RefCell<dyn Any> as *const RefCell<T>) },
             marker: PhantomData,
         }
     }

@@ -5,10 +5,12 @@ use std::{
 
 use crate::{
     Tick,
+    entity::EntityManager,
     hashed::Hashed,
     registry::get_registry_entry,
     resource::LocalResourceType,
-    schedule::{ANONYMOUS_SYSTEM, CurrentSystem, set_current_system, system_graph},
+    schedule::{ANONYMOUS_SYSTEM, CurrentSystem, Mut, set_current_system, system_graph},
+    signal::SweepCursor,
 };
 use serde::{Deserialize, Serialize};
 
@@ -49,6 +51,8 @@ impl World {
 
         world.init_resource::<CurrentSystem>();
         world.init_resource::<Tick>();
+        world.init_resource::<SweepCursor>();
+        world.init_param::<Mut<EntityManager>>();
         system_graph().init(&mut world);
 
         world
