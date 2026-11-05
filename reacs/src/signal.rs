@@ -104,13 +104,34 @@ impl<S: SignalType> Signals<S> {
         Some(instance.id)
     }
 
-    pub fn modify(&mut self, id: u64) -> Option<&mut S> {
-        for list in [&mut self.transitory_active, &mut self.transitory_inactive] {
-            if let Ok(i) = list.binary_search_by(|x| x.1.id.cmp(&id)) {
-                return Some(&mut list[i].1.payload);
+    pub fn modify(&mut self, id: u64, f: impl FnOnce(&mut S)) -> bool {
+        let windowed = [&mut self.transitory_active, &mut self.transitory_inactive]
+            .into_iter()
+            .find_map(|list| {
+                let i = list.binary_search_by(|x| x.1.id.cmp(&id)).ok()?;
+                Some(&mut list[i].1.payload)
+            });
+        let transient = [&mut self.transient, &mut self.transient_buffer]
+            .into_iter()
+            .find_map(|list| {
+                let i = list.binary_search_by(|x| x.id.cmp(&id)).ok()?;
+                Some(&mut list[i].payload)
+            });
+
+        match (windowed, transient) {
+            (Some(windowed), transient) => {
+                f(windowed);
+                if let Some(transient) = transient {
+                    *transient = *windowed;
+                }
+                true
             }
+            (None, Some(transient)) => {
+                f(transient);
+                true
+            }
+            (None, None) => false,
         }
-        None
     }
 
     pub fn receive<'a>(
@@ -250,8 +271,8 @@ impl<'w, S: SignalType> Signal<'w, S, Write> {
     }
 
     #[inline]
-    pub fn modify(&mut self, id: u64) -> Option<&mut S> {
-        self.signals.modify(id)
+    pub fn modify(&mut self, id: u64, payload: S) -> bool {
+        self.signals.modify(id, |current| *current = payload)
     }
 
     #[inline]
@@ -487,16 +508,16 @@ mod tests {
             .send(NumSignal(1), 1..3)
             .unwrap();
 
-        *world.signal::<NumSignal>().modify(id).unwrap() = NumSignal(2);
+        assert!(world.signal::<NumSignal>().modify(id, NumSignal(2)));
         end_tick(&world);
         assert_eq!(receive(&world), vec![2]);
 
-        *world.signal::<NumSignal>().modify(id).unwrap() = NumSignal(3);
+        assert!(world.signal::<NumSignal>().modify(id, NumSignal(3)));
         assert_eq!(receive(&world), vec![3]);
 
         end_tick(&world);
         end_tick(&world);
-        assert!(world.signal::<NumSignal>().modify(id).is_none());
+        assert!(!world.signal::<NumSignal>().modify(id, NumSignal(0)));
     }
 
     #[test]
@@ -748,8 +769,50 @@ mod tests {
             .unwrap();
         end_tick(&world);
 
-        *world.signal::<NumSignal>().modify(id).unwrap() = NumSignal(2);
+        assert!(world.signal::<NumSignal>().modify(id, NumSignal(2)));
         assert_eq!(receive(&world), vec![2]);
+    }
+
+    #[test]
+    fn modify_on_send_tick_reaches_later_receiver() {
+        let world = world();
+        let id = world
+            .signal::<NumSignal>()
+            .send(NumSignal(1), 0..3)
+            .unwrap();
+
+        assert!(world.signal::<NumSignal>().modify(id, NumSignal(2)));
+        assert_eq!(receive(&world), vec![2]);
+    }
+
+    #[test]
+    fn modify_changes_one_tick_signal() {
+        let world = world();
+        let id = world.signal::<NumSignal>().emit(NumSignal(1));
+
+        assert!(world.signal::<NumSignal>().modify(id, NumSignal(2)));
+        assert_eq!(receive(&world), vec![2]);
+    }
+
+    #[test]
+    fn modify_changes_one_tick_signal_for_late_receiver() {
+        let world = world();
+        receive(&world);
+        let id = world.signal::<NumSignal>().emit(NumSignal(1));
+        end_tick(&world);
+
+        assert!(world.signal::<NumSignal>().modify(id, NumSignal(2)));
+        assert_eq!(receive(&world), vec![2]);
+    }
+
+    #[test]
+    fn modify_fails_after_one_tick_signal_expires() {
+        let world = world();
+        let id = world.signal::<NumSignal>().emit(NumSignal(1));
+        end_tick(&world);
+        end_tick(&world);
+
+        assert!(!world.signal::<NumSignal>().modify(id, NumSignal(2)));
     }
 
     #[test]
