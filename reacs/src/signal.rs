@@ -121,6 +121,48 @@ pub struct Signals<S: SignalType> {
     pub permanent_cancelled_bits: BitSet,
 }
 
+static EMPTY_BITS: BitSet = BitSet { words: Vec::new() };
+
+#[inline(never)]
+fn fold_instances<'a, S, B, F, K>(
+    signals: &'a [SignalInstance<S>],
+    init: B,
+    f: &mut F,
+    keep: &K,
+) -> B
+where
+    F: FnMut(B, &'a S) -> B,
+    K: Fn(&S) -> bool,
+{
+    signals.iter().fold(init, |acc, signal| {
+        if keep(&signal.payload) {
+            f(acc, &signal.payload)
+        } else {
+            acc
+        }
+    })
+}
+
+#[inline(never)]
+fn fold_entries<'a, S, B, F, K>(
+    entries: &'a [(SignalWindow, SignalInstance<S>)],
+    init: B,
+    f: &mut F,
+    keep: &K,
+) -> B
+where
+    F: FnMut(B, &'a S) -> B,
+    K: Fn(&S) -> bool,
+{
+    entries.iter().fold(init, |acc, entry| {
+        if !entry.0.is_cancelled() && keep(&entry.1.payload) {
+            f(acc, &entry.1.payload)
+        } else {
+            acc
+        }
+    })
+}
+
 enum ReceiveStage {
     Transient,
     TransientBuffer,
@@ -131,7 +173,7 @@ enum ReceiveStage {
     Done,
 }
 
-struct ReceiveIter<'a, S: SignalType> {
+struct ReceiveIter<'a, S: SignalType, K> {
     run: std::slice::Iter<'a, SignalInstance<S>>,
     entries: std::slice::Iter<'a, (SignalWindow, SignalInstance<S>)>,
     stage: ReceiveStage,
@@ -144,9 +186,10 @@ struct ReceiveIter<'a, S: SignalType> {
     read: usize,
     position: usize,
     cancelled: Option<&'a BitSet>,
+    keep: K,
 }
 
-impl<'a, S: SignalType> ReceiveIter<'a, S> {
+impl<'a, S: SignalType, K: Fn(&S) -> bool> ReceiveIter<'a, S, K> {
     #[inline]
     fn next_entry(&mut self) -> Option<&'a S> {
         for entry in self.entries.by_ref() {
@@ -155,6 +198,17 @@ impl<'a, S: SignalType> ReceiveIter<'a, S> {
             }
         }
         None
+    }
+
+    #[inline]
+    fn next_raw(&mut self) -> Option<&'a S> {
+        if let Some(signal) = self.run.next() {
+            return Some(&signal.payload);
+        }
+        if let Some(signal) = self.next_entry() {
+            return Some(signal);
+        }
+        self.next_slow()
     }
 
     fn next_slow(&mut self) -> Option<&'a S> {
@@ -231,18 +285,97 @@ impl<'a, S: SignalType> ReceiveIter<'a, S> {
     }
 }
 
-impl<'a, S: SignalType> Iterator for ReceiveIter<'a, S> {
+impl<'a, S: SignalType, K: Fn(&S) -> bool> Iterator for ReceiveIter<'a, S, K> {
     type Item = &'a S;
 
     #[inline]
     fn next(&mut self) -> Option<&'a S> {
-        if let Some(signal) = self.run.next() {
-            return Some(&signal.payload);
+        if !S::Filter::ACTIVE {
+            return self.next_raw();
         }
-        if let Some(signal) = self.next_entry() {
-            return Some(signal);
+        loop {
+            let signal = self.next_raw()?;
+            if (self.keep)(signal) {
+                return Some(signal);
+            }
         }
-        self.next_slow()
+    }
+
+    fn fold<B, F>(mut self, init: B, mut f: F) -> B
+    where
+        F: FnMut(B, &'a S) -> B,
+    {
+        let mut acc = fold_instances(self.run.as_slice(), init, &mut f, &self.keep);
+        acc = fold_entries(self.entries.as_slice(), acc, &mut f, &self.keep);
+
+        loop {
+            match self.stage {
+                ReceiveStage::Transient => {
+                    let transient = self.transient.as_slice();
+                    if self.windowed.is_empty() {
+                        acc = fold_instances(transient, acc, &mut f, &self.keep);
+                    } else {
+                        let mut windowed = self.windowed;
+                        for signal in transient {
+                            while windowed.first().is_some_and(|w| w.1.id < signal.id) {
+                                windowed = &windowed[1..];
+                            }
+                            if !windowed.first().is_some_and(|w| w.1.id == signal.id)
+                                && (self.keep)(&signal.payload)
+                            {
+                                acc = f(acc, &signal.payload);
+                            }
+                        }
+                    }
+                    self.stage = ReceiveStage::TransientBuffer;
+                }
+                ReceiveStage::TransientBuffer => {
+                    acc = fold_instances(self.transient_buffer, acc, &mut f, &self.keep);
+                    self.stage = ReceiveStage::Active;
+                }
+                ReceiveStage::Active => {
+                    acc = fold_entries(self.active, acc, &mut f, &self.keep);
+                    self.stage = if self.cancelled.is_some() {
+                        ReceiveStage::PermanentCancelled
+                    } else {
+                        ReceiveStage::PermanentLeft
+                    };
+                }
+                ReceiveStage::PermanentLeft => {
+                    acc = fold_instances(&self.permanent[..self.write], acc, &mut f, &self.keep);
+                    self.stage = ReceiveStage::PermanentRight;
+                }
+                ReceiveStage::PermanentRight => {
+                    return fold_instances(&self.permanent[self.read..], acc, &mut f, &self.keep);
+                }
+                ReceiveStage::PermanentCancelled => {
+                    let bits = self.cancelled.unwrap_or(&EMPTY_BITS);
+                    let mut position = self.position;
+                    loop {
+                        if position == self.write {
+                            position = self.read;
+                        }
+                        if position >= self.permanent.len() {
+                            return acc;
+                        }
+                        let limit = if position < self.write {
+                            self.write
+                        } else {
+                            self.permanent.len()
+                        };
+                        let next = bits.next_set(position, limit);
+                        acc = fold_instances(
+                            &self.permanent[position..next],
+                            acc,
+                            &mut f,
+                            &self.keep,
+                        );
+                        position = (next + 1).min(limit);
+                    }
+                }
+                ReceiveStage::Done => return acc,
+            }
+        }
     }
 }
 
@@ -353,11 +486,12 @@ impl<S: SignalType> Signals<S> {
         found
     }
 
-    pub fn receive<'a>(
+    pub fn receive<'a, K: Fn(&S) -> bool>(
         &'a self,
         data: &mut SignalData<S>,
         system: u128,
-    ) -> impl Iterator<Item = &'a S> + use<'a, S> {
+        keep: K,
+    ) -> impl Iterator<Item = &'a S> + use<'a, S, K> {
         let slot = data.cursors.binary_search_by_key(&system, |x| x.0);
         let cursor = slot.map_or(0, |i| data.cursors[i].1);
         let unread =
@@ -394,6 +528,7 @@ impl<S: SignalType> Signals<S> {
             read: self.permanent_read,
             position: 0,
             cancelled: (self.permanent_cancelled > 0).then_some(&self.permanent_cancelled_bits),
+            keep,
         }
     }
 
@@ -613,8 +748,9 @@ impl<'w, S: SignalType> Signal<'w, S, Write> {
     pub fn receive(&mut self) -> impl Iterator<Item = &S> {
         let context = S::Filter::fetch(&self.world);
         self.signals
-            .receive(&mut self.data, (*self.current).0)
-            .filter(move |signal| S::Filter::keep(&context, signal))
+            .receive(&mut self.data, (*self.current).0, move |signal| {
+                S::Filter::keep(&context, signal)
+            })
     }
 
     #[inline]
@@ -2265,6 +2401,70 @@ mod tests {
         }
         let signals = restored.get_resource::<Signals<Kept>>().unwrap();
         assert_eq!(signals.permanent.len(), count / 2);
+    }
+
+    fn mixed_lists_world() -> World {
+        let world = world();
+        for payload in 100..110 {
+            send_open(&world, payload);
+        }
+        run_ticks(&world, 2);
+        assert_eq!(sweep(&world, 4, |s| s.0 != 101), (4, false));
+        assert!(cancel(&world, 0));
+        assert!(cancel(&world, 5));
+
+        receive(&world);
+        send(&world, 7, 2..7);
+        let cancelled = send(&world, 11, 2..7);
+        world.signal::<NumSignal>().emit(NumSignal(8));
+        end_tick(&world);
+
+        assert!(cancel(&world, cancelled));
+        send(&world, 9, 3..6);
+        world.signal::<NumSignal>().emit(NumSignal(10));
+        world
+    }
+
+    fn receive_by_next(world: &World) -> Vec<u64> {
+        let mut signal = world.signal::<NumSignal>();
+        let mut received = signal.receive();
+        let mut payloads = Vec::new();
+        while let Some(s) = received.next() {
+            payloads.push(s.0);
+        }
+        payloads
+    }
+
+    #[test]
+    fn fold_delivers_the_same_signals_as_next() {
+        let by_next = receive_by_next(&mixed_lists_world());
+        let by_fold: Vec<u64> = mixed_lists_world().signal::<NumSignal>().receive().fold(
+            Vec::new(),
+            |mut payloads, s| {
+                payloads.push(s.0);
+                payloads
+            },
+        );
+
+        assert_eq!(
+            by_next,
+            vec![8, 9, 10, 7, 102, 103, 104, 106, 107, 108, 109]
+        );
+        assert_eq!(by_fold, by_next);
+    }
+
+    #[test]
+    fn fold_after_partial_next_delivers_the_rest() {
+        let world = mixed_lists_world();
+        let mut signal = world.signal::<NumSignal>();
+        let mut received = signal.receive();
+        let mut payloads: Vec<u64> = (0..4).map(|_| received.next().unwrap().0).collect();
+        payloads = received.fold(payloads, |mut payloads, s| {
+            payloads.push(s.0);
+            payloads
+        });
+
+        assert_eq!(payloads, receive_by_next(&mixed_lists_world()));
     }
 
     #[test]
