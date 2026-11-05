@@ -320,14 +320,10 @@ fn find_entity_field(input: &DeriveInput) -> syn::Result<Member> {
 
 #[proc_macro_attribute]
 pub fn signal(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let mut keep: Option<Path> = None;
     let mut entity: Option<Option<Member>> = None;
 
     let attr_parser = syn::meta::parser(|meta| {
-        if meta.path.is_ident("keep") {
-            keep = Some(meta.value()?.parse()?);
-            Ok(())
-        } else if meta.path.is_ident("entity") {
+        if meta.path.is_ident("entity") {
             entity = Some(if meta.input.peek(syn::Token![=]) {
                 Some(meta.value()?.parse()?)
             } else {
@@ -335,9 +331,7 @@ pub fn signal(attr: TokenStream, item: TokenStream) -> TokenStream {
             });
             Ok(())
         } else {
-            Err(meta.error(
-                "unsupported #[signal] argument, expected `keep = function`, `entity` or `entity = field`",
-            ))
+            Err(meta.error("unsupported #[signal] argument, expected `entity` or `entity = field`"))
         }
     });
     parse_macro_input!(attr with attr_parser);
@@ -357,37 +351,30 @@ pub fn signal(attr: TokenStream, item: TokenStream) -> TokenStream {
     let snake_name = format_ident!("{}", name.to_string().to_lowercase());
     let ctor_fn = format_ident!("__register_signal_{}", snake_name);
     let link = linked_crates();
-    let keep = match (keep, entity) {
-        (Some(_), Some(_)) => {
-            return syn::Error::new(
-                name.span(),
-                "#[signal] takes either `keep` or `entity`, not both",
-            )
-            .to_compile_error()
-            .into();
-        }
-        (Some(keep), None) => Some(quote! {
-            const KEEP: ::core::option::Option<
-                fn(&Self, &::reacs::entity::EntityManager) -> bool,
-            > = ::core::option::Option::Some(#keep);
-        }),
-        (None, Some(field)) => {
+    let filter = match entity {
+        Some(field) => {
             let field = match field.map_or_else(|| find_entity_field(&input), Ok) {
                 Ok(field) => field,
                 Err(error) => return error.to_compile_error().into(),
             };
-            Some(quote! {
-                const KEEP: ::core::option::Option<
-                    fn(&Self, &::reacs::entity::EntityManager) -> bool,
-                > = {
-                    fn keep(signal: &#name, em: &::reacs::entity::EntityManager) -> bool {
-                        em.is_alive(signal.#field)
+            quote! {
+                impl ::reacs::signal::SignalType for #name {
+                    type Filter = ::reacs::entity::AliveFilter;
+                }
+
+                impl ::reacs::entity::EntitySignal for #name {
+                    #[inline]
+                    fn entity(&self) -> ::reacs::entity::Entity {
+                        self.#field
                     }
-                    ::core::option::Option::Some(keep)
-                };
-            })
+                }
+            }
         }
-        (None, None) => None,
+        None => quote! {
+            impl ::reacs::signal::SignalType for #name {
+                type Filter = ::reacs::signal::NoFilter;
+            }
+        },
     };
 
     let expanded = quote! {
@@ -402,9 +389,7 @@ pub fn signal(attr: TokenStream, item: TokenStream) -> TokenStream {
         #[serde(crate = "::reacs::__private::serde")]
         #input
 
-        impl ::reacs::signal::SignalType for #name {
-            #keep
-        }
+        #filter
 
         #[::reacs::__private::ctor::ctor]
         #[allow(non_snake_case)]

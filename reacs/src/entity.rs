@@ -8,6 +8,7 @@ use crate::{
     free_list::FreeList,
     resource::{Resource, ResourceCell},
     schedule::{Mode, Mut, Write},
+    signal::SignalFilter,
     world::World,
 };
 
@@ -100,6 +101,47 @@ impl<M: Mode> EntityManager<'_, M> {
     pub fn is_alive(&self, entity: Entity) -> bool {
         self.free_list.bitset.get(entity.index() as usize)
             && self.generation(entity.index()) == entity.generation()
+    }
+}
+
+pub struct EntityLife<'w> {
+    generations: ResourceCell<'w, EntityGenerations>,
+}
+
+impl EntityLife<'_> {
+    #[inline]
+    pub fn is_alive(&self, entity: Entity) -> bool {
+        self.generations.read().current(entity.index() as usize) == entity.generation()
+    }
+}
+
+pub trait EntitySignal {
+    fn entity(&self) -> Entity;
+}
+
+pub struct AliveFilter;
+
+impl<S: EntitySignal> SignalFilter<S> for AliveFilter {
+    const ACTIVE: bool = true;
+    type Context<'w> = EntityLife<'w>;
+
+    #[inline]
+    fn fetch<'w>(world: &'w World) -> EntityLife<'w> {
+        EntityLife {
+            generations: world.fetch_param::<ResourceCell<EntityGenerations>>(),
+        }
+    }
+
+    #[inline]
+    fn keep(context: &EntityLife<'_>, signal: &S) -> bool {
+        context.is_alive(signal.entity())
+    }
+
+    #[inline]
+    fn stamp(world: &World) -> u64 {
+        world
+            .get_resource::<EntityFreeList>()
+            .map_or(0, |free_list| free_list.frees)
     }
 }
 

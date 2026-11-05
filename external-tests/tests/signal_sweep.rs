@@ -1,12 +1,8 @@
 use reacs::prelude::*;
 use reacs::signal::Signals;
 
-#[signal(keep = burn_target_alive)]
+#[signal(entity)]
 pub struct Burn(pub Entity);
-
-fn burn_target_alive(signal: &Burn, em: &EntityManager) -> bool {
-    em.is_alive(signal.0)
-}
 
 #[signal(entity)]
 pub struct Poison(pub Entity);
@@ -32,17 +28,38 @@ pub struct Burned {
 }
 
 #[system]
-fn burn(mut burns: Mut<Signal<Burn>>, em: EntityManager, mut burned: Mut<Resource<Burned>>) {
+fn burn(mut burns: Mut<Signal<Burn>>, mut burned: Mut<Resource<Burned>>) {
     burned.entities.clear();
     for signal in burns.receive() {
-        if em.is_alive(signal.0) {
-            burned.entities.push(signal.0);
+        burned.entities.push(signal.0);
+    }
+}
+
+#[signal(entity)]
+pub struct Chain(pub Entity);
+
+#[resource]
+pub struct ChainTargets {
+    pub next: Vec<Entity>,
+    pub delivered: Vec<Entity>,
+}
+
+#[system]
+fn chain(
+    mut chains: Mut<Signal<Chain>>,
+    mut em: Mut<EntityManager>,
+    mut targets: Mut<Resource<ChainTargets>>,
+) {
+    for signal in chains.receive() {
+        targets.delivered.push(signal.0);
+        if let Some(next) = targets.next.pop() {
+            em.despawn(next);
         }
     }
 }
 
 #[test]
-fn keep_removes_a_dead_entitys_open_signal_during_step() {
+fn dead_entitys_open_signal_is_removed_during_step() {
     let mut world = World::new();
     let (first, second) = {
         let mut em = world.entity_manager();
@@ -151,4 +168,24 @@ fn entity_signals_are_removed_when_their_entity_dies() {
         .map(|s| s.target)
         .collect();
     assert_eq!(received, [alive]);
+}
+
+#[test]
+fn system_with_entity_manager_and_entity_signal_runs_without_a_borrow_panic() {
+    let mut world = World::new();
+    let (first, second, third) = {
+        let mut em = world.entity_manager();
+        (em.spawn(), em.spawn(), em.spawn())
+    };
+    world.signal::<Chain>().send(Chain(first), ..);
+    world.signal::<Chain>().send(Chain(second), ..);
+    world.signal::<Chain>().send(Chain(third), ..);
+    world.get_resource_mut::<ChainTargets>().unwrap().next = vec![second];
+
+    world.step();
+
+    assert_eq!(
+        world.get_resource::<ChainTargets>().unwrap().delivered,
+        [first, third]
+    );
 }

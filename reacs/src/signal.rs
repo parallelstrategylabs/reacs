@@ -1,4 +1,5 @@
 use std::{
+    any::TypeId,
     marker::PhantomData,
     ops::{Bound, RangeBounds},
     ptr::addr_of_mut,
@@ -10,18 +11,46 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use crate::{
     Tick,
     bit_set::BitSet,
-    entity::{EntityFreeList, EntityManager},
     hashed::Hashed,
     registry::get_registry_entry,
     resource::Resource,
-    schedule::{CurrentSystem, Mut, Write},
+    schedule::{CurrentSystem, Mut, WorldAccess, Write},
     world::World,
 };
 
 pub const SWEEP_BUDGET: u64 = 65536;
 
+pub trait SignalFilter<S>: 'static {
+    const ACTIVE: bool;
+    type Context<'w>;
+
+    fn fetch<'w>(world: &'w World) -> Self::Context<'w>;
+    fn keep(context: &Self::Context<'_>, signal: &S) -> bool;
+    fn stamp(world: &World) -> u64;
+}
+
+pub struct NoFilter;
+
+impl<S> SignalFilter<S> for NoFilter {
+    const ACTIVE: bool = false;
+    type Context<'w> = ();
+
+    #[inline]
+    fn fetch<'w>(_world: &'w World) {}
+
+    #[inline]
+    fn keep(_context: &(), _signal: &S) -> bool {
+        true
+    }
+
+    #[inline]
+    fn stamp(_world: &World) -> u64 {
+        0
+    }
+}
+
 pub trait SignalType: 'static + Copy + Default + Hashed + Serialize + DeserializeOwned {
-    const KEEP: Option<fn(&Self, &EntityManager) -> bool> = None;
+    type Filter: SignalFilter<Self>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -486,7 +515,7 @@ impl<S: SignalType> Signals<S> {
             self.sort_permanent(first_new);
         }
 
-        if S::KEEP.is_none() && self.permanent_cancelled > 0 {
+        if !S::Filter::ACTIVE && self.permanent_cancelled > 0 {
             self.sweep(SWEEP_BUDGET, |_| true);
         }
 
@@ -502,6 +531,8 @@ pub struct Signal<S: SignalType> {
     pub tick: Resource<Tick>,
     #[read]
     pub current: Resource<CurrentSystem>,
+    #[read]
+    pub world: WorldAccess,
 }
 
 impl<'w, S: SignalType> Signal<'w, S, Write> {
@@ -535,7 +566,10 @@ impl<'w, S: SignalType> Signal<'w, S, Write> {
 
     #[inline]
     pub fn receive(&mut self) -> impl Iterator<Item = &S> {
-        self.signals.receive(&mut self.data, (*self.current).0)
+        let context = S::Filter::fetch(&self.world);
+        self.signals
+            .receive(&mut self.data, (*self.current).0)
+            .filter(move |signal| S::Filter::keep(&context, signal))
     }
 
     #[inline]
@@ -548,12 +582,14 @@ pub static mut SIGNAL_REGISTRY: Option<Vec<fn(&World)>> = None;
 
 pub static mut SWEEP_REGISTRY: Option<Vec<(u128, fn(&World, u64) -> (u64, bool))>> = None;
 
+pub static mut SWEEP_STAMPS: Option<Vec<(TypeId, fn(&World) -> u64)>> = None;
+
 #[resource]
 pub struct SweepCursor {
     pub type_index: usize,
     pub running: bool,
     pub woken: bool,
-    pub seen_frees: u64,
+    pub seen_stamp: u64,
 }
 
 pub fn register_signal<S: SignalType>() {
@@ -563,12 +599,19 @@ pub fn register_signal<S: SignalType>() {
             .get_or_insert_with(Vec::new)
             .push(cleanup_in_world::<S>);
 
-        if S::KEEP.is_some() {
+        if S::Filter::ACTIVE {
             let ptr = addr_of_mut!(SWEEP_REGISTRY);
             let sweeps = (*ptr).get_or_insert_with(Vec::new);
             let uuid = Signals::<S>::TYPE_UUID;
             let i = sweeps.partition_point(|x| x.0 < uuid);
             sweeps.insert(i, (uuid, sweep_in_world::<S>));
+
+            let ptr = addr_of_mut!(SWEEP_STAMPS);
+            let stamps = (*ptr).get_or_insert_with(Vec::new);
+            let filter = TypeId::of::<S::Filter>();
+            if !stamps.iter().any(|x| x.0 == filter) {
+                stamps.push((filter, S::Filter::stamp));
+            }
         }
     }
 }
@@ -580,12 +623,19 @@ fn get_registered_sweeps() -> &'static [(u128, fn(&World, u64) -> (u64, bool))] 
     }
 }
 
+fn get_registered_stamps() -> &'static [(TypeId, fn(&World) -> u64)] {
+    unsafe {
+        let ptr = addr_of_mut!(SWEEP_STAMPS);
+        (*ptr).as_deref().unwrap_or(&[])
+    }
+}
+
 fn sweep_in_world<S: SignalType>(world: &World, budget: u64) -> (u64, bool) {
-    let (Some(keep), Some(mut signals)) = (S::KEEP, world.get_resource_mut::<Signals<S>>()) else {
+    let Some(mut signals) = world.get_resource_mut::<Signals<S>>() else {
         return (0, true);
     };
-    let em = world.fetch_param::<EntityManager>();
-    signals.sweep(budget, |signal| keep(signal, &em))
+    let context = S::Filter::fetch(world);
+    signals.sweep(budget, |signal| S::Filter::keep(&context, signal))
 }
 
 fn sweep_signals(world: &World) {
@@ -593,22 +643,21 @@ fn sweep_signals(world: &World) {
     if sweeps.is_empty() {
         return;
     }
-    let (Some(mut cursor), Some(free_list)) = (
-        world.get_resource_mut::<SweepCursor>(),
-        world.get_resource::<EntityFreeList>(),
-    ) else {
+    let Some(mut cursor) = world.get_resource_mut::<SweepCursor>() else {
         return;
     };
-    let frees = free_list.frees;
-    drop(free_list);
+    let stamp: u64 = get_registered_stamps()
+        .iter()
+        .map(|(_, stamp)| stamp(world))
+        .sum();
 
     if !cursor.running {
-        if !cursor.woken && frees == cursor.seen_frees {
+        if !cursor.woken && stamp == cursor.seen_stamp {
             return;
         }
         cursor.running = true;
         cursor.woken = false;
-        cursor.seen_frees = frees;
+        cursor.seen_stamp = stamp;
         cursor.type_index = 0;
     }
 
@@ -645,7 +694,7 @@ fn cleanup_in_world<S: SignalType>(world: &World) {
     };
     let joined = signals.cleanup(tick.0);
 
-    if S::KEEP.is_some() && (joined || signals.permanent_cancelled > 0) {
+    if S::Filter::ACTIVE && (joined || signals.permanent_cancelled > 0) {
         if let Some(mut cursor) = world.get_resource_mut::<SweepCursor>() {
             cursor.woken = true;
         }
@@ -1671,19 +1720,11 @@ mod tests {
         assert!(world.signal::<NumSignal>().modify(late, NumSignal(8)));
     }
 
-    #[signal(keep = kept_alive)]
+    #[signal(entity)]
     pub struct Kept(pub Entity);
 
-    fn kept_alive(signal: &Kept, em: &EntityManager) -> bool {
-        em.is_alive(signal.0)
-    }
-
-    #[signal(keep = other_kept_alive)]
+    #[signal(entity)]
     pub struct OtherKept(pub Entity);
-
-    fn other_kept_alive(signal: &OtherKept, em: &EntityManager) -> bool {
-        em.is_alive(signal.0)
-    }
 
     fn kept_world() -> World {
         let mut world = World::new();
@@ -1695,6 +1736,106 @@ mod tests {
     fn spawn_all(world: &World, count: usize) -> Vec<Entity> {
         let mut em = world.entity_manager();
         (0..count).map(|_| em.spawn()).collect()
+    }
+
+    fn received_kept(world: &World) -> Vec<Entity> {
+        world.signal::<Kept>().receive().map(|s| s.0).collect()
+    }
+
+    #[test]
+    fn dead_entity_signal_is_not_delivered_before_the_sweep_reaches_it() {
+        let world = kept_world();
+        let entities = spawn_all(&world, 2);
+        world.signal::<Kept>().send(Kept(entities[0]), ..);
+        world.signal::<Kept>().send(Kept(entities[1]), ..);
+        for _ in 0..3 {
+            end_tick(&world);
+        }
+
+        world.entity_manager().despawn(entities[0]);
+
+        assert_eq!(received_kept(&world), vec![entities[1]]);
+        let signals = world.get_resource::<Signals<Kept>>().unwrap();
+        assert_eq!(signals.permanent.len(), 2);
+    }
+
+    #[test]
+    fn dead_entity_one_tick_signal_is_not_delivered() {
+        let world = kept_world();
+        let entities = spawn_all(&world, 2);
+        world.signal::<Kept>().emit(Kept(entities[0]));
+        world.signal::<Kept>().emit(Kept(entities[1]));
+        world.entity_manager().despawn(entities[0]);
+
+        assert_eq!(received_kept(&world), vec![entities[1]]);
+    }
+
+    #[test]
+    fn signal_for_a_new_entity_at_a_reused_index_is_delivered() {
+        let world = kept_world();
+        let old = spawn_all(&world, 1)[0];
+        world.signal::<Kept>().send(Kept(old), ..);
+        world.entity_manager().despawn(old);
+        let new = world.entity_manager().spawn();
+        assert_eq!(new.index(), old.index());
+        world.signal::<Kept>().send(Kept(new), ..);
+
+        assert_eq!(received_kept(&world), vec![new]);
+    }
+
+    #[test]
+    fn signal_without_a_filter_is_delivered_after_its_entity_dies() {
+        let mut world = World::new();
+        world.init_signal::<TestSignal>();
+        let entity = world.entity_manager().spawn();
+        world.signal::<TestSignal>().emit(TestSignal(entity));
+        world.entity_manager().despawn(entity);
+
+        let received: Vec<Entity> = world
+            .signal::<TestSignal>()
+            .receive()
+            .map(|s| s.0)
+            .collect();
+        assert_eq!(received, vec![entity]);
+    }
+
+    #[resource]
+    struct LoopTargets {
+        first: Entity,
+        second: Entity,
+        delivered: Vec<Entity>,
+    }
+
+    fn despawning_receiver(
+        mut signal: Mut<Signal<Kept>>,
+        mut em: Mut<EntityManager>,
+        mut targets: Mut<Resource<LoopTargets>>,
+    ) {
+        for kept in signal.receive() {
+            targets.delivered.push(kept.0);
+            if kept.0 == targets.first {
+                em.despawn(targets.second);
+            }
+        }
+    }
+
+    #[test]
+    fn system_can_receive_entity_signals_and_despawn_in_the_same_loop() {
+        let mut world = kept_world();
+        let entities = spawn_all(&world, 3);
+        for &entity in &entities {
+            world.signal::<Kept>().send(Kept(entity), ..);
+        }
+        world.insert_resource(LoopTargets {
+            first: entities[0],
+            second: entities[1],
+            delivered: Vec::new(),
+        });
+
+        despawning_receiver.into_system().run(&mut world);
+
+        let targets = world.get_resource::<LoopTargets>().unwrap();
+        assert_eq!(targets.delivered, vec![entities[0], entities[2]]);
     }
 
     #[test]
