@@ -45,6 +45,11 @@ impl SignalWindow {
     pub fn contains(&self, tick: u64) -> bool {
         self.start <= tick && tick < self.end
     }
+
+    #[inline]
+    pub fn is_cancelled(&self) -> bool {
+        self.end == 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -109,7 +114,8 @@ impl<S: SignalType> Signals<S> {
             .into_iter()
             .find_map(|list| {
                 let i = list.binary_search_by(|x| x.1.id.cmp(&id)).ok()?;
-                Some(&mut list[i].1.payload)
+                let (window, signal) = &mut list[i];
+                (!window.is_cancelled()).then_some(&mut signal.payload)
             });
         let transient = [&mut self.transient, &mut self.transient_buffer]
             .into_iter()
@@ -132,6 +138,30 @@ impl<S: SignalType> Signals<S> {
             }
             (None, None) => false,
         }
+    }
+
+    pub fn cancel(&mut self, id: u64) -> bool {
+        let mut found = false;
+        for list in [&mut self.transitory_active, &mut self.transitory_inactive] {
+            if let Ok(i) = list.binary_search_by(|x| x.1.id.cmp(&id)) {
+                let window = &mut list[i].0;
+                if window.is_cancelled() {
+                    return false;
+                }
+                window.end = 0;
+                found = true;
+                break;
+            }
+        }
+
+        for list in [&mut self.transient, &mut self.transient_buffer] {
+            if let Ok(i) = list.binary_search_by(|x| x.id.cmp(&id)) {
+                list.remove(i);
+                return true;
+            }
+        }
+
+        found
     }
 
     pub fn receive<'a>(
@@ -172,7 +202,12 @@ impl<S: SignalType> Signals<S> {
             })
             .chain(transient_buffer)
             .map(|x| &x.payload)
-            .chain(self.transitory_active.iter().map(|x| &x.1.payload))
+            .chain(
+                self.transitory_active
+                    .iter()
+                    .filter(|x| !x.0.is_cancelled())
+                    .map(|x| &x.1.payload),
+            )
     }
 
     pub fn cleanup(&mut self, tick: u64) {
@@ -197,12 +232,14 @@ impl<S: SignalType> Signals<S> {
                 }
                 l += 1;
             } else {
-                if inactive_window.start <= next_tick {
-                    self.transitory_active_buffer
-                        .push((inactive_window, inactive_signal));
-                } else {
-                    self.transitory_inactive_buffer
-                        .push((inactive_window, inactive_signal));
+                if !inactive_window.is_cancelled() {
+                    if inactive_window.start <= next_tick {
+                        self.transitory_active_buffer
+                            .push((inactive_window, inactive_signal));
+                    } else {
+                        self.transitory_inactive_buffer
+                            .push((inactive_window, inactive_signal));
+                    }
                 }
                 r += 1;
             }
@@ -219,6 +256,10 @@ impl<S: SignalType> Signals<S> {
 
         if r < inactive.len() {
             for &(window, signal) in &inactive[r..] {
+                if window.is_cancelled() {
+                    continue;
+                }
+
                 if window.start <= next_tick {
                     self.transitory_active_buffer.push((window, signal));
                 } else {
@@ -273,6 +314,11 @@ impl<'w, S: SignalType> Signal<'w, S, Write> {
     #[inline]
     pub fn modify(&mut self, id: u64, payload: S) -> bool {
         self.signals.modify(id, |current| *current = payload)
+    }
+
+    #[inline]
+    pub fn cancel(&mut self, id: u64) -> bool {
+        self.signals.cancel(id)
     }
 
     #[inline]
@@ -813,6 +859,189 @@ mod tests {
         end_tick(&world);
 
         assert!(!world.signal::<NumSignal>().modify(id, NumSignal(2)));
+    }
+
+    fn send(world: &World, payload: u64, window: std::ops::Range<u64>) -> u64 {
+        world
+            .signal::<NumSignal>()
+            .send(NumSignal(payload), window)
+            .unwrap()
+    }
+
+    fn cancel(world: &World, id: u64) -> bool {
+        world.signal::<NumSignal>().cancel(id)
+    }
+
+    #[test]
+    fn cancel_stops_active_signal_for_the_next_receiver() {
+        let world = world();
+        let id = send(&world, 1, 0..5);
+        assert_eq!(run_ticks(&world, 2), vec![vec![1], vec![1]]);
+
+        assert_eq!(receive(&world), vec![1]);
+        assert!(cancel(&world, id));
+        assert_eq!(receive(&world), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn cancel_stops_future_signal() {
+        let world = world();
+        let id = send(&world, 1, 2..4);
+        end_tick(&world);
+
+        assert!(cancel(&world, id));
+        assert_eq!(run_ticks(&world, 5), vec![Vec::<u64>::new(); 5]);
+    }
+
+    #[test]
+    fn cancel_stops_future_signal_while_merging_with_active() {
+        let world = world();
+        send(&world, 1, 0..9);
+        let id = send(&world, 2, 2..4);
+        send(&world, 3, 2..4);
+        end_tick(&world);
+
+        assert!(cancel(&world, id));
+        assert_eq!(run_ticks(&world, 3), vec![vec![1], vec![1, 3], vec![1, 3]]);
+    }
+
+    #[test]
+    fn cancel_on_send_tick_stops_later_receiver() {
+        let world = world();
+        let id = send(&world, 1, 0..5);
+
+        assert!(cancel(&world, id));
+        assert_eq!(run_ticks(&world, 3), vec![Vec::<u64>::new(); 3]);
+    }
+
+    #[test]
+    fn cancel_on_send_tick_stops_receiver_that_ran_before_sender() {
+        let world = world();
+        receive(&world);
+        let id = send(&world, 1, 0..5);
+
+        assert!(cancel(&world, id));
+        end_tick(&world);
+        assert_eq!(receive(&world), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn cancel_on_next_tick_stops_receiver_that_ran_before_sender() {
+        let world = world();
+        receive(&world);
+        let id = send(&world, 1, 0..5);
+        end_tick(&world);
+
+        assert!(cancel(&world, id));
+        assert_eq!(receive(&world), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn cancel_stops_one_tick_signal() {
+        let world = world();
+        let id = world.signal::<NumSignal>().emit(NumSignal(1));
+
+        assert!(cancel(&world, id));
+        assert_eq!(receive(&world), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn cancel_stops_one_tick_signal_for_late_receiver() {
+        let world = world();
+        receive(&world);
+        let id = world.signal::<NumSignal>().emit(NumSignal(1));
+        end_tick(&world);
+
+        assert!(cancel(&world, id));
+        assert_eq!(receive(&world), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn cancel_leaves_other_signals_in_order() {
+        let world = world();
+        send(&world, 1, 0..3);
+        let id = send(&world, 2, 0..3);
+        send(&world, 3, 0..3);
+        world.signal::<NumSignal>().emit(NumSignal(4));
+        end_tick(&world);
+
+        assert!(cancel(&world, id));
+        assert_eq!(run_ticks(&world, 2), vec![vec![4, 1, 3], vec![1, 3]]);
+    }
+
+    #[test]
+    fn cancel_returns_false_for_unknown_id() {
+        let world = world();
+        send(&world, 1, 0..5);
+
+        assert!(!cancel(&world, 99));
+    }
+
+    #[test]
+    fn cancel_returns_false_when_already_cancelled() {
+        let world = world();
+        let windowed = send(&world, 1, 0..5);
+        let one_tick = world.signal::<NumSignal>().emit(NumSignal(2));
+
+        assert!(cancel(&world, windowed));
+        assert!(cancel(&world, one_tick));
+        assert!(!cancel(&world, windowed));
+        assert!(!cancel(&world, one_tick));
+
+        end_tick(&world);
+        assert!(!cancel(&world, windowed));
+    }
+
+    #[test]
+    fn cancel_returns_false_after_signal_expires() {
+        let world = world();
+        let id = send(&world, 1, 0..2);
+        run_ticks(&world, 3);
+
+        assert!(!cancel(&world, id));
+    }
+
+    #[test]
+    fn modify_fails_on_cancelled_signal() {
+        let world = world();
+        let id = send(&world, 1, 0..5);
+        end_tick(&world);
+        end_tick(&world);
+
+        assert!(cancel(&world, id));
+        assert!(!world.signal::<NumSignal>().modify(id, NumSignal(2)));
+    }
+
+    #[test]
+    fn cleanup_drops_cancelled_signals() {
+        let world = world();
+        let started = send(&world, 1, 0..5);
+        let future = send(&world, 2, 3..5);
+        end_tick(&world);
+        assert!(cancel(&world, started));
+        assert!(cancel(&world, future));
+        end_tick(&world);
+
+        let signals = world.get_resource::<Signals<NumSignal>>().unwrap();
+        assert!(signals.transitory_active.is_empty());
+        assert!(signals.transitory_inactive.is_empty());
+    }
+
+    #[test]
+    fn cancel_survives_save_before_cleanup() {
+        let world = world();
+        let id = send(&world, 1, 0..5);
+        end_tick(&world);
+        end_tick(&world);
+        assert!(cancel(&world, id));
+
+        let bytes = world.save();
+        let mut restored = super::tests::world();
+        restored.load(&bytes);
+
+        assert_eq!(receive(&restored), Vec::<u64>::new());
+        end_tick(&restored);
+        assert_eq!(receive(&restored), Vec::<u64>::new());
     }
 
     #[test]
