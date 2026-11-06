@@ -83,7 +83,7 @@ impl SignalWindow {
 
     #[inline]
     pub fn is_cancelled(&self) -> bool {
-        self.end == 0
+        self.start == u64::MAX
     }
 }
 
@@ -102,18 +102,185 @@ pub struct SignalData<S: SignalType> {
     phantom: PhantomData<S>,
 }
 
+pub const WINDOW_CHUNK_TICKS: u64 = 64;
+const _: () = assert!(WINDOW_CHUNK_TICKS > 0 && WINDOW_CHUNK_TICKS <= 64);
+
+pub type WindowEntry<S> = (SignalWindow, SignalInstance<S>);
+
+#[inline]
+fn chunk_key(tick: u64) -> u64 {
+    tick / WINDOW_CHUNK_TICKS
+}
+
+#[inline]
+fn chunk_bit(tick: u64) -> u64 {
+    1 << (tick % WINDOW_CHUNK_TICKS)
+}
+
+#[inline]
+fn chunk_bits_through(tick: u64) -> u64 {
+    u64::MAX >> (63 - tick % WINDOW_CHUNK_TICKS)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound = "S: SignalType")]
+pub struct WindowChunk<S> {
+    pub key: u64,
+    pub ticks: u64,
+    pub cancelled: u64,
+    pub head: usize,
+    pub by_end: bool,
+    pub due: bool,
+    pub entries: Vec<WindowEntry<S>>,
+}
+
+impl<S: Copy> WindowChunk<S> {
+    #[inline]
+    pub fn live(&self) -> &[WindowEntry<S>] {
+        &self.entries[self.head..]
+    }
+
+    fn is_empty(&self) -> bool {
+        self.head == self.entries.len()
+    }
+
+    fn retain_live(&mut self, mut f: impl FnMut(&WindowEntry<S>) -> bool) {
+        let head = self.head;
+        let mut index = 0;
+        let mut last_end = 0;
+        let mut by_end = true;
+        let mut cancelled = 0;
+        self.entries.retain(|entry| {
+            let keep = index >= head && f(entry);
+            index += 1;
+            if keep {
+                by_end &= last_end <= entry.0.end;
+                last_end = entry.0.end;
+                cancelled += entry.0.is_cancelled() as u64;
+            }
+            keep
+        });
+        self.head = 0;
+        self.by_end = by_end;
+        self.cancelled = cancelled;
+    }
+
+    fn join(&mut self, joining: &[WindowEntry<S>]) {
+        let Some(first) = joining.first() else {
+            return;
+        };
+        let appends = self.live().last().is_none_or(|last| last.1.id < first.1.id);
+        if appends {
+            self.by_end &= self
+                .live()
+                .last()
+                .is_none_or(|last| last.0.end <= first.0.end)
+                && joining.is_sorted_by_key(|entry| entry.0.end);
+            self.entries.extend_from_slice(joining);
+            return;
+        }
+
+        self.entries.drain(..self.head);
+        self.head = 0;
+        self.by_end = false;
+        merge_by_id(&mut self.entries, joining);
+    }
+}
+
+const SPARE_CHUNKS: usize = 16;
+
+fn recycle<S>(spare: &mut Vec<Vec<WindowEntry<S>>>, mut entries: Vec<WindowEntry<S>>) {
+    if spare.len() < SPARE_CHUNKS {
+        entries.clear();
+        spare.push(entries);
+    }
+}
+
+fn chunk_mut<'a, S>(
+    chunks: &'a mut Vec<WindowChunk<S>>,
+    spare: &mut Vec<Vec<WindowEntry<S>>>,
+    key: u64,
+) -> &'a mut WindowChunk<S> {
+    let i = match chunks.binary_search_by_key(&key, |chunk| chunk.key) {
+        Ok(i) => i,
+        Err(i) => {
+            let chunk = WindowChunk {
+                key,
+                ticks: 0,
+                cancelled: 0,
+                head: 0,
+                by_end: true,
+                due: false,
+                entries: spare.pop().unwrap_or_default(),
+            };
+            chunks.insert(i, chunk);
+            i
+        }
+    };
+    &mut chunks[i]
+}
+
+fn find_in_chunks<S: Copy>(chunks: &[WindowChunk<S>], id: u64) -> Option<(usize, usize)> {
+    chunks.iter().enumerate().find_map(|(c, chunk)| {
+        let live = chunk.live();
+        let (first, last) = (live.first()?, live.last()?);
+        if id < first.1.id || id > last.1.id {
+            return None;
+        }
+        let i = live.binary_search_by(|x| x.1.id.cmp(&id)).ok()?;
+        Some((c, chunk.head + i))
+    })
+}
+
+fn merge_by_id<S: Copy>(entries: &mut Vec<WindowEntry<S>>, joining: &[WindowEntry<S>]) {
+    let Some(first) = joining.first() else {
+        return;
+    };
+    if entries.last().is_none_or(|last| last.1.id < first.1.id) {
+        entries.extend_from_slice(joining);
+        return;
+    }
+
+    let mut i = entries.len();
+    let mut j = joining.len();
+    entries.extend_from_slice(joining);
+    let mut write = entries.len();
+    while j > 0 {
+        write -= 1;
+        if i > 0 && entries[i - 1].1.id > joining[j - 1].1.id {
+            i -= 1;
+            entries[write] = entries[i];
+        } else {
+            j -= 1;
+            entries[write] = joining[j];
+        }
+    }
+}
+
+enum WindowSlot {
+    Pending(usize),
+    Joining(usize),
+    Active(usize, usize),
+    Inactive(usize, usize),
+}
+
 #[derive(Default, Hashed, Serialize, Deserialize)]
 #[serde(bound = "")]
 pub struct Signals<S: SignalType> {
     pub transient: Vec<SignalInstance<S>>,
     pub transient_buffer: Vec<SignalInstance<S>>,
 
-    pub transitory_active: Vec<(SignalWindow, SignalInstance<S>)>,
-    pub transitory_active_buffer: Vec<(SignalWindow, SignalInstance<S>)>,
+    pub transitory_pending: Vec<WindowEntry<S>>,
+    pub transitory_active: Vec<WindowChunk<S>>,
+    pub transitory_inactive: Vec<WindowChunk<S>>,
+    pub transitory_compact: Vec<(bool, u64)>,
+    pub transitory_wake: u64,
 
-    pub transitory_inactive: Vec<(SignalWindow, SignalInstance<S>)>,
-    pub transitory_inactive_buffer: Vec<(SignalWindow, SignalInstance<S>)>,
-
+    pub permanent_joining: Vec<WindowEntry<S>>,
+    #[serde(skip)]
+    pub window_spare: Vec<Vec<WindowEntry<S>>>,
+    #[serde(skip)]
+    pub window_started: Vec<WindowEntry<S>>,
     pub permanent: Vec<SignalInstance<S>>,
     pub permanent_write: usize,
     pub permanent_read: usize,
@@ -164,7 +331,6 @@ where
 }
 
 enum ReceiveStage {
-    Transient,
     TransientBuffer,
     Active,
     PermanentLeft,
@@ -177,10 +343,9 @@ struct ReceiveIter<'a, S: SignalType, K> {
     run: std::slice::Iter<'a, SignalInstance<S>>,
     entries: std::slice::Iter<'a, (SignalWindow, SignalInstance<S>)>,
     stage: ReceiveStage,
-    transient: std::slice::Iter<'a, SignalInstance<S>>,
-    windowed: &'a [(SignalWindow, SignalInstance<S>)],
     transient_buffer: &'a [SignalInstance<S>],
-    active: &'a [(SignalWindow, SignalInstance<S>)],
+    active: &'a [WindowChunk<S>],
+    joining: &'a [WindowEntry<S>],
     permanent: &'a [SignalInstance<S>],
     write: usize,
     read: usize,
@@ -221,30 +386,17 @@ impl<'a, S: SignalType, K: Fn(&S) -> bool> ReceiveIter<'a, S, K> {
             }
 
             match self.stage {
-                ReceiveStage::Transient => {
-                    if self.windowed.is_empty() {
-                        self.run = std::mem::replace(&mut self.transient, [].iter());
-                        self.stage = ReceiveStage::TransientBuffer;
-                        continue;
-                    }
-
-                    let Some(signal) = self.transient.next() else {
-                        self.stage = ReceiveStage::TransientBuffer;
-                        continue;
-                    };
-                    while self.windowed.first().is_some_and(|w| w.1.id < signal.id) {
-                        self.windowed = &self.windowed[1..];
-                    }
-                    if !self.windowed.first().is_some_and(|w| w.1.id == signal.id) {
-                        return Some(&signal.payload);
-                    }
-                }
                 ReceiveStage::TransientBuffer => {
                     self.run = self.transient_buffer.iter();
                     self.stage = ReceiveStage::Active;
                 }
                 ReceiveStage::Active => {
-                    self.entries = self.active.iter();
+                    if let Some((chunk, rest)) = self.active.split_first() {
+                        self.entries = chunk.live().iter();
+                        self.active = rest;
+                        continue;
+                    }
+                    self.entries = self.joining.iter();
                     self.stage = if self.cancelled.is_some() {
                         ReceiveStage::PermanentCancelled
                     } else {
@@ -310,31 +462,15 @@ impl<'a, S: SignalType, K: Fn(&S) -> bool> Iterator for ReceiveIter<'a, S, K> {
 
         loop {
             match self.stage {
-                ReceiveStage::Transient => {
-                    let transient = self.transient.as_slice();
-                    if self.windowed.is_empty() {
-                        acc = fold_instances(transient, acc, &mut f, &self.keep);
-                    } else {
-                        let mut windowed = self.windowed;
-                        for signal in transient {
-                            while windowed.first().is_some_and(|w| w.1.id < signal.id) {
-                                windowed = &windowed[1..];
-                            }
-                            if !windowed.first().is_some_and(|w| w.1.id == signal.id)
-                                && (self.keep)(&signal.payload)
-                            {
-                                acc = f(acc, &signal.payload);
-                            }
-                        }
-                    }
-                    self.stage = ReceiveStage::TransientBuffer;
-                }
                 ReceiveStage::TransientBuffer => {
                     acc = fold_instances(self.transient_buffer, acc, &mut f, &self.keep);
                     self.stage = ReceiveStage::Active;
                 }
                 ReceiveStage::Active => {
-                    acc = fold_entries(self.active, acc, &mut f, &self.keep);
+                    for chunk in self.active {
+                        acc = fold_entries(chunk.live(), acc, &mut f, &self.keep);
+                    }
+                    acc = fold_entries(self.joining, acc, &mut f, &self.keep);
                     self.stage = if self.cancelled.is_some() {
                         ReceiveStage::PermanentCancelled
                     } else {
@@ -402,10 +538,45 @@ impl<S: SignalType> Signals<S> {
         }
 
         if window.end > tick + 1 {
-            self.transitory_inactive.push((window, instance));
+            self.transitory_pending.push((window, instance));
         }
 
         Some(instance.id)
+    }
+
+    #[inline]
+    pub fn emit(&mut self, data: &mut SignalData<S>, signal: S) -> u64 {
+        let id = data.next;
+        data.next += 1;
+        self.transient_buffer.push(SignalInstance {
+            id,
+            payload: signal,
+        });
+        id
+    }
+
+    fn find_windowed(&self, id: u64) -> Option<WindowSlot> {
+        let search = |list: &[WindowEntry<S>]| list.binary_search_by(|x| x.1.id.cmp(&id)).ok();
+        search(&self.transitory_pending)
+            .map(WindowSlot::Pending)
+            .or_else(|| search(&self.permanent_joining).map(WindowSlot::Joining))
+            .or_else(|| {
+                let (c, i) = find_in_chunks(&self.transitory_active, id)?;
+                Some(WindowSlot::Active(c, i))
+            })
+            .or_else(|| {
+                let (c, i) = find_in_chunks(&self.transitory_inactive, id)?;
+                Some(WindowSlot::Inactive(c, i))
+            })
+    }
+
+    fn windowed_mut(&mut self, slot: &WindowSlot) -> &mut WindowEntry<S> {
+        match *slot {
+            WindowSlot::Pending(i) => &mut self.transitory_pending[i],
+            WindowSlot::Joining(i) => &mut self.permanent_joining[i],
+            WindowSlot::Active(c, i) => &mut self.transitory_active[c].entries[i],
+            WindowSlot::Inactive(c, i) => &mut self.transitory_inactive[c].entries[i],
+        }
     }
 
     fn find_permanent(&self, id: u64) -> Option<usize> {
@@ -423,34 +594,28 @@ impl<S: SignalType> Signals<S> {
             return true;
         }
 
-        let windowed = [&mut self.transitory_active, &mut self.transitory_inactive]
-            .into_iter()
-            .find_map(|list| {
-                let i = list.binary_search_by(|x| x.1.id.cmp(&id)).ok()?;
-                let (window, signal) = &mut list[i];
-                (!window.is_cancelled()).then_some(&mut signal.payload)
-            });
-        let transient = [&mut self.transient, &mut self.transient_buffer]
-            .into_iter()
-            .find_map(|list| {
-                let i = list.binary_search_by(|x| x.id.cmp(&id)).ok()?;
-                Some(&mut list[i].payload)
-            });
-
-        match (windowed, transient) {
-            (Some(windowed), transient) => {
-                f(windowed);
-                if let Some(transient) = transient {
-                    *transient = *windowed;
+        if let Some(slot) = self.find_windowed(id) {
+            let entry = self.windowed_mut(&slot);
+            if entry.0.is_cancelled() {
+                return false;
+            }
+            f(&mut entry.1.payload);
+            let payload = entry.1.payload;
+            for list in [&mut self.transient, &mut self.transient_buffer] {
+                if let Ok(i) = list.binary_search_by(|x| x.id.cmp(&id)) {
+                    list[i].payload = payload;
                 }
-                true
             }
-            (None, Some(transient)) => {
-                f(transient);
-                true
-            }
-            (None, None) => false,
+            return true;
         }
+
+        for list in [&mut self.transient, &mut self.transient_buffer] {
+            if let Ok(i) = list.binary_search_by(|x| x.id.cmp(&id)) {
+                f(&mut list[i].payload);
+                return true;
+            }
+        }
+        false
     }
 
     pub fn cancel(&mut self, id: u64) -> bool {
@@ -464,15 +629,26 @@ impl<S: SignalType> Signals<S> {
         }
 
         let mut found = false;
-        for list in [&mut self.transitory_active, &mut self.transitory_inactive] {
-            if let Ok(i) = list.binary_search_by(|x| x.1.id.cmp(&id)) {
-                let window = &mut list[i].0;
-                if window.is_cancelled() {
-                    return false;
+        if let Some(slot) = self.find_windowed(id) {
+            let window = &mut self.windowed_mut(&slot).0;
+            if window.is_cancelled() {
+                return false;
+            }
+            window.start = u64::MAX;
+            found = true;
+
+            if let WindowSlot::Active(c, _) | WindowSlot::Inactive(c, _) = slot {
+                let active = matches!(slot, WindowSlot::Active(..));
+                let chunks = match active {
+                    true => &mut self.transitory_active,
+                    false => &mut self.transitory_inactive,
+                };
+                let chunk = &mut chunks[c];
+                chunk.cancelled += 1;
+                if !chunk.due && chunk.cancelled * 2 > chunk.live().len() as u64 {
+                    chunk.due = true;
+                    self.transitory_compact.push((active, chunk.key));
                 }
-                window.end = 0;
-                found = true;
-                break;
             }
         }
 
@@ -507,22 +683,13 @@ impl<S: SignalType> Signals<S> {
             }
         }
 
-        let windowed = match transient.first() {
-            Some(first) => {
-                let active = &self.transitory_active;
-                &active[active.partition_point(|x| x.1.id < first.id)..]
-            }
-            None => &[],
-        };
-
         ReceiveIter {
-            run: [].iter(),
-            stage: ReceiveStage::Transient,
-            transient: transient.iter(),
-            windowed,
+            run: transient.iter(),
+            stage: ReceiveStage::TransientBuffer,
             transient_buffer,
             entries: [].iter(),
             active: &self.transitory_active,
+            joining: &self.permanent_joining,
             permanent: &self.permanent,
             write: self.permanent_write,
             read: self.permanent_read,
@@ -597,96 +764,213 @@ impl<S: SignalType> Signals<S> {
         }
     }
 
+    fn drop_transient_copies(&mut self) {
+        let pending = &self.transitory_pending;
+        if pending.is_empty() || self.transient.is_empty() {
+            return;
+        }
+
+        let mut p = 0;
+        self.transient.retain(|signal| {
+            while p < pending.len() && pending[p].1.id < signal.id {
+                p += 1;
+            }
+            p == pending.len() || pending[p].1.id != signal.id
+        });
+    }
+
+    fn expire_active(&mut self, next_tick: u64) {
+        let key = chunk_key(next_tick);
+        let expired = self
+            .transitory_active
+            .partition_point(|chunk| chunk.key < key);
+        for chunk in self.transitory_active.drain(..expired) {
+            recycle(&mut self.window_spare, chunk.entries);
+        }
+
+        let Some(chunk) = self.transitory_active.first_mut() else {
+            return;
+        };
+        let through = chunk_bits_through(next_tick);
+        if chunk.key != key || chunk.ticks & through == 0 {
+            return;
+        }
+
+        if chunk.by_end {
+            let ended = chunk
+                .live()
+                .partition_point(|entry| entry.0.end <= next_tick);
+            if chunk.cancelled > 0 {
+                let live = chunk.live();
+                chunk.cancelled -= live[..ended]
+                    .iter()
+                    .filter(|entry| entry.0.is_cancelled())
+                    .count() as u64;
+            }
+            chunk.head += ended;
+        } else {
+            chunk.retain_live(|entry| entry.0.end > next_tick);
+        }
+        chunk.ticks &= !through;
+        if chunk.is_empty() {
+            let chunk = self.transitory_active.remove(0);
+            recycle(&mut self.window_spare, chunk.entries);
+        }
+    }
+
+    fn compact_cancelled(&mut self) {
+        for (active, key) in std::mem::take(&mut self.transitory_compact) {
+            let chunks = match active {
+                true => &mut self.transitory_active,
+                false => &mut self.transitory_inactive,
+            };
+            let Ok(c) = chunks.binary_search_by_key(&key, |chunk| chunk.key) else {
+                continue;
+            };
+            let chunk = &mut chunks[c];
+            if !chunk.due {
+                continue;
+            }
+            chunk.due = false;
+            chunk.retain_live(|entry| !entry.0.is_cancelled());
+            if chunk.is_empty() {
+                let chunk = chunks.remove(c);
+                recycle(&mut self.window_spare, chunk.entries);
+            }
+        }
+    }
+
+    fn start_inactive(&mut self, next_tick: u64, started: &mut Vec<WindowEntry<S>>) {
+        let key = chunk_key(next_tick);
+        let through = chunk_bits_through(next_tick);
+
+        while let Some(chunk) = self.transitory_inactive.first_mut() {
+            if chunk.key > key || (chunk.key == key && chunk.ticks & through == 0) {
+                break;
+            }
+
+            chunk.retain_live(|entry| {
+                if entry.0.is_cancelled() || entry.0.end <= next_tick {
+                    return false;
+                }
+                if entry.0.start <= next_tick {
+                    started.push(*entry);
+                    return false;
+                }
+                true
+            });
+            chunk.ticks &= !through;
+
+            if !chunk.is_empty() {
+                break;
+            }
+            let chunk = self.transitory_inactive.remove(0);
+            recycle(&mut self.window_spare, chunk.entries);
+        }
+    }
+
+    fn place_pending(&mut self, next_tick: u64, started: &mut Vec<WindowEntry<S>>) {
+        for entry in self.transitory_pending.drain(..) {
+            let window = entry.0;
+            if window.is_cancelled() {
+                continue;
+            }
+            if window.start <= next_tick {
+                started.push(entry);
+                continue;
+            }
+
+            let key = chunk_key(window.start);
+            let chunk = chunk_mut(&mut self.transitory_inactive, &mut self.window_spare, key);
+            chunk.ticks |= chunk_bit(window.start);
+            chunk.entries.push(entry);
+        }
+    }
+
+    fn place_started(&mut self, started: &mut [WindowEntry<S>]) {
+        let order = |entry: &WindowEntry<S>| (chunk_key(entry.0.end), entry.1.id);
+        if !started.is_sorted_by_key(order) {
+            started.sort_unstable_by_key(order);
+        }
+
+        for group in started.chunk_by(|a, b| chunk_key(a.0.end) == chunk_key(b.0.end)) {
+            let key = chunk_key(group[0].0.end);
+            let chunk = chunk_mut(&mut self.transitory_active, &mut self.window_spare, key);
+            for entry in group {
+                chunk.ticks |= chunk_bit(entry.0.end);
+            }
+            chunk.join(group);
+        }
+    }
+
+    fn first_bit_tick(chunks: &[WindowChunk<S>]) -> u64 {
+        chunks.first().map_or(u64::MAX, |chunk| {
+            let offset = (chunk.ticks.trailing_zeros() as u64).min(WINDOW_CHUNK_TICKS);
+            (chunk.key * WINDOW_CHUNK_TICKS).saturating_add(offset)
+        })
+    }
+
     pub fn cleanup(&mut self, tick: u64, keep: impl Fn(&S) -> bool) {
         std::mem::swap(&mut self.transient, &mut self.transient_buffer);
         self.transient_buffer.clear();
 
         let next_tick = tick + 1;
-        let active = &self.transitory_active;
-        let inactive = &self.transitory_inactive;
+        let windows_idle = self.transitory_pending.is_empty()
+            && self.transitory_compact.is_empty()
+            && self.permanent_joining.is_empty()
+            && next_tick < self.transitory_wake;
+        if !windows_idle {
+            self.cleanup_windows(next_tick, keep);
+        }
+
+        if !S::Filter::ACTIVE && (self.permanent_cancelled > 0 || self.permanent_read > 0) {
+            self.sweep(SWEEP_BUDGET, |_| true);
+        }
+    }
+
+    fn cleanup_windows(&mut self, next_tick: u64, keep: impl Fn(&S) -> bool) {
+        self.drop_transient_copies();
+        if !self.transitory_compact.is_empty() {
+            self.compact_cancelled();
+        }
+        self.expire_active(next_tick);
+
+        let mut started = std::mem::take(&mut self.window_started);
+        self.start_inactive(next_tick, &mut started);
+        self.place_pending(next_tick, &mut started);
+
+        let mut open = Vec::new();
+        started.retain(|entry| {
+            if entry.0.end == u64::MAX {
+                open.push(*entry);
+                return false;
+            }
+            true
+        });
+        self.place_started(&mut started);
+        started.clear();
+        self.window_started = started;
 
         let first_new = self.permanent.len();
         let newest = self.permanent.last().map(|x| x.id);
         let newest_checked = self.permanent[..self.permanent_write].last().map(|x| x.id);
         let behind_sweep = |id: u64| newest_checked.is_some_and(|checked| id < checked);
 
-        let mut l = 0;
-        let mut r = 0;
-
-        while l < active.len() && r < inactive.len() {
-            let (active_window, active_signal) = active[l];
-            let (inactive_window, inactive_signal) = inactive[r];
-
-            if active_signal.id < inactive_signal.id {
-                if active_window.end == u64::MAX {
-                    if keep(&active_signal.payload) {
-                        if behind_sweep(active_signal.id) {
-                            self.transitory_active_buffer
-                                .push((active_window, active_signal));
-                        } else {
-                            self.permanent.push(active_signal);
-                        }
-                    }
-                } else if active_window.end > next_tick {
-                    self.transitory_active_buffer
-                        .push((active_window, active_signal));
-                }
-                l += 1;
-            } else {
-                if !inactive_window.is_cancelled() {
-                    if inactive_window.start <= next_tick {
-                        self.transitory_active_buffer
-                            .push((inactive_window, inactive_signal));
-                    } else {
-                        self.transitory_inactive_buffer
-                            .push((inactive_window, inactive_signal));
-                    }
-                }
-                r += 1;
+        let permanent = &mut self.permanent;
+        self.permanent_joining.retain(|&(window, signal)| {
+            if window.is_cancelled() || !keep(&signal.payload) {
+                return false;
             }
-        }
-
-        if l < active.len() {
-            for &(window, signal) in &active[l..] {
-                if window.end == u64::MAX {
-                    if keep(&signal.payload) {
-                        if behind_sweep(signal.id) {
-                            self.transitory_active_buffer.push((window, signal));
-                        } else {
-                            self.permanent.push(signal);
-                        }
-                    }
-                } else if window.end > next_tick {
-                    self.transitory_active_buffer.push((window, signal));
-                }
+            if behind_sweep(signal.id) {
+                return true;
             }
+            permanent.push(signal);
+            false
+        });
+        if !open.is_sorted_by_key(|entry| entry.1.id) {
+            open.sort_unstable_by_key(|entry| entry.1.id);
         }
-
-        if r < inactive.len() {
-            for &(window, signal) in &inactive[r..] {
-                if window.is_cancelled() {
-                    continue;
-                }
-
-                if window.start <= next_tick {
-                    self.transitory_active_buffer.push((window, signal));
-                } else {
-                    self.transitory_inactive_buffer.push((window, signal));
-                }
-            }
-        }
-
-        std::mem::swap(
-            &mut self.transitory_active,
-            &mut self.transitory_active_buffer,
-        );
-        self.transitory_active_buffer.clear();
-
-        std::mem::swap(
-            &mut self.transitory_inactive,
-            &mut self.transitory_inactive_buffer,
-        );
-        self.transitory_inactive_buffer.clear();
+        merge_by_id(&mut self.permanent_joining, &open);
 
         let joined_late = self
             .permanent
@@ -697,9 +981,8 @@ impl<S: SignalType> Signals<S> {
             self.merge_late_permanent(first_new);
         }
 
-        if !S::Filter::ACTIVE && (self.permanent_cancelled > 0 || self.permanent_read > 0) {
-            self.sweep(SWEEP_BUDGET, |_| true);
-        }
+        self.transitory_wake = Self::first_bit_tick(&self.transitory_active)
+            .min(Self::first_bit_tick(&self.transitory_inactive));
     }
 }
 
@@ -729,9 +1012,7 @@ impl<'w, S: SignalType> Signal<'w, S, Write> {
 
     #[inline]
     pub fn emit(&mut self, signal: S) -> u64 {
-        let tick = self.tick();
-        self.send(signal, tick..=tick)
-            .expect("current tick window is never empty")
+        self.signals.emit(&mut self.data, signal)
     }
 
     #[inline]
@@ -873,7 +1154,7 @@ fn cleanup_in_world<S: SignalType>(world: &World) {
     ) else {
         return;
     };
-    let context = (!signals.transitory_active.is_empty()).then(|| S::Filter::fetch(world));
+    let context = (!signals.permanent_joining.is_empty()).then(|| S::Filter::fetch(world));
     signals.cleanup(tick.0, |signal| {
         context
             .as_ref()
@@ -1115,8 +1396,11 @@ mod tests {
             }
 
             let signals = world.get_resource::<Signals<NumSignal>>().unwrap();
-            for list in [&signals.transitory_active, &signals.transitory_inactive] {
-                assert!(list.windows(2).all(|w| w[0].1.id < w[1].1.id));
+            for chunks in [&signals.transitory_active, &signals.transitory_inactive] {
+                assert!(chunks.windows(2).all(|w| w[0].key < w[1].key));
+                for chunk in chunks {
+                    assert!(chunk.live().windows(2).all(|w| w[0].1.id < w[1].1.id));
+                }
             }
         }
 
@@ -1124,9 +1408,129 @@ mod tests {
         let active: Vec<u64> = signals
             .transitory_active
             .iter()
-            .map(|x| x.1.payload.0)
+            .flat_map(|chunk| chunk.live().iter().map(|x| x.1.payload.0))
             .collect();
         assert_eq!(active, vec![0, 1, 3, 102, 103]);
+    }
+
+    #[test]
+    fn windows_across_chunks_match_a_simple_model() {
+        windows_model_run(false);
+    }
+
+    #[test]
+    fn same_length_windows_expire_by_head_and_match_a_simple_model() {
+        assert!(windows_model_run(true) > 0);
+    }
+
+    fn windows_model_run(same_length: bool) -> usize {
+        struct Sent {
+            id: u64,
+            sent: u64,
+            start: u64,
+            end: u64,
+            payload: u64,
+            stopped: u64,
+        }
+
+        let mut world = world();
+        let mut rng = 0x2545F4914F6CDD1Du64;
+        let mut random = move |below: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % below
+        };
+        let mut model: Vec<Sent> = Vec::new();
+        let mut payloads = 0;
+        let mut head_moves = 0;
+
+        for tick in 0..600u64 {
+            if tick == 300 {
+                let bytes = world.save();
+                world = super::tests::world();
+                world.load(&bytes);
+            }
+
+            let mut expected: Vec<u64> = model
+                .iter()
+                .filter(|s| {
+                    s.sent < tick
+                        && tick < s.stopped
+                        && ((s.start <= tick && tick < s.end)
+                            || (s.start <= s.sent && tick == s.sent + 1))
+                })
+                .map(|s| s.payload)
+                .collect();
+            let mut received = receive(&world);
+            expected.sort();
+            received.sort();
+            assert_eq!(received, expected, "tick {tick}");
+
+            let mut s = world.signal::<NumSignal>();
+            for _ in 0..random(6) {
+                let start = if same_length || random(4) == 0 {
+                    tick.saturating_sub(random(3))
+                } else {
+                    tick + random(200)
+                };
+                let end = if same_length {
+                    tick + 90
+                } else if random(10) == 0 {
+                    u64::MAX
+                } else {
+                    start.max(tick) + 1 + random(300)
+                };
+                payloads += 1;
+                let id = if end == u64::MAX {
+                    s.send(NumSignal(payloads), start..)
+                } else {
+                    s.send(NumSignal(payloads), start..end)
+                };
+                model.push(Sent {
+                    id: id.unwrap(),
+                    sent: tick,
+                    start,
+                    end,
+                    payload: payloads,
+                    stopped: u64::MAX,
+                });
+            }
+
+            for _ in 0..random(4) {
+                let i = random(model.len().max(1) as u64) as usize;
+                let Some(sent) = model.get_mut(i) else {
+                    break;
+                };
+                if sent.end <= tick {
+                    continue;
+                }
+                let live = sent.stopped == u64::MAX;
+                if random(2) == 0 {
+                    payloads += 1;
+                    assert_eq!(s.modify(sent.id, NumSignal(payloads)), live);
+                    if live {
+                        sent.payload = payloads;
+                    }
+                } else {
+                    assert_eq!(s.cancel(sent.id), live);
+                    if live {
+                        sent.stopped = tick + 1;
+                    }
+                }
+            }
+            drop(s);
+            end_tick(&world);
+
+            let signals = world.get_resource::<Signals<NumSignal>>().unwrap();
+            if signals.transitory_active.iter().any(|chunk| chunk.head > 0) {
+                head_moves += 1;
+            }
+        }
+
+        let signals = world.get_resource::<Signals<NumSignal>>().unwrap();
+        assert!(signals.transitory_active.len() + signals.transitory_inactive.len() > 1);
+        head_moves
     }
 
     #[test]
@@ -1557,6 +1961,30 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_windows_stay_until_half_their_chunk_is_cancelled() {
+        let world = world();
+        let ids: Vec<u64> = (0..10).map(|i| send(&world, i, 0..50)).collect();
+        end_tick(&world);
+        for &id in &ids[..5] {
+            assert!(cancel(&world, id));
+        }
+        end_tick(&world);
+
+        let live = |world: &World| {
+            let signals = world.get_resource::<Signals<NumSignal>>().unwrap();
+            signals.transitory_active[0].live().len()
+        };
+        assert_eq!(live(&world), 10);
+        assert_eq!(receive(&world), vec![5, 6, 7, 8, 9]);
+
+        assert!(cancel(&world, ids[5]));
+        assert_eq!(receive(&world), vec![6, 7, 8, 9]);
+        end_tick(&world);
+        assert_eq!(live(&world), 4);
+        assert_eq!(receive(&world), vec![6, 7, 8, 9]);
+    }
+
+    #[test]
     fn cancel_survives_save_before_cleanup() {
         let world = world();
         let id = send(&world, 1, 0..5);
@@ -1604,12 +2032,13 @@ mod tests {
         end_tick(&world);
         {
             let signals = world.get_resource::<Signals<NumSignal>>().unwrap();
-            assert_eq!(signals.transitory_active.len(), 1);
+            assert_eq!(signals.permanent_joining.len(), 1);
             assert!(signals.permanent.is_empty());
         }
 
         end_tick(&world);
         let signals = world.get_resource::<Signals<NumSignal>>().unwrap();
+        assert!(signals.permanent_joining.is_empty());
         assert!(signals.transitory_active.is_empty());
         assert!(signals.transitory_inactive.is_empty());
         assert_eq!(signals.permanent.len(), 1);
@@ -2029,7 +2458,7 @@ mod tests {
 
         {
             let signals = world.get_resource::<Signals<Kept>>().unwrap();
-            assert_eq!(signals.transitory_active.len(), 1);
+            assert_eq!(signals.permanent_joining.len(), 1);
             assert_eq!(signals.permanent.len(), 4);
         }
         assert_eq!(received_kept(&world), entities);
@@ -2039,7 +2468,7 @@ mod tests {
         end_tick(&world);
 
         let signals = world.get_resource::<Signals<Kept>>().unwrap();
-        assert!(signals.transitory_active.is_empty());
+        assert!(signals.permanent_joining.is_empty());
         assert_eq!(signals.permanent_read, 0);
         drop(signals);
         assert_eq!(kept_ids(&world), vec![0, 1, 2, 3, 4]);
@@ -2479,7 +2908,7 @@ mod tests {
             .downcast::<Signals<NumSignal>>()
             .unwrap();
 
-        assert_eq!(restored.transitory_inactive.len(), 1);
-        assert_eq!(restored.transitory_inactive[0].1.payload, NumSignal(42));
+        assert_eq!(restored.transitory_pending.len(), 1);
+        assert_eq!(restored.transitory_pending[0].1.payload, NumSignal(42));
     }
 }
