@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, VecDeque},
-    ops::{Deref, DerefMut, Range},
+    ops::Range,
     ptr::addr_of_mut,
 };
 
@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Tick,
+    registry::get_registry_entry,
     schedule::{ANONYMOUS_SYSTEM, system_graph},
     signal::{SignalData, SignalFilter, SignalInstance, SignalType, Signals, WindowEntry},
     world::World,
@@ -450,28 +451,37 @@ impl TrackingSave {
     }
 }
 
-pub struct Tracker<'w> {
-    world: &'w mut World,
+pub struct Tracker {
     log: TrackingSave,
     live: Vec<LiveSignal>,
     paused: bool,
+    restart: bool,
+    copy: Option<World>,
 }
 
-impl Deref for Tracker<'_> {
-    type Target = World;
-    fn deref(&self) -> &World {
-        self.world
-    }
-}
-
-impl DerefMut for Tracker<'_> {
-    fn deref_mut(&mut self) -> &mut World {
-        self.world
-    }
+fn copy_world(from: &World, to: &mut World) {
+    to.resources = from
+        .resources
+        .iter()
+        .map(|(id, cell)| {
+            let entry = get_registry_entry(*id).unwrap_or_else(|| {
+                panic!(
+                    "Tracker can't copy resource {id:#034x}: it isn't registered, use #[resource]"
+                )
+            });
+            let resource = cell.try_borrow().unwrap_or_else(|_| {
+                panic!(
+                    "Tracker can't copy resource `{}` while it's borrowed for writing",
+                    entry.type_name
+                )
+            });
+            (*id, (entry.restore)(&(entry.serialize)(&*resource)))
+        })
+        .collect();
 }
 
 impl World {
-    pub fn to_tracker(&mut self) -> Tracker<'_> {
+    pub fn to_tracker(&self) -> Tracker {
         let mut systems: Vec<TrackedName> = system_graph()
             .iter()
             .map(|system| TrackedName {
@@ -494,7 +504,6 @@ impl World {
             .collect();
 
         let mut tracker = Tracker {
-            world: self,
             log: TrackingSave {
                 systems,
                 signals,
@@ -506,21 +515,22 @@ impl World {
             },
             live: Vec::new(),
             paused: false,
+            restart: false,
+            copy: None,
         };
-        tracker.begin();
+        tracker.begin(self);
         tracker
     }
 }
 
-impl Tracker<'_> {
+impl Tracker {
     pub fn with_window(mut self, ticks: u64) -> Self {
         assert!(ticks > 0, "the tracker window needs at least one tick");
         self.log.window_ticks = ticks;
         self
     }
 
-    fn rebaseline(&mut self) {
-        let world = &*self.world;
+    fn rebaseline(&mut self, world: &World) {
         self.live = probes()
             .iter()
             .map(|probe| LiveSignal {
@@ -530,11 +540,12 @@ impl Tracker<'_> {
             .collect();
     }
 
-    fn begin(&mut self) {
-        let tick = current_tick(self.world);
+    fn begin(&mut self, world: &World) {
+        let tick = current_tick(world);
         self.log.start_tick = tick;
         self.log.end_tick = tick;
-        self.rebaseline();
+        self.restart = false;
+        self.rebaseline(world);
     }
 
     fn freeze(&mut self) {
@@ -552,10 +563,10 @@ impl Tracker<'_> {
         }
     }
 
-    fn realign(&mut self, tick: u64) {
+    fn realign(&mut self, world: &World, tick: u64) {
         if tick > self.log.end_tick {
             self.freeze();
-            self.begin();
+            self.begin(world);
             return;
         }
 
@@ -569,23 +580,25 @@ impl Tracker<'_> {
         }
         self.log.end_tick = tick;
         self.log.start_tick = self.log.start_tick.min(tick);
-        self.rebaseline();
+        self.rebaseline(world);
     }
 
-    pub fn step(&mut self) {
+    pub fn step(&mut self, world: &World) {
         if self.paused {
-            self.world.step();
             return;
         }
 
-        let tick = current_tick(self.world);
-        if tick != self.log.end_tick {
-            self.realign(tick);
+        let tick = current_tick(world);
+        if self.restart {
+            self.begin(world);
+        } else if tick != self.log.end_tick {
+            self.realign(world, tick);
         }
 
-        let world = &mut *self.world;
+        let copy = self.copy.get_or_insert_with(World::new);
+        copy_world(world, copy);
         for (probe, live) in probes().iter().zip(&mut self.live) {
-            (probe.outside)(world, tick, live);
+            (probe.outside)(copy, tick, live);
         }
 
         let mut before = Vec::with_capacity(probes().len());
@@ -594,22 +607,16 @@ impl Tracker<'_> {
                 probes()
                     .iter()
                     .zip(&self.live)
-                    .map(|(probe, live)| (probe.before)(world, system.uuid, live)),
+                    .map(|(probe, live)| (probe.before)(copy, system.uuid, live)),
             );
-            system.run(world);
+            system.run(copy);
             for ((probe, live), before) in probes().iter().zip(&mut self.live).zip(before.drain(..))
             {
                 if let Some(before) = before {
-                    (probe.after)(world, system.uuid, tick, before, live);
+                    (probe.after)(copy, system.uuid, tick, before, live);
                 }
             }
         }
-
-        world.cleanup_signals();
-        world
-            .get_resource_mut::<Tick>()
-            .expect("the world has no Tick")
-            .0 += 1;
 
         self.finish_frame(tick);
     }
@@ -653,7 +660,7 @@ impl Tracker<'_> {
     pub fn resume(&mut self) {
         if self.paused {
             self.paused = false;
-            self.begin();
+            self.restart = true;
         }
     }
 
@@ -664,7 +671,7 @@ impl Tracker<'_> {
     pub fn reset(&mut self) {
         self.log.frames.clear();
         self.log.intervals.clear();
-        self.begin();
+        self.restart = true;
     }
 
     pub fn log(&self) -> &TrackingSave {
