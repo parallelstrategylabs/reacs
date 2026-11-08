@@ -1,0 +1,10 @@
+[package]
+name = "reacs-tracker"
+version = "0.1.0"
+edition = "2024"
+description = "A window that shows what a reacs tracker recorded"
+license = "Apache-2.0"
+
+[dependencies]
+reacs = { path = "../reacs" }
+eframe = "0.37"

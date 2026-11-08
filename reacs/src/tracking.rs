@@ -1,6 +1,9 @@
 use std::{
     collections::{BTreeMap, VecDeque},
+    io::{self, ErrorKind, Read, Write},
+    net::{TcpListener, TcpStream},
     ops::Range,
+    path::Path,
     ptr::addr_of_mut,
 };
 
@@ -18,6 +21,8 @@ pub const UNKNOWN_SENDER: u128 = u128::MAX;
 pub const TRACKER_WINDOW_TICKS: u64 = 4096;
 const MIN_TRIM_RUNS: usize = 64;
 const SNAPSHOT_MAGIC: [u8; 8] = *b"REACSTRK";
+const MAX_MESSAGE_BYTES: usize = 1 << 30;
+const MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SentCount {
@@ -30,6 +35,7 @@ pub struct ReceivedCount {
     pub receiver: u128,
     pub sender: u128,
     pub sent_tick: Option<u64>,
+    pub windowed: bool,
     pub count: u64,
 }
 
@@ -89,17 +95,20 @@ impl LiveSignal {
     }
 
     fn add_received(&mut self, receiver: u128, tally: Tally) {
-        for (sender, sent_tick, count) in tally {
-            let existing = self
-                .received
-                .iter_mut()
-                .find(|x| x.receiver == receiver && x.sender == sender && x.sent_tick == sent_tick);
+        for (sender, sent_tick, windowed, count) in tally {
+            let existing = self.received.iter_mut().find(|x| {
+                x.receiver == receiver
+                    && x.sender == sender
+                    && x.sent_tick == sent_tick
+                    && x.windowed == windowed
+            });
             match existing {
                 Some(existing) => existing.count += count,
                 None => self.received.push(ReceivedCount {
                     receiver,
                     sender,
                     sent_tick,
+                    windowed,
                     count,
                 }),
             }
@@ -107,7 +116,7 @@ impl LiveSignal {
     }
 }
 
-type Tally = Vec<(u128, Option<u64>, u64)>;
+type Tally = Vec<(u128, Option<u64>, bool, u64)>;
 
 fn record_sent<S: SignalType>(
     signals: &Signals<S>,
@@ -172,14 +181,13 @@ fn tally_sorted<T>(
         }
 
         let sender = run.map_or(UNKNOWN_SENDER, |run| run.sender);
-        let sent_tick = if windowed {
-            None
-        } else {
-            run.map(|run| run.tick)
-        };
-        match tally.iter_mut().find(|x| x.0 == sender && x.1 == sent_tick) {
-            Some(existing) => existing.2 += count,
-            None => tally.push((sender, sent_tick, count)),
+        let sent_tick = run.map(|run| run.tick);
+        match tally
+            .iter_mut()
+            .find(|x| x.0 == sender && x.1 == sent_tick && x.2 == windowed)
+        {
+            Some(existing) => existing.3 += count,
+            None => tally.push((sender, sent_tick, windowed, count)),
         }
     }
 }
@@ -407,6 +415,7 @@ pub struct TrackedInterval {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrackingSave {
     systems: Vec<TrackedName>,
+    system_order: Vec<u128>,
     signals: Vec<TrackedName>,
     window_ticks: u64,
     start_tick: u64,
@@ -416,6 +425,10 @@ pub struct TrackingSave {
 }
 
 impl TrackingSave {
+    pub fn system_order(&self) -> &[u128] {
+        &self.system_order
+    }
+
     pub fn window_ticks(&self) -> u64 {
         self.window_ticks
     }
@@ -426,6 +439,14 @@ impl TrackingSave {
 
     pub fn frames(&self) -> impl Iterator<Item = &TrackedFrame> {
         self.frames.iter()
+    }
+
+    pub fn frames_in(&self, ticks: Range<u64>) -> impl Iterator<Item = &TrackedFrame> {
+        let start = self
+            .frames
+            .partition_point(|frame| frame.tick < ticks.start);
+        let end = self.frames.partition_point(|frame| frame.tick < ticks.end);
+        self.frames.range(start..end)
     }
 
     pub fn intervals(&self) -> &BTreeMap<u64, TrackedInterval> {
@@ -440,6 +461,20 @@ impl TrackingSave {
         name_of(&self.signals, id)
     }
 
+    pub fn push_frame(&mut self, tick: u64, frame: Option<TrackedFrame>) {
+        let window = self.window_ticks;
+        while self
+            .frames
+            .front()
+            .is_some_and(|frame| frame.tick + window <= tick)
+        {
+            self.frames.pop_front();
+        }
+        self.frames.extend(frame);
+        self.end_tick = tick + 1;
+        self.start_tick = self.start_tick.max((tick + 1).saturating_sub(window));
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = SNAPSHOT_MAGIC.to_vec();
         bincode::serialize_into(&mut bytes, self).expect("failed to encode tracking save");
@@ -451,12 +486,77 @@ impl TrackingSave {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TrackerMessage {
+    Full(TrackingSave),
+    Frame {
+        tick: u64,
+        frame: Option<TrackedFrame>,
+    },
+}
+
+impl TrackerMessage {
+    fn to_wire(&self) -> Vec<u8> {
+        let body = bincode::serialize(self).expect("failed to encode tracker message");
+        let mut bytes = (body.len() as u32).to_le_bytes().to_vec();
+        bytes.extend(body);
+        bytes
+    }
+
+    pub fn read_from(reader: &mut impl Read) -> io::Result<Self> {
+        let mut length = [0; 4];
+        reader.read_exact(&mut length)?;
+        let length = u32::from_le_bytes(length) as usize;
+        if length > MAX_MESSAGE_BYTES {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "tracker message is too long",
+            ));
+        }
+
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body)?;
+        bincode::deserialize(&body).map_err(|error| io::Error::new(ErrorKind::InvalidData, error))
+    }
+}
+
+struct TrackerClient {
+    stream: TcpStream,
+    pending: Vec<u8>,
+    written: usize,
+}
+
+impl TrackerClient {
+    fn flush(&mut self) -> bool {
+        while self.written < self.pending.len() {
+            match self.stream.write(&self.pending[self.written..]) {
+                Ok(0) => return false,
+                Ok(count) => self.written += count,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(_) => return false,
+            }
+        }
+
+        self.pending.drain(..self.written);
+        self.written = 0;
+        self.pending.len() <= MAX_PENDING_BYTES
+    }
+}
+
+struct TrackerNet {
+    listener: TcpListener,
+    clients: Vec<TrackerClient>,
+}
+
 pub struct Tracker {
     log: TrackingSave,
     live: Vec<LiveSignal>,
     paused: bool,
     restart: bool,
     copy: Option<World>,
+    net: Option<TrackerNet>,
+    changed: bool,
 }
 
 fn copy_world(from: &World, to: &mut World) {
@@ -482,6 +582,7 @@ fn copy_world(from: &World, to: &mut World) {
 
 impl World {
     pub fn to_tracker(&self) -> Tracker {
+        let system_order = system_graph().iter().map(|system| system.uuid).collect();
         let mut systems: Vec<TrackedName> = system_graph()
             .iter()
             .map(|system| TrackedName {
@@ -506,6 +607,7 @@ impl World {
         let mut tracker = Tracker {
             log: TrackingSave {
                 systems,
+                system_order,
                 signals,
                 window_ticks: TRACKER_WINDOW_TICKS,
                 start_tick: 0,
@@ -517,6 +619,8 @@ impl World {
             paused: false,
             restart: false,
             copy: None,
+            net: None,
+            changed: false,
         };
         tracker.begin(self);
         tracker
@@ -545,10 +649,12 @@ impl Tracker {
         self.log.start_tick = tick;
         self.log.end_tick = tick;
         self.restart = false;
+        self.changed = true;
         self.rebaseline(world);
     }
 
     fn freeze(&mut self) {
+        self.changed = true;
         let (start_tick, end_tick) = (self.log.start_tick, self.log.end_tick);
         let frames: Vec<TrackedFrame> = self.log.frames.drain(..).collect();
         if end_tick > start_tick {
@@ -580,11 +686,13 @@ impl Tracker {
         }
         self.log.end_tick = tick;
         self.log.start_tick = self.log.start_tick.min(tick);
+        self.changed = true;
         self.rebaseline(world);
     }
 
     pub fn step(&mut self, world: &World) {
         if self.paused {
+            self.pump(None);
             return;
         }
 
@@ -622,16 +730,6 @@ impl Tracker {
     }
 
     fn finish_frame(&mut self, tick: u64) {
-        let window = self.log.window_ticks;
-        while self
-            .log
-            .frames
-            .front()
-            .is_some_and(|frame| frame.tick + window <= tick)
-        {
-            self.log.frames.pop_front();
-        }
-
         let signals: Vec<TrackedSignalFrame> = probes()
             .iter()
             .zip(&mut self.live)
@@ -642,12 +740,69 @@ impl Tracker {
                 received: std::mem::take(&mut live.received),
             })
             .collect();
-        if !signals.is_empty() {
-            self.log.frames.push_back(TrackedFrame { tick, signals });
+        let frame = (!signals.is_empty()).then_some(TrackedFrame { tick, signals });
+
+        let message = self
+            .net
+            .as_ref()
+            .is_some_and(|net| !net.clients.is_empty())
+            .then(|| TrackerMessage::Frame {
+                tick,
+                frame: frame.clone(),
+            });
+        self.log.push_frame(tick, frame);
+        self.pump(message);
+    }
+
+    fn pump(&mut self, frame: Option<TrackerMessage>) {
+        let Some(net) = &mut self.net else {
+            return;
+        };
+
+        let update = if std::mem::take(&mut self.changed) {
+            (!net.clients.is_empty()).then(|| TrackerMessage::Full(self.log.clone()))
+        } else {
+            frame
+        };
+        if let Some(update) = update {
+            let bytes = update.to_wire();
+            for client in &mut net.clients {
+                client.pending.extend_from_slice(&bytes);
+            }
         }
 
-        self.log.end_tick = tick + 1;
-        self.log.start_tick = self.log.start_tick.max((tick + 1).saturating_sub(window));
+        while let Ok((stream, _)) = net.listener.accept() {
+            if stream.set_nonblocking(true).is_err() {
+                continue;
+            }
+            let _ = stream.set_nodelay(true);
+            net.clients.push(TrackerClient {
+                stream,
+                pending: TrackerMessage::Full(self.log.clone()).to_wire(),
+                written: 0,
+            });
+        }
+
+        net.clients.retain_mut(TrackerClient::flush);
+    }
+
+    pub fn listen(&mut self, port: u16) -> io::Result<u16> {
+        let listener = TcpListener::bind(("127.0.0.1", port))?;
+        listener.set_nonblocking(true)?;
+        let port = listener.local_addr()?.port();
+        self.net = Some(TrackerNet {
+            listener,
+            clients: Vec::new(),
+        });
+        Ok(port)
+    }
+
+    pub fn save_to(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let path = path.as_ref();
+        let mut temporary = path.as_os_str().to_owned();
+        temporary.push(".tmp");
+        std::fs::write(&temporary, self.snapshot())?;
+        std::fs::rename(&temporary, path)
     }
 
     pub fn pause(&mut self) {
@@ -672,6 +827,7 @@ impl Tracker {
         self.log.frames.clear();
         self.log.intervals.clear();
         self.restart = true;
+        self.changed = true;
     }
 
     pub fn log(&self) -> &TrackingSave {

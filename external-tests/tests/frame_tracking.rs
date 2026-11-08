@@ -1,9 +1,11 @@
 use reacs::prelude::*;
 use reacs::tracking::{
-    TRACKER_WINDOW_TICKS, TrackedSignalFrame, Tracker, TrackingSave, UNKNOWN_SENDER,
+    TRACKER_WINDOW_TICKS, TrackedSignalFrame, Tracker, TrackerMessage, TrackingSave, UNKNOWN_SENDER,
 };
 use std::cell::Cell;
+use std::net::TcpStream;
 use std::rc::Rc;
+use std::time::Duration;
 
 #[signal]
 struct TrackPing(u64);
@@ -264,8 +266,8 @@ fn future_window_is_credited_only_while_it_runs() {
         step(&mut tracker, &mut world);
         let expected = if tick == 3 || tick == 4 {
             vec![
-                row("track_early", "track_sender_b", None, 1),
-                row("track_late", "track_sender_b", None, 1),
+                row("track_early", "track_sender_b", Some(1), 1),
+                row("track_late", "track_sender_b", Some(1), 1),
             ]
         } else {
             vec![]
@@ -291,8 +293,8 @@ fn open_window_is_credited_through_every_list() {
         assert_eq!(
             received(&tracker, "TrackPing"),
             vec![
-                row("track_early", "track_sender_b", None, 1),
-                row("track_late", "track_sender_b", None, 1),
+                row("track_early", "track_sender_b", Some(0), 1),
+                row("track_late", "track_sender_b", Some(0), 1),
             ]
         );
     }
@@ -314,8 +316,8 @@ fn cancelled_windows_are_not_counted() {
         assert_eq!(
             received(&tracker, "TrackPing"),
             vec![
-                row("track_early", "track_sender_b", None, 2),
-                row("track_late", "track_sender_b", None, 2),
+                row("track_early", "track_sender_b", Some(0), 2),
+                row("track_late", "track_sender_b", Some(0), 2),
             ]
         );
 
@@ -323,8 +325,8 @@ fn cancelled_windows_are_not_counted() {
         assert_eq!(
             received(&tracker, "TrackPing"),
             vec![
-                row("track_early", "track_sender_b", None, 1),
-                row("track_late", "track_sender_b", None, 1),
+                row("track_early", "track_sender_b", Some(0), 1),
+                row("track_late", "track_sender_b", Some(0), 1),
             ]
         );
     }
@@ -724,4 +726,209 @@ fn a_world_save_is_not_a_tracking_save() {
     let world = world_with(reading());
     assert!(TrackingSave::from_bytes(&world.save()).is_none());
     assert!(TrackingSave::from_bytes(&[1, 2, 3]).is_none());
+}
+
+fn connect(port: u16) -> TcpStream {
+    let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+}
+
+fn read_into(stream: &mut TcpStream, save: &mut Option<TrackingSave>) {
+    match TrackerMessage::read_from(stream).unwrap() {
+        TrackerMessage::Full(full) => *save = Some(full),
+        TrackerMessage::Frame { tick, frame } => save.as_mut().unwrap().push_frame(tick, frame),
+    }
+}
+
+#[test]
+fn a_late_client_gets_the_whole_window_and_then_each_tick() {
+    let mut world = world_with(TrackPlan {
+        emits_a: 2,
+        ..reading()
+    });
+    let mut tracker = world.to_tracker();
+    let port = tracker.listen(0).unwrap();
+    for _ in 0..5 {
+        step(&mut tracker, &mut world);
+    }
+
+    let mut stream = connect(port);
+    step(&mut tracker, &mut world);
+    let mut save = None;
+    read_into(&mut stream, &mut save);
+    assert_eq!(save.as_ref().unwrap(), tracker.log());
+
+    for _ in 0..3 {
+        step(&mut tracker, &mut world);
+        read_into(&mut stream, &mut save);
+    }
+    assert_eq!(save.as_ref().unwrap(), tracker.log());
+    assert_eq!(save.as_ref().unwrap().tick_range(), 0..9);
+}
+
+#[test]
+fn idle_ticks_still_reach_the_client() {
+    let mut world = world_with(reading());
+    let mut tracker = world.to_tracker();
+    let port = tracker.listen(0).unwrap();
+    let mut stream = connect(port);
+    step(&mut tracker, &mut world);
+    let mut save = None;
+    read_into(&mut stream, &mut save);
+
+    step(&mut tracker, &mut world);
+    read_into(&mut stream, &mut save);
+    assert_eq!(save.as_ref().unwrap().tick_range(), 0..2);
+    assert_eq!(save.as_ref().unwrap().frames().count(), 0);
+}
+
+#[test]
+fn pausing_and_resetting_send_the_new_state() {
+    let mut world = world_with(TrackPlan {
+        emits_a: 1,
+        ..reading()
+    });
+    let mut tracker = world.to_tracker();
+    let port = tracker.listen(0).unwrap();
+    let mut stream = connect(port);
+    step(&mut tracker, &mut world);
+    let mut save = None;
+    read_into(&mut stream, &mut save);
+
+    tracker.pause();
+    step(&mut tracker, &mut world);
+    read_into(&mut stream, &mut save);
+    assert_eq!(save.as_ref().unwrap(), tracker.log());
+    assert_eq!(save.as_ref().unwrap().intervals().len(), 1);
+
+    tracker.reset();
+    step(&mut tracker, &mut world);
+    read_into(&mut stream, &mut save);
+    assert!(save.as_ref().unwrap().intervals().is_empty());
+}
+
+#[test]
+fn a_paused_tracker_still_accepts_clients() {
+    let mut world = world_with(reading());
+    let mut tracker = world.to_tracker();
+    let port = tracker.listen(0).unwrap();
+    tracker.pause();
+
+    let mut stream = connect(port);
+    step(&mut tracker, &mut world);
+    let mut save = None;
+    read_into(&mut stream, &mut save);
+    assert_eq!(save.as_ref().unwrap(), tracker.log());
+}
+
+#[test]
+fn a_client_that_leaves_or_never_reads_does_not_stop_the_game() {
+    let mut world = world_with(TrackPlan {
+        emits_a: 1,
+        ..reading()
+    });
+    let mut tracker = world.to_tracker();
+    let port = tracker.listen(0).unwrap();
+    let gone = connect(port);
+    let _never_reads = connect(port);
+    step(&mut tracker, &mut world);
+    drop(gone);
+
+    for _ in 0..30_000 {
+        tracker.step(&world);
+        world.step();
+    }
+    assert_eq!(world.get_resource::<Tick>().unwrap().0, 30_001);
+}
+
+#[test]
+fn closing_the_tracker_ends_the_connection() {
+    let mut world = world_with(reading());
+    let mut tracker = world.to_tracker();
+    let port = tracker.listen(0).unwrap();
+    let mut stream = connect(port);
+    step(&mut tracker, &mut world);
+    let mut save = None;
+    read_into(&mut stream, &mut save);
+
+    drop(tracker);
+    assert!(TrackerMessage::read_from(&mut stream).is_err());
+}
+
+#[test]
+fn save_to_writes_a_readable_file_and_leaves_no_temporary() {
+    let mut world = world_with(TrackPlan {
+        emits_a: 1,
+        ..reading()
+    });
+    let mut tracker = world.to_tracker();
+    step(&mut tracker, &mut world);
+
+    let path = std::env::temp_dir().join(format!("reacs-tracking-{}.bin", std::process::id()));
+    tracker.save_to(&path).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(&TrackingSave::from_bytes(&bytes).unwrap(), tracker.log());
+
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(".tmp");
+    assert!(!std::path::Path::new(&temporary).exists());
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn the_save_records_the_system_execution_order() {
+    let world = world_with(reading());
+    let tracker = world.to_tracker();
+    let log = tracker.log();
+    let position = |name: &str| {
+        log.system_order()
+            .iter()
+            .position(|id| short(log.system_name(*id)) == name)
+            .unwrap()
+    };
+
+    assert!(position("track_early") < position("track_sender_a"));
+    assert!(position("track_sender_a") < position("track_sender_b"));
+    assert!(position("track_sender_b") < position("track_late"));
+}
+
+#[test]
+fn windowed_deliveries_are_marked_and_keep_their_send_tick() {
+    let mut world = world_with(TrackPlan {
+        open_at: 1,
+        ..reading()
+    });
+    let mut tracker = world.to_tracker();
+    step(&mut tracker, &mut world);
+    step(&mut tracker, &mut world);
+
+    let copy = frame_of(tracker.log(), 0, "TrackPing").unwrap();
+    assert!(copy.received.iter().all(|x| !x.windowed));
+    let running = frame_of(tracker.log(), 1, "TrackPing").unwrap();
+    assert!(!running.received.is_empty());
+    assert!(
+        running
+            .received
+            .iter()
+            .all(|x| x.windowed && x.sent_tick == Some(0))
+    );
+}
+
+#[test]
+fn frames_in_returns_only_the_requested_ticks() {
+    let mut world = world_with(TrackPlan {
+        emits_a: 1,
+        ..reading()
+    });
+    let mut tracker = world.to_tracker();
+    for _ in 0..6 {
+        step(&mut tracker, &mut world);
+    }
+
+    let ticks: Vec<u64> = tracker.log().frames_in(2..4).map(|x| x.tick).collect();
+    assert_eq!(ticks, [2, 3]);
+    assert_eq!(tracker.log().frames_in(9..12).count(), 0);
 }
