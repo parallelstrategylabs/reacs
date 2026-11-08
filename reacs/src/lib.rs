@@ -6,7 +6,7 @@ pub mod bit_set;
 pub mod component;
 pub mod direct_map;
 pub mod entity;
-pub mod free_list;
+pub(crate) mod free_list;
 pub mod hashed;
 pub mod registry;
 pub mod resource;

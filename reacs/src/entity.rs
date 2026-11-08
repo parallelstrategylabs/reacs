@@ -44,7 +44,7 @@ impl Entity {
 }
 
 #[resource]
-pub struct EntityFreeList(pub FreeList);
+pub(crate) struct EntityFreeList(pub FreeList);
 
 impl Deref for EntityFreeList {
     type Target = FreeList;

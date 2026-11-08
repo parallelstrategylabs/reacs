@@ -6,30 +6,65 @@ use crate::bit_set::BitSet;
 pub struct FreeList {
     pub bitset: BitSet,
     pub frees: u64,
+    #[serde(skip)]
+    full: Vec<u64>,
+    #[serde(skip)]
+    first_open: usize,
+    #[serde(skip)]
+    built: bool,
 }
 
 impl FreeList {
-    pub fn new() -> Self {
-        Self {
-            bitset: BitSet::new(),
-            frees: 0,
-        }
+    #[cold]
+    fn rebuild(&mut self) {
+        self.full = self
+            .bitset
+            .words
+            .chunks(64)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .enumerate()
+                    .fold(0u64, |acc, (b, &w)| acc | (((w == !0u64) as u64) << b))
+            })
+            .collect();
+        self.first_open = 0;
+        self.built = true;
     }
 
     pub fn reserve(&mut self) -> u64 {
+        if !self.built {
+            self.rebuild();
+        }
         let words = &mut self.bitset.words;
+        let full = &mut self.full;
 
-        for (w, word) in words.iter_mut().enumerate() {
-            if *word < !0u64 {
+        for s in self.first_open..full.len() {
+            let summary = full[s];
+            if summary != !0u64 {
+                let b = summary.trailing_ones() as usize;
+                let w = s * 64 + b;
+                if w >= words.len() {
+                    break;
+                }
+                let word = &mut words[w];
                 let o = word.trailing_ones();
                 *word |= 1 << o;
+                if *word == !0u64 {
+                    full[s] |= 1 << b;
+                }
+                self.first_open = s;
                 return w as u64 * 64 + o as u64;
             }
         }
 
-        let next = words.len() * 64;
-        self.bitset.set(next, true);
-        return next as u64;
+        let w = words.len();
+        words.push(1);
+        if w >> 6 >= full.len() {
+            full.push(0);
+        }
+        self.first_open = w >> 6;
+        w as u64 * 64
     }
 
     // pub fn reserve_many<const A: usize>(&mut self) -> [u64; A] {
@@ -90,7 +125,14 @@ impl FreeList {
     // }
 
     pub fn free(&mut self, index: usize) {
-        self.bitset.set(index, false);
+        let w = index >> 6;
+        if let Some(word) = self.bitset.words.get_mut(w) {
+            *word &= !(1 << (index & 63));
+            if self.built {
+                self.full[w >> 6] &= !(1 << (w & 63));
+                self.first_open = self.first_open.min(w >> 6);
+            }
+        }
         self.frees += 1;
     }
 }
@@ -101,7 +143,7 @@ mod tests {
 
     #[test]
     fn reserves_sequentially_across_words() {
-        let mut list = FreeList::new();
+        let mut list = FreeList::default();
         for expected in 0..200 {
             assert_eq!(list.reserve(), expected);
         }
@@ -110,7 +152,7 @@ mod tests {
 
     #[test]
     fn reserve_and_free_update_the_index_bit() {
-        let mut list = FreeList::new();
+        let mut list = FreeList::default();
         let index = list.reserve() as usize;
         assert!(list.bitset.get(index));
         assert!(!list.bitset.get(index + 1));
@@ -121,7 +163,7 @@ mod tests {
 
     #[test]
     fn lowest_freed_index_is_reused_first() {
-        let mut list = FreeList::new();
+        let mut list = FreeList::default();
         for _ in 0..130 {
             list.reserve();
         }
@@ -136,7 +178,7 @@ mod tests {
 
     #[test]
     fn full_words_are_skipped() {
-        let mut list = FreeList::new();
+        let mut list = FreeList::default();
         for _ in 0..130 {
             list.reserve();
         }
@@ -147,7 +189,7 @@ mod tests {
 
     #[test]
     fn first_bit_of_a_word_is_reused_when_it_is_the_only_free_one() {
-        let mut list = FreeList::new();
+        let mut list = FreeList::default();
         for _ in 0..64 {
             list.reserve();
         }
@@ -158,7 +200,7 @@ mod tests {
 
     #[test]
     fn last_bit_of_a_word_is_reserved_before_a_new_word() {
-        let mut list = FreeList::new();
+        let mut list = FreeList::default();
         for _ in 0..64 {
             list.reserve();
         }
@@ -172,7 +214,7 @@ mod tests {
 
     #[test]
     fn freeing_an_unreserved_index_does_nothing() {
-        let mut list = FreeList::new();
+        let mut list = FreeList::default();
         list.free(1_000);
         assert!(list.bitset.words.is_empty());
 
@@ -183,7 +225,7 @@ mod tests {
 
     #[test]
     fn serialization_round_trip_keeps_reservations() {
-        let mut list = FreeList::new();
+        let mut list = FreeList::default();
         for _ in 0..70 {
             list.reserve();
         }
@@ -194,5 +236,67 @@ mod tests {
 
         assert_eq!(restored.reserve(), 5);
         assert_eq!(restored.reserve(), 70);
+    }
+
+    #[test]
+    fn freeing_below_the_open_word_is_reused_before_the_end() {
+        let mut list = FreeList::default();
+        for _ in 0..300 {
+            list.reserve();
+        }
+        list.free(200);
+        assert_eq!(list.reserve(), 200);
+        list.free(7);
+        list.free(130);
+        assert_eq!(list.reserve(), 7);
+        assert_eq!(list.reserve(), 130);
+        assert_eq!(list.reserve(), 300);
+    }
+
+    #[test]
+    fn restored_list_reserves_like_the_original() {
+        let mut list = FreeList::default();
+        for _ in 0..1_000 {
+            list.reserve();
+        }
+        for index in [3, 640, 641, 999] {
+            list.free(index);
+        }
+        list.reserve();
+
+        let bytes = bincode::serialize(&list).unwrap();
+        let mut restored: FreeList = bincode::deserialize(&bytes).unwrap();
+        for _ in 0..5 {
+            assert_eq!(restored.reserve(), list.reserve());
+        }
+    }
+
+    #[test]
+    fn always_reserves_the_lowest_free_index() {
+        let mut list = FreeList::default();
+        let mut used = Vec::<bool>::new();
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for _ in 0..20_000 {
+            let roll = next();
+            if roll % 5 < 3 || used.is_empty() {
+                let expected = used.iter().position(|&u| !u).unwrap_or(used.len());
+                if expected == used.len() {
+                    used.push(false);
+                }
+                used[expected] = true;
+                assert_eq!(list.reserve(), expected as u64);
+            } else {
+                let index = (next() % used.len() as u64) as usize;
+                used[index] = false;
+                list.free(index);
+            }
+        }
     }
 }
