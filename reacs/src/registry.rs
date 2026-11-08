@@ -1,5 +1,6 @@
-use std::collections::hash_map::Entry as MapEntry;
-use std::{any::Any, cell::RefCell, collections::HashMap, ptr::addr_of_mut};
+use std::{any::Any, cell::RefCell, ptr::addr_of_mut};
+
+use crate::index_map::IndexMap;
 
 #[derive(Debug)]
 pub struct RegistryEntry {
@@ -18,7 +19,7 @@ fn decode<T: for<'de> serde::Deserialize<'de>>(bytes: &[u8]) -> T {
     })
 }
 
-pub static mut REGISTRY: Option<HashMap<u128, RegistryEntry>> = None;
+pub static mut REGISTRY: Option<IndexMap<u128, RegistryEntry>> = None;
 
 pub fn register_entry<T>(id: u128)
 where
@@ -26,22 +27,23 @@ where
 {
     unsafe {
         let ptr = addr_of_mut!(REGISTRY);
-        let map = (*ptr).get_or_insert_with(HashMap::new);
-        match map.entry(id) {
-            MapEntry::Occupied(e) => panic!(
+        let map = (*ptr).get_or_insert_with(IndexMap::new);
+        if let Some(existing) = map.get(&id) {
+            panic!(
                 "id collision: `{}` and `{}` share id {id:#034x}",
-                e.get().type_name,
+                existing.type_name,
                 std::any::type_name::<T>(),
-            ),
-            MapEntry::Vacant(slot) => {
-                slot.insert(RegistryEntry {
-                    type_name: std::any::type_name::<T>(),
-                    serialize: |v| bincode::serialize(v.downcast_ref::<T>().unwrap()).unwrap(),
-                    deserialize: |b| Box::new(decode::<T>(b)),
-                    restore: |b| Box::new(RefCell::new(decode::<T>(b))),
-                });
-            }
+            );
         }
+        map.insert(
+            id,
+            RegistryEntry {
+                type_name: std::any::type_name::<T>(),
+                serialize: |v| bincode::serialize(v.downcast_ref::<T>().unwrap()).unwrap(),
+                deserialize: |b| Box::new(decode::<T>(b)),
+                restore: |b| Box::new(RefCell::new(decode::<T>(b))),
+            },
+        );
     }
 }
 

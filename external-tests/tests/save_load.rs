@@ -19,6 +19,9 @@ pub struct Trace(pub u64);
 #[resource]
 pub struct Living(pub Vec<Entity>);
 
+#[resource]
+pub struct Ages(pub IndexMap<Entity, u64>);
+
 fn mix(trace: &mut Trace, value: u64) {
     trace.0 = trace.0.wrapping_mul(1_000_003).wrapping_add(value);
 }
@@ -37,17 +40,29 @@ fn spawner(
     mut burn: Mut<Signal<Burn>>,
     mut late: Mut<Signal<Late>>,
     mut living: Mut<Resource<Living>>,
+    mut ages: Mut<Resource<Ages>>,
     tick: Resource<Tick>,
 ) {
     let tick = (*tick).0;
     let entity = em.spawn();
     (*living).0.push(entity);
+    (*ages).0.insert(entity, 0);
     spawned.emit(Spawned(entity));
     burn.send(Burn(entity), tick + 1..tick + 4);
     late.emit(Late(tick));
 
     if tick % 3 == 2 {
-        em.despawn((*living).0.remove(0));
+        let dead = (*living).0.remove(0);
+        (*ages).0.swap_remove(&dead);
+        em.despawn(dead);
+    }
+}
+
+#[system(run_after(spawner))]
+fn ager(mut ages: Mut<Resource<Ages>>, mut trace: Mut<Resource<Trace>>) {
+    for (entity, age) in (*ages).0.iter_mut() {
+        *age += 1;
+        mix(&mut trace, entity.to_bits() ^ *age);
     }
 }
 

@@ -8,6 +8,7 @@ pub mod direct_map;
 pub mod entity;
 pub(crate) mod free_list;
 pub mod hashed;
+pub mod index_map;
 pub mod registry;
 pub mod resource;
 pub mod schedule;
@@ -24,6 +25,7 @@ pub mod prelude {
     pub use crate::component::Component;
     pub use crate::entity::{Entity, EntityManager};
     pub use crate::hashed::Hashed;
+    pub use crate::index_map::IndexMap;
     pub use crate::resource::{LocalResource, Resource};
     pub use crate::schedule::{
         IntoSystem, Mut, SystemEntry, SystemGraph, SystemParam, WorldAccess, system_graph,
