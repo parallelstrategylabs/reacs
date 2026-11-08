@@ -76,6 +76,23 @@ fn systems_from_stacked_crates_run_in_declared_order() {
 }
 
 #[test]
+fn order_tree_shows_systems_from_every_crate() {
+    let world = World::new();
+    world.print_order();
+    let tree = system_graph().tree();
+
+    for name in [
+        "plugin_leaf::leaf_system",
+        "plugin_mid::apply_damage",
+        "plugin_top::despawn_dead",
+        "plugin_other::regenerate",
+        "stacked_plugins::record_deaths",
+    ] {
+        assert!(tree.contains(name), "{name} is missing from:\n{tree}");
+    }
+}
+
+#[test]
 fn plugins_share_signals_components_resources_and_params() {
     let (mut world, knight, goblin) = battle();
 

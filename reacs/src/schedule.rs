@@ -7,6 +7,7 @@ use reacs_derive::resource;
 use std::cell::{Ref, RefMut};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::fmt::Write as _;
 use std::ops::{Deref, DerefMut};
 use std::ptr::{addr_of, addr_of_mut};
 
@@ -272,6 +273,42 @@ impl SystemGraph {
 
     pub fn iter(&self) -> impl Iterator<Item = &SystemEntry> {
         self.nodes.iter()
+    }
+
+    pub fn tree(&self) -> String {
+        let width = self.nodes.len().to_string().len();
+        let mut tree = String::new();
+        let mut block = None;
+
+        for (i, system) in self.nodes.iter().enumerate() {
+            let group = system.groups.first();
+            let branch = if group.is_some() && group == block {
+                let next = self.nodes.get(i + 1);
+                if next.is_some_and(|next| next.groups.first() == block) {
+                    "├─ "
+                } else {
+                    "└─ "
+                }
+            } else {
+                block = Some(&system.uuid);
+                ""
+            };
+
+            writeln!(
+                tree,
+                "{:>width$} {branch}{}::{}",
+                i + 1,
+                system.module,
+                system.name
+            )
+            .unwrap();
+        }
+
+        tree
+    }
+
+    pub fn print_tree(&self) {
+        print!("{}", self.tree());
     }
 
     pub fn init(&self, world: &mut World) {
@@ -1384,6 +1421,92 @@ mod tests {
 
         let positions = expected.map(position);
         assert!(positions.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    fn tree_lines(lines: &[&str]) -> String {
+        lines
+            .iter()
+            .map(|line| format!("{}\n", line.replace("@", module_path!())))
+            .collect()
+    }
+
+    #[test]
+    fn tree_of_an_empty_graph_is_empty() {
+        assert_eq!(SystemGraph::new().tree(), "");
+    }
+
+    #[test]
+    fn tree_lists_plain_systems_in_execution_order() {
+        let graph = graph_of(vec![
+            entry("physics", &[], &["render"]),
+            entry("render", &[], &[]),
+        ]);
+
+        assert_eq!(graph.tree(), tree_lines(&["1 @::render", "2 @::physics"]));
+    }
+
+    #[test]
+    fn tree_puts_members_under_their_group() {
+        assert!(id("physics") < id("render"));
+
+        let graph = graph_of(vec![
+            group("group_first", &["group_second"], &[]),
+            group("group_second", &[], &[]),
+            member(entry("physics", &[], &[]), &["group_first"]),
+            member(entry("render", &[], &[]), &["group_first"]),
+            member(entry("input", &[], &[]), &["group_second"]),
+            entry("logic", &[], &["group_second"]),
+        ]);
+
+        assert_eq!(
+            graph.tree(),
+            tree_lines(&[
+                "1 @::group_first",
+                "2 ├─ @::physics",
+                "3 └─ @::render",
+                "4 @::group_second",
+                "5 └─ @::input",
+                "6 @::logic",
+            ])
+        );
+    }
+
+    #[test]
+    fn tree_shows_a_group_without_members_as_a_plain_system() {
+        let graph = graph_of(vec![
+            group("group_first", &["render"], &[]),
+            entry("render", &[], &[]),
+        ]);
+
+        assert_eq!(
+            graph.tree(),
+            tree_lines(&["1 @::group_first", "2 @::render"])
+        );
+    }
+
+    #[test]
+    fn tree_shows_members_of_a_missing_group_as_plain_systems() {
+        let graph = graph_of(vec![
+            member(entry("physics", &["render"], &[]), &["group_missing"]),
+            member(entry("render", &[], &[]), &["group_missing"]),
+        ]);
+
+        assert_eq!(graph.tree(), tree_lines(&["1 @::physics", "2 @::render"]));
+    }
+
+    #[test]
+    fn tree_aligns_numbers_past_nine_systems() {
+        let graph = graph_of(
+            (0..10)
+                .map(|i| group(format!("system{i}").leak(), &[], &[]))
+                .collect(),
+        );
+        let tree = graph.tree();
+        let lines: Vec<&str> = tree.lines().collect();
+
+        assert!(lines[0].starts_with(" 1 "));
+        assert!(lines[8].starts_with(" 9 "));
+        assert!(lines[9].starts_with("10 "));
     }
 
     #[test]

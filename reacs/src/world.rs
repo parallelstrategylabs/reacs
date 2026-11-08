@@ -186,6 +186,10 @@ impl World {
         self.app_version
     }
 
+    pub fn print_order(&self) {
+        system_graph().print_tree();
+    }
+
     pub fn save(&self) -> Vec<u8> {
         let saved: Vec<(u128, Vec<u8>)> = self
             .resources
