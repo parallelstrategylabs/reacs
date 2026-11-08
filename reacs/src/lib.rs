@@ -13,6 +13,7 @@ pub mod registry;
 pub mod resource;
 pub mod schedule;
 pub mod signal;
+pub mod tracking;
 pub mod world;
 
 #[doc(hidden)]
