@@ -78,8 +78,8 @@ fn systems_from_stacked_crates_run_in_declared_order() {
 #[test]
 fn order_tree_shows_systems_from_every_crate() {
     let world = World::new();
-    world.print_order();
-    let tree = system_graph().tree();
+    world.print_system_order();
+    let tree = world.system_order();
 
     for name in [
         "plugin_leaf::leaf_system",

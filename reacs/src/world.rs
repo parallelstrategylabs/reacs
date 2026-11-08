@@ -186,7 +186,11 @@ impl World {
         self.app_version
     }
 
-    pub fn print_order(&self) {
+    pub fn system_order(&self) -> String {
+        system_graph().tree()
+    }
+
+    pub fn print_system_order(&self) {
         system_graph().print_tree();
     }
 
