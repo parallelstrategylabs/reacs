@@ -94,10 +94,17 @@ pub struct SignalInstance<S> {
     pub payload: S,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct ReceiveCursor {
+    pub system: u128,
+    pub next: u64,
+    pub windows_tick: u64,
+}
+
 #[derive(Default, Hashed, Serialize, Deserialize)]
 #[serde(bound = "")]
 pub struct SignalData<S: SignalType> {
-    pub cursors: Vec<(u128, u64)>,
+    pub cursors: Vec<ReceiveCursor>,
     pub next: u64,
     phantom: PhantomData<S>,
 }
@@ -662,28 +669,45 @@ impl<S: SignalType> Signals<S> {
         found
     }
 
+    #[inline(always)]
     pub fn receive<'a, K: Fn(&S) -> bool>(
         &'a self,
         data: &mut SignalData<S>,
         system: u128,
+        tick: u64,
         keep: K,
     ) -> impl Iterator<Item = &'a S> + use<'a, S, K> {
-        let slot = data.cursors.binary_search_by_key(&system, |x| x.0);
-        let cursor = slot.map_or(0, |i| data.cursors[i].1);
+        let slot = data.cursors.binary_search_by_key(&system, |x| x.system);
+        let (cursor, windows) = match slot {
+            Ok(i) => (data.cursors[i].next, data.cursors[i].windows_tick != tick),
+            Err(_) => (0, true),
+        };
         let unread =
             |list: &'a [SignalInstance<S>]| &list[list.partition_point(|x| x.id < cursor)..];
 
         let transient = unread(&self.transient);
         let transient_buffer = unread(&self.transient_buffer);
 
-        if let Some(last) = transient_buffer.last().or_else(|| transient.last()) {
-            match slot {
-                Ok(i) => data.cursors[i].1 = last.id + 1,
-                Err(i) => data.cursors.insert(i, (system, last.id + 1)),
+        let next = transient_buffer
+            .last()
+            .or_else(|| transient.last())
+            .map_or(cursor, |last| last.id + 1);
+        match slot {
+            Ok(i) => {
+                data.cursors[i].next = next;
+                data.cursors[i].windows_tick = tick;
             }
+            Err(i) => data.cursors.insert(
+                i,
+                ReceiveCursor {
+                    system,
+                    next,
+                    windows_tick: tick,
+                },
+            ),
         }
 
-        ReceiveIter {
+        let mut iter = ReceiveIter {
             run: transient.iter(),
             stage: ReceiveStage::TransientBuffer,
             transient_buffer,
@@ -696,7 +720,16 @@ impl<S: SignalType> Signals<S> {
             position: 0,
             cancelled: (self.permanent_cancelled > 0).then_some(&self.permanent_cancelled_bits),
             keep,
+        };
+        if !windows {
+            iter.active = &[];
+            iter.joining = &[];
+            iter.permanent = &[];
+            iter.write = 0;
+            iter.read = 0;
+            iter.cancelled = None;
         }
+        iter
     }
 
     pub(crate) fn sweep(&mut self, budget: u64, mut keep: impl FnMut(&S) -> bool) -> (u64, bool) {
@@ -1028,10 +1061,12 @@ impl<'w, S: SignalType> Signal<'w, S, Write> {
     #[inline]
     pub fn receive(&mut self) -> impl Iterator<Item = &S> {
         let context = S::Filter::fetch(&self.world);
-        self.signals
-            .receive(&mut self.data, (*self.current).0, move |signal| {
-                S::Filter::keep(&context, signal)
-            })
+        self.signals.receive(
+            &mut self.data,
+            (*self.current).0,
+            (*self.tick).0,
+            move |signal| S::Filter::keep(&context, signal),
+        )
     }
 
     #[inline]
@@ -1233,6 +1268,17 @@ mod tests {
         world.signal::<NumSignal>().receive().map(|s| s.0).collect()
     }
 
+    fn peek(world: &World) -> Vec<u64> {
+        let signals = world.get_resource::<Signals<NumSignal>>().unwrap();
+        let mut data = world.get_resource_mut::<SignalData<NumSignal>>().unwrap();
+        let tick = world.get_resource::<Tick>().unwrap().0;
+        let fresh = u128::MAX - data.cursors.len() as u128;
+        signals
+            .receive(&mut data, fresh, tick, |_| true)
+            .map(|s| s.0)
+            .collect()
+    }
+
     fn run_ticks(world: &World, ticks: u64) -> Vec<Vec<u64>> {
         (0..ticks)
             .map(|_| {
@@ -1369,7 +1415,7 @@ mod tests {
         assert_eq!(receive(&world), vec![2]);
 
         assert!(world.signal::<NumSignal>().modify(id, NumSignal(3)));
-        assert_eq!(receive(&world), vec![3]);
+        assert_eq!(peek(&world), vec![3]);
 
         end_tick(&world);
         end_tick(&world);
@@ -1674,7 +1720,59 @@ mod tests {
 
         let data = world.get_resource::<SignalData<NumSignal>>().unwrap();
         assert_eq!(data.cursors.len(), 3);
-        assert!(data.cursors.windows(2).all(|w| w[0].0 < w[1].0));
+        assert!(data.cursors.windows(2).all(|w| w[0].system < w[1].system));
+    }
+
+    #[test]
+    fn second_receive_in_a_tick_only_gets_new_signals() {
+        let world = world();
+        world.signal::<NumSignal>().send(NumSignal(1), 0..3);
+        world.signal::<NumSignal>().send(NumSignal(2), ..);
+
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        for tick in 0..4 {
+            let mut received = receive(&world);
+            received.sort_unstable();
+            first.push(received);
+            world.signal::<NumSignal>().emit(NumSignal(100 + tick));
+            world
+                .signal::<NumSignal>()
+                .send(NumSignal(200 + tick), tick..tick + 2);
+            second.push(receive(&world));
+            end_tick(&world);
+        }
+
+        assert_eq!(
+            first,
+            vec![vec![1, 2], vec![1, 2, 200], vec![1, 2, 201], vec![2, 202]]
+        );
+        assert_eq!(
+            second,
+            vec![
+                vec![100, 200],
+                vec![101, 201],
+                vec![102, 202],
+                vec![103, 203]
+            ]
+        );
+    }
+
+    #[test]
+    fn repeat_receive_skips_permanent_during_a_sweep_with_cancels() {
+        let world = permanent_world(8);
+        assert_eq!(sweep(&world, 4, |s| s.0 % 2 == 0), (4, false));
+        assert!(cancel(&world, 6));
+
+        assert_eq!(receive(&world), vec![0, 2, 4, 5, 7]);
+        assert_eq!(receive(&world), Vec::<u64>::new());
+        assert_eq!(receive_by_next(&world), Vec::<u64>::new());
+
+        world.signal::<NumSignal>().emit(NumSignal(100));
+        assert_eq!(receive(&world), vec![100]);
+
+        end_tick(&world);
+        assert_eq!(receive(&world), vec![0, 2, 4, 5, 7]);
     }
 
     #[test]
@@ -1813,7 +1911,7 @@ mod tests {
 
         assert_eq!(receive(&world), vec![1]);
         assert!(cancel(&world, id));
-        assert_eq!(receive(&world), Vec::<u64>::new());
+        assert_eq!(peek(&world), Vec::<u64>::new());
     }
 
     #[test]
@@ -1978,7 +2076,7 @@ mod tests {
         assert_eq!(receive(&world), vec![5, 6, 7, 8, 9]);
 
         assert!(cancel(&world, ids[5]));
-        assert_eq!(receive(&world), vec![6, 7, 8, 9]);
+        assert_eq!(peek(&world), vec![6, 7, 8, 9]);
         end_tick(&world);
         assert_eq!(live(&world), 4);
         assert_eq!(receive(&world), vec![6, 7, 8, 9]);
@@ -2211,7 +2309,7 @@ mod tests {
         assert!(!cancel(&world, 1));
         assert!(cancel(&world, 0));
         assert!(cancel(&world, 5));
-        assert_eq!(receive(&world), vec![20, 3, 40]);
+        assert_eq!(peek(&world), vec![20, 3, 40]);
     }
 
     #[test]
@@ -2236,7 +2334,7 @@ mod tests {
         assert_eq!(receive(&world), vec![0, 4, 5, 7]);
 
         assert_eq!(sweep(&world, 10, |_| true), (4, true));
-        assert_eq!(receive(&world), vec![0, 4, 5, 7]);
+        assert_eq!(peek(&world), vec![0, 4, 5, 7]);
         assert!(!cancel(&world, 6));
         assert!(!world.signal::<NumSignal>().modify(2, NumSignal(9)));
 
@@ -2254,7 +2352,7 @@ mod tests {
         drop(signals);
 
         assert!(cancel(&world, 5));
-        assert_eq!(receive(&world), vec![0, 4, 7]);
+        assert_eq!(peek(&world), vec![0, 4, 7]);
     }
 
     #[test]
@@ -2419,6 +2517,27 @@ mod tests {
             .get_resource_mut::<Signals<Kept>>()
             .unwrap()
             .sweep(budget, keep)
+    }
+
+    #[test]
+    fn repeat_receive_on_an_entity_signal_filters_only_new_signals() {
+        let world = kept_world();
+        let entities = spawn_all(&world, 4);
+        world.signal::<Kept>().send(Kept(entities[0]), ..);
+        world.signal::<Kept>().send(Kept(entities[1]), ..);
+        end_tick(&world);
+        end_tick(&world);
+
+        assert_eq!(received_kept(&world), entities[..2].to_vec());
+        assert_eq!(received_kept(&world), Vec::<Entity>::new());
+
+        world.signal::<Kept>().emit(Kept(entities[2]));
+        world.signal::<Kept>().emit(Kept(entities[3]));
+        world.entity_manager().despawn(entities[3]);
+        assert_eq!(received_kept(&world), vec![entities[2]]);
+
+        end_tick(&world);
+        assert_eq!(received_kept(&world), entities[..2].to_vec());
     }
 
     #[test]
