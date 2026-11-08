@@ -117,20 +117,23 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let input = parse_macro_input!(item as DeriveInput);
     let name = &input.ident;
+
+    if !input.generics.params.is_empty() {
+        let message = if local {
+            "#[resource(local)] does not support generic resources"
+        } else {
+            "#[resource] does not support generic resources"
+        };
+        return syn::Error::new(input.generics.span(), message)
+            .to_compile_error()
+            .into();
+    }
+
     let snake_name = format_ident!("{}", name.to_string().to_lowercase());
     let ctor_fn = format_ident!("__register_type_{}", snake_name);
     let link = linked_crates();
 
     if local {
-        if !input.generics.params.is_empty() {
-            return syn::Error::new(
-                input.generics.span(),
-                "#[resource(local)] does not support generic resources",
-            )
-            .to_compile_error()
-            .into();
-        }
-
         let on_load = on_load.map(|hook| {
             quote! {
                 const ON_LOAD: ::core::option::Option<fn(&mut Self, &::reacs::world::World)> =
@@ -178,6 +181,16 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn component(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as DeriveInput);
     let name = &input.ident;
+
+    if !input.generics.params.is_empty() {
+        return syn::Error::new(
+            input.generics.span(),
+            "#[component] does not support generic components",
+        )
+        .to_compile_error()
+        .into();
+    }
+
     let snake_name = format_ident!("{}", name.to_string().to_lowercase());
     let ctor_fn = format_ident!("__register_type_{}", snake_name);
     let link = linked_crates();

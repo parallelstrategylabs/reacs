@@ -1,4 +1,3 @@
-use reacs::Tick;
 use reacs::prelude::*;
 
 #[signal]

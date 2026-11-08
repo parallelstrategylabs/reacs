@@ -22,6 +22,7 @@ pub mod __private {
 }
 
 pub mod prelude {
+    pub use crate::Tick;
     pub use crate::component::Component;
     pub use crate::entity::{Entity, EntityManager};
     pub use crate::hashed::Hashed;
