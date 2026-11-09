@@ -438,3 +438,185 @@ fn a_recording_from_another_build_is_rejected() {
 
     assert!(matches!(result, Err(ReplayError::DifferentBuild)));
 }
+
+fn play_saving(
+    world: &mut World,
+    recorder: &mut Recorder,
+    ticks: std::ops::Range<u64>,
+    extra: u64,
+) -> Vec<Vec<u8>> {
+    let mut saves = Vec::new();
+    for tick in ticks {
+        if tick % 3 == 0 {
+            world.input(Order(tick + extra));
+        }
+        if tick % 7 == 0 {
+            world.input(Pause(tick as u8));
+        }
+        recorder.record(world);
+        saves.push(world.save());
+        world.step();
+    }
+    saves
+}
+
+#[test]
+fn seeking_gives_the_world_the_recorder_saw_at_that_tick() {
+    let file = path("seek");
+    let mut world = World::new();
+    let mut recorder = world.to_recorder(&file).unwrap().with_hash_every(8);
+    let saves = play_saving(&mut world, &mut recorder, 0..60, 0);
+    recorder.finish().unwrap();
+
+    let replay = Replay::open(&file).unwrap();
+    fs::remove_file(&file).unwrap();
+
+    assert_eq!((replay.start_tick(), replay.last_tick()), (0, 57));
+    for tick in [37, 0, 59, 8, 21, 37] {
+        let player = replay.seek(tick).unwrap();
+        assert_eq!(player.tick(), tick);
+        assert!(player.world().save() == saves[tick as usize], "tick {tick}");
+    }
+    let report = replay.seek(37).unwrap().report();
+    assert_eq!((report.inputs, report.hashes_checked), (13 + 6, 5));
+    assert!(!report.past_recording);
+}
+
+#[test]
+fn a_player_advances_tick_by_tick_from_where_it_landed() {
+    let file = path("advance");
+    let mut world = World::new();
+    let mut recorder = world.to_recorder(&file).unwrap().with_hash_every(8);
+    let saves = play_saving(&mut world, &mut recorder, 0..40, 0);
+    recorder.finish().unwrap();
+
+    let replay = Replay::open(&file).unwrap();
+    fs::remove_file(&file).unwrap();
+
+    let mut player = replay.seek(10).unwrap();
+    for tick in 11..=36 {
+        player.advance().unwrap();
+        assert_eq!(player.tick(), tick);
+        assert!(player.world().save() == saves[tick as usize], "tick {tick}");
+    }
+}
+
+#[test]
+fn seeking_starts_from_a_recording_that_began_late() {
+    let file = path("late");
+    let mut world = World::new();
+    for _ in 0..50 {
+        world.step();
+    }
+    let mut recorder = world.to_recorder(&file).unwrap().with_hash_every(8);
+    let saves = play_saving(&mut world, &mut recorder, 50..80, 0);
+    recorder.finish().unwrap();
+
+    let replay = Replay::open(&file).unwrap();
+    fs::remove_file(&file).unwrap();
+
+    assert!(replay.seek(66).unwrap().world().save() == saves[16]);
+    assert!(matches!(
+        replay.seek(49),
+        Err(ReplayError::BeforeStart {
+            tick: 49,
+            start: 50
+        })
+    ));
+}
+
+#[test]
+fn seeking_follows_the_run_that_continued_after_a_load() {
+    let file = path("seek-load");
+    let mut world = World::new();
+    let mut recorder = world.to_recorder(&file).unwrap().with_hash_every(4);
+    let before = play_saving(&mut world, &mut recorder, 0..10, 0);
+    let save = world.save();
+    let dropped = play_saving(&mut world, &mut recorder, 10..20, 0);
+    world.load(&save);
+    let kept = play_saving(&mut world, &mut recorder, 10..30, 1000);
+    recorder.finish().unwrap();
+
+    let replay = Replay::open(&file).unwrap();
+    fs::remove_file(&file).unwrap();
+
+    assert!(dropped[5] != kept[5]);
+    assert!(replay.seek(4).unwrap().world().save() == before[4]);
+    assert!(replay.seek(10).unwrap().world().save() == kept[0]);
+    assert!(replay.seek(15).unwrap().world().save() == kept[5]);
+    assert!(replay.seek(29).unwrap().world().save() == kept[19]);
+
+    let mut player = replay.seek(8).unwrap();
+    for _ in 0..4 {
+        player.advance().unwrap();
+    }
+    assert_eq!(player.tick(), 12);
+    assert!(player.world().save() == kept[2]);
+}
+
+#[test]
+fn seeking_passes_a_step_that_was_not_recorded() {
+    let file = path("seek-gap");
+    let mut world = World::new();
+    let mut recorder = world.to_recorder(&file).unwrap().with_hash_every(4);
+    play(&mut world, &mut recorder, 0..6);
+    world.input(Order(77));
+    world.step();
+    let saves = play_saving(&mut world, &mut recorder, 7..14, 0);
+    recorder.finish().unwrap();
+
+    let replay = Replay::open(&file).unwrap();
+    fs::remove_file(&file).unwrap();
+
+    assert!(replay.seek(7).unwrap().world().save() == saves[0]);
+    assert!(replay.seek(12).unwrap().world().save() == saves[5]);
+}
+
+#[test]
+fn a_divergence_stops_the_trip() {
+    let file = path("seek-diverged");
+    let mut world = World::new();
+    let mut recorder = world.to_recorder(&file).unwrap().with_hash_every(8);
+    for tick in 0..64 {
+        if tick == 30 {
+            world.get_local_resource_mut::<Bias>().unwrap().0 = 1;
+        }
+        recorder.record(&world);
+        world.step();
+    }
+    recorder.finish().unwrap();
+
+    let replay = Replay::open(&file).unwrap();
+    fs::remove_file(&file).unwrap();
+
+    assert!(replay.seek(31).is_ok());
+    let Err(ReplayError::Diverged(divergence)) = replay.seek(40) else {
+        panic!("the trip went past a divergence");
+    };
+    assert_eq!((divergence.last_match, divergence.tick), (Some(24), 32));
+    assert!(divergence.resources[0].name.ends_with("Trace"));
+}
+
+#[test]
+fn seeking_past_the_last_record_runs_on_with_no_inputs() {
+    let file = path("seek-past");
+    let mut world = World::new();
+    let mut recorder = world.to_recorder(&file).unwrap().with_hash_every(8);
+    play(&mut world, &mut recorder, 0..19);
+    recorder.finish().unwrap();
+    let at_19 = world.save();
+    for _ in 0..3 {
+        world.step();
+    }
+    let at_22 = world.save();
+
+    let replay = Replay::open(&file).unwrap();
+    fs::remove_file(&file).unwrap();
+
+    assert_eq!(replay.last_tick(), 18);
+    assert!(!replay.seek(18).unwrap().report().past_recording);
+    let player = replay.seek(19).unwrap();
+    assert!(player.report().past_recording);
+    assert!(player.world().save() == at_19);
+    assert!(replay.seek(22).unwrap().world().save() == at_22);
+}

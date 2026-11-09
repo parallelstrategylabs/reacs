@@ -2,6 +2,7 @@ use std::{
     fmt,
     fs::File,
     io::{self, BufRead, BufReader, BufWriter, ErrorKind, Read, Write},
+    ops::Range,
     path::Path,
     ptr::addr_of_mut,
     rc::Rc,
@@ -312,6 +313,8 @@ pub enum ReplayError {
     NotAReplay,
     DifferentBuild,
     Corrupted,
+    BeforeStart { tick: u64, start: u64 },
+    Diverged(Divergence),
 }
 
 impl fmt::Display for ReplayError {
@@ -323,6 +326,30 @@ impl fmt::Display for ReplayError {
                 write!(f, "this replay was recorded by a different build")
             }
             ReplayError::Corrupted => write!(f, "this replay is corrupted"),
+            ReplayError::BeforeStart { tick, start } => {
+                write!(
+                    f,
+                    "tick {tick} is before the recording, which starts at tick {start}"
+                )
+            }
+            ReplayError::Diverged(divergence) => {
+                match divergence.last_match {
+                    Some(last) => write!(
+                        f,
+                        "the replay diverged between ticks {last} and {}:",
+                        divergence.tick
+                    )?,
+                    None => write!(
+                        f,
+                        "the replay diverged at or before tick {}:",
+                        divergence.tick
+                    )?,
+                }
+                for resource in &divergence.resources {
+                    write!(f, " {}", resource.name)?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -402,22 +429,59 @@ fn differences(check: &HashCheck, found: &[(u128, u64)]) -> Vec<ResourceDifferen
     out
 }
 
-enum Item {
-    Tick {
-        tick: u64,
-        hash: Option<HashCheck>,
-        inputs: Vec<InputBatch>,
-    },
-    Section {
-        tick: u64,
-        state: Vec<u8>,
-    },
+struct TickItem {
+    tick: u64,
+    hash: Option<HashCheck>,
+    inputs: Vec<InputBatch>,
+}
+
+struct Segment {
+    tick: u64,
+    state: Vec<u8>,
+    items: Range<usize>,
+}
+
+#[derive(Default)]
+struct Progress {
+    inputs: u64,
+    hashes_checked: u64,
+    last_match: Option<u64>,
+}
+
+fn apply_item(
+    world: &mut World,
+    item: &TickItem,
+    progress: &mut Progress,
+) -> Result<Option<Divergence>, ReplayError> {
+    for batch in &item.inputs {
+        let input = input_signals()
+            .get(batch.kind as usize)
+            .ok_or(ReplayError::Corrupted)?;
+        for payload in &batch.payloads {
+            if !(input.resend)(world, payload) {
+                return Err(ReplayError::Corrupted);
+            }
+            progress.inputs += 1;
+        }
+    }
+    if let Some(check) = &item.hash {
+        progress.hashes_checked += 1;
+        let resources = differences(check, &world.resource_hashes());
+        if !resources.is_empty() {
+            return Ok(Some(Divergence {
+                last_match: progress.last_match,
+                tick: item.tick,
+                resources,
+            }));
+        }
+        progress.last_match = Some(item.tick);
+    }
+    Ok(None)
 }
 
 pub struct Replay {
-    start_tick: u64,
-    start_state: Vec<u8>,
-    items: Vec<Item>,
+    segments: Vec<Segment>,
+    items: Vec<TickItem>,
     truncated: bool,
 }
 
@@ -451,25 +515,25 @@ impl Replay {
         let start_state =
             read_state(&mut reader, header.state_len)?.ok_or(ReplayError::Corrupted)?;
 
-        let (items, truncated) = Self::read_items(&mut reader, header.start_tick)?;
-        Ok(Self {
-            start_tick: header.start_tick,
-            start_state,
-            items,
-            truncated,
-        })
+        let mut replay = Self {
+            segments: vec![Segment {
+                tick: header.start_tick,
+                state: start_state,
+                items: 0..0,
+            }],
+            items: Vec::new(),
+            truncated: false,
+        };
+        replay.truncated = replay.read_records(&mut reader)?;
+        Ok(replay)
     }
 
-    fn read_items(
-        reader: &mut BufReader<File>,
-        start_tick: u64,
-    ) -> Result<(Vec<Item>, bool), ReplayError> {
-        let mut items = Vec::new();
-        let mut tick = start_tick;
+    fn read_records(&mut self, reader: &mut BufReader<File>) -> Result<bool, ReplayError> {
+        let mut tick = self.segments[0].tick;
         let mut table: Rc<[u128]> = Rc::from(Vec::new());
         loop {
             if reader.fill_buf()?.is_empty() {
-                return Ok((items, false));
+                return Ok(false);
             }
             let record: Record = match options().deserialize_from(&mut *reader) {
                 Ok(record) => record,
@@ -477,14 +541,14 @@ impl Replay {
                     if matches!(&*error, bincode::ErrorKind::Io(io)
                         if io.kind() == ErrorKind::UnexpectedEof)
                     {
-                        return Ok((items, true));
+                        return Ok(true);
                     }
                     return Err(ReplayError::Corrupted);
                 }
             };
             match record {
                 Record::Tick { gap, hash, inputs } => {
-                    tick += gap;
+                    tick = tick.checked_add(gap).ok_or(ReplayError::Corrupted)?;
                     let hash = match hash {
                         Some(record) => {
                             if let Some(new_table) = record.table {
@@ -500,78 +564,170 @@ impl Replay {
                         }
                         None => None,
                     };
-                    items.push(Item::Tick { tick, hash, inputs });
+                    self.items.push(TickItem { tick, hash, inputs });
+                    let segment = self.segments.last_mut().unwrap();
+                    segment.items.end = self.items.len();
                 }
                 Record::Section {
                     tick: section,
                     state_len,
                 } => {
                     let Some(state) = read_state(&mut *reader, state_len)? else {
-                        return Ok((items, true));
+                        return Ok(true);
                     };
                     tick = section;
-                    items.push(Item::Section { tick, state });
+                    self.segments.push(Segment {
+                        tick,
+                        state,
+                        items: self.items.len()..self.items.len(),
+                    });
                 }
             }
         }
     }
 
+    fn owner(&self, tick: u64) -> Option<usize> {
+        self.segments.iter().rposition(|x| x.tick <= tick)
+    }
+
+    fn recorded_until(&self, segment: usize) -> u64 {
+        let segment = &self.segments[segment];
+        self.items[segment.items.clone()]
+            .last()
+            .map_or(segment.tick, |item| item.tick)
+    }
+
+    pub fn start_tick(&self) -> u64 {
+        self.segments.iter().map(|x| x.tick).min().unwrap()
+    }
+
+    pub fn last_tick(&self) -> u64 {
+        self.recorded_until(self.segments.len() - 1)
+    }
+
     pub fn verify(&self) -> Result<ReplayReport, ReplayError> {
         let mut world = World::new();
-        world
-            .restore_recorded(&self.start_state)
-            .ok_or(ReplayError::Corrupted)?;
-
+        let mut progress = Progress::default();
         let mut report = ReplayReport {
-            last_tick: self.start_tick,
+            last_tick: self.segments[0].tick,
             inputs: 0,
             hashes_checked: 0,
             divergence: None,
             truncated: self.truncated,
         };
-        let mut last_match = None;
 
-        for item in &self.items {
-            match item {
-                Item::Section { tick, state } => {
-                    world
-                        .restore_recorded(state)
-                        .ok_or(ReplayError::Corrupted)?;
-                    report.last_tick = *tick;
-                    last_match = None;
+        for segment in &self.segments {
+            world
+                .restore_recorded(&segment.state)
+                .ok_or(ReplayError::Corrupted)?;
+            report.last_tick = segment.tick;
+            progress.last_match = None;
+
+            for item in &self.items[segment.items.clone()] {
+                while current_tick(&world) < item.tick {
+                    world.step();
                 }
-                Item::Tick { tick, hash, inputs } => {
-                    while current_tick(&world) < *tick {
-                        world.step();
-                    }
-                    report.last_tick = *tick;
-                    for batch in inputs {
-                        let input = input_signals()
-                            .get(batch.kind as usize)
-                            .ok_or(ReplayError::Corrupted)?;
-                        for payload in &batch.payloads {
-                            if !(input.resend)(&mut world, payload) {
-                                return Err(ReplayError::Corrupted);
-                            }
-                            report.inputs += 1;
-                        }
-                    }
-                    if let Some(check) = hash {
-                        report.hashes_checked += 1;
-                        let resources = differences(check, &world.resource_hashes());
-                        if !resources.is_empty() {
-                            report.divergence = Some(Divergence {
-                                last_match,
-                                tick: *tick,
-                                resources,
-                            });
-                            return Ok(report);
-                        }
-                        last_match = Some(*tick);
-                    }
+                report.last_tick = item.tick;
+                report.divergence = apply_item(&mut world, item, &mut progress)?;
+                report.inputs = progress.inputs;
+                report.hashes_checked = progress.hashes_checked;
+                if report.divergence.is_some() {
+                    return Ok(report);
                 }
             }
         }
         Ok(report)
+    }
+
+    pub fn seek(&self, tick: u64) -> Result<ReplayPlayer<'_>, ReplayError> {
+        let segment = self.owner(tick).ok_or(ReplayError::BeforeStart {
+            tick,
+            start: self.start_tick(),
+        })?;
+        let mut player = ReplayPlayer {
+            replay: self,
+            world: World::new(),
+            segment,
+            next: 0,
+            progress: Progress::default(),
+        };
+        player.enter(segment)?;
+        while player.tick() < tick {
+            player.advance()?;
+        }
+        Ok(player)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerReport {
+    pub tick: u64,
+    pub inputs: u64,
+    pub hashes_checked: u64,
+    pub past_recording: bool,
+}
+
+pub struct ReplayPlayer<'a> {
+    replay: &'a Replay,
+    world: World,
+    segment: usize,
+    next: usize,
+    progress: Progress,
+}
+
+impl ReplayPlayer<'_> {
+    pub fn world(&self) -> &World {
+        &self.world
+    }
+
+    pub fn tick(&self) -> u64 {
+        current_tick(&self.world)
+    }
+
+    pub fn report(&self) -> PlayerReport {
+        let tick = self.tick();
+        PlayerReport {
+            tick,
+            inputs: self.progress.inputs,
+            hashes_checked: self.progress.hashes_checked,
+            past_recording: tick > self.replay.recorded_until(self.segment),
+        }
+    }
+
+    pub fn advance(&mut self) -> Result<(), ReplayError> {
+        let tick = self.tick() + 1;
+        let owner = self.replay.owner(tick).unwrap_or(self.segment);
+        if owner != self.segment {
+            return self.enter(owner);
+        }
+        self.world.step();
+        self.apply()
+    }
+
+    fn enter(&mut self, segment: usize) -> Result<(), ReplayError> {
+        let entered = &self.replay.segments[segment];
+        self.world
+            .restore_recorded(&entered.state)
+            .ok_or(ReplayError::Corrupted)?;
+        self.segment = segment;
+        self.next = entered.items.start;
+        self.progress.last_match = None;
+        self.apply()
+    }
+
+    fn apply(&mut self) -> Result<(), ReplayError> {
+        let tick = self.tick();
+        let end = self.replay.segments[self.segment].items.end;
+        while self.next < end && self.replay.items[self.next].tick <= tick {
+            let item = &self.replay.items[self.next];
+            self.next += 1;
+            if item.tick < tick {
+                continue;
+            }
+            if let Some(divergence) = apply_item(&mut self.world, item, &mut self.progress)? {
+                return Err(ReplayError::Diverged(divergence));
+            }
+        }
+        Ok(())
     }
 }
