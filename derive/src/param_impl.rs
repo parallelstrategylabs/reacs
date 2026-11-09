@@ -304,7 +304,7 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
         let init_ty = rewrite_path(&info.ty, &infer, &mode)?;
         let fetch_ty = rewrite_path(&info.ty, &fetch_lt, &mode)?;
         init_stmts.push(quote!(
-            <#init_ty as ::reacs::schedule::SystemParam>::init(world);
+            <#init_ty as ::reacs::schedule::SystemParam>::init(world.reborrow());
         ));
         fetch_exprs.push(quote!(
             <#fetch_ty as ::reacs::schedule::SystemParam>::fetch(world)
@@ -318,7 +318,8 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
         impl #sp_impl ::reacs::schedule::SystemParam for #sp_header #sp_where {
             type Item<'__w> = #sp_item;
 
-            fn init(world: &mut ::reacs::world::World) {
+            #[allow(unused_mut, unused_variables)]
+            fn init(mut world: ::reacs::schedule::ParamInit<'_>) {
                 #(#init_stmts)*
             }
 

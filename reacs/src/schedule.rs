@@ -329,10 +329,19 @@ impl SystemGraph {
 #[derive(Clone, Copy)]
 pub struct ParamWorld<'w>(pub(crate) &'w World);
 
+pub struct ParamInit<'w>(pub(crate) &'w mut World);
+
+impl ParamInit<'_> {
+    #[inline]
+    pub fn reborrow(&mut self) -> ParamInit<'_> {
+        ParamInit(self.0)
+    }
+}
+
 pub trait SystemParam {
     type Item<'w>;
 
-    fn init(world: &mut World);
+    fn init(world: ParamInit<'_>);
     fn fetch<'w>(world: ParamWorld<'w>) -> Self::Item<'w>;
 }
 
@@ -358,7 +367,7 @@ macro_rules! impl_into_system_tuples {
                     after: Vec::new(),
                     groups: Vec::new(),
                     init_fn: Box::new(move |world: &mut World| {
-                        $( $param::init(world); )*
+                        $( $param::init(ParamInit(&mut *world)); )*
                     }),
 
                     run_fn: Box::new(move |world: &mut World| {
@@ -503,11 +512,6 @@ impl WorldAccess<'_, Write> {
     }
 
     #[inline]
-    pub fn init_signal<S: SignalType>(&mut self) {
-        self.0.init_signal::<S>();
-    }
-
-    #[inline]
     pub fn signal<S: SignalType>(&self) -> Mut<Signal<'_, S>> {
         self.0.signal::<S>()
     }
@@ -516,7 +520,7 @@ impl WorldAccess<'_, Write> {
 impl SystemParam for WorldAccess<'_, Read> {
     type Item<'w> = WorldAccess<'w, Read>;
 
-    fn init(_world: &mut World) {}
+    fn init(_world: ParamInit<'_>) {}
 
     fn fetch<'w>(world: ParamWorld<'w>) -> WorldAccess<'w, Read> {
         WorldAccess(world.0)
@@ -572,7 +576,7 @@ impl World {
 
     #[inline]
     pub(crate) fn init_param<P: SystemParam>(&mut self) {
-        P::init(self);
+        P::init(ParamInit(self));
     }
 
     #[inline]

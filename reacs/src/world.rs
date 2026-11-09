@@ -10,7 +10,7 @@ use crate::{
     registry::get_registry_entry,
     resource::LocalResourceType,
     schedule::{ANONYMOUS_SYSTEM, CurrentSystem, Mut, set_current_system, system_graph},
-    signal::{SweepCursor, init_input_signals},
+    signal::{SweepCursor, init_signals},
 };
 use serde::{Deserialize, Serialize};
 
@@ -53,7 +53,7 @@ impl World {
         world.init_resource::<Tick>();
         world.init_resource::<SweepCursor>();
         world.init_param::<Mut<EntityManager>>();
-        init_input_signals(&mut world);
+        init_signals(&mut world);
         system_graph().init(&mut world);
 
         world

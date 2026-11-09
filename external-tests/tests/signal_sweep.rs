@@ -130,10 +130,6 @@ fn permanent_len<S: SignalType>(world: &World) -> usize {
 fn entity_signals_are_removed_when_their_entity_dies() {
     let mut units = (Entity::default(), Entity::default());
     let mut world = World::build(|setup| {
-        setup.init_signal::<Poison>();
-        setup.init_signal::<Regen>();
-        setup.init_signal::<Attack>();
-        setup.init_signal::<Heal>();
         let (dead, alive) = (setup.spawn(), setup.spawn());
 
         setup.signal::<Poison>().send(Poison(dead), ..);

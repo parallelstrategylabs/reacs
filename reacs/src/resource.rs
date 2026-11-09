@@ -1,6 +1,6 @@
 use crate::{
     hashed::Hashed,
-    schedule::{Mode, ParamWorld, Read, SystemParam, WithMode, conflict},
+    schedule::{Mode, ParamInit, ParamWorld, Read, SystemParam, WithMode, conflict},
     world::World,
 };
 use std::{
@@ -35,8 +35,8 @@ where
 impl<T: 'static + Default + Hashed, M: Mode> SystemParam for Resource<'_, T, M> {
     type Item<'w> = Resource<'w, T, M>;
 
-    fn init(world: &mut World) {
-        world.init_resource::<T>();
+    fn init(world: ParamInit<'_>) {
+        world.0.init_resource::<T>();
     }
 
     fn fetch<'w>(world: ParamWorld<'w>) -> Resource<'w, T, M> {
@@ -77,8 +77,8 @@ where
 impl<T: LocalResourceType, M: Mode> SystemParam for LocalResource<'_, T, M> {
     type Item<'w> = LocalResource<'w, T, M>;
 
-    fn init(world: &mut World) {
-        world.init_local_resource::<T>();
+    fn init(world: ParamInit<'_>) {
+        world.0.init_local_resource::<T>();
     }
 
     fn fetch<'w>(world: ParamWorld<'w>) -> LocalResource<'w, T, M> {
@@ -106,8 +106,8 @@ impl<'w, T: 'static, M: Mode> ResourceCell<'w, T, M> {
 impl<T: 'static + Default + Hashed, M: Mode> SystemParam for ResourceCell<'_, T, M> {
     type Item<'w> = ResourceCell<'w, T, M>;
 
-    fn init(world: &mut World) {
-        world.init_resource::<T>();
+    fn init(world: ParamInit<'_>) {
+        world.0.init_resource::<T>();
     }
 
     fn fetch<'w>(world: ParamWorld<'w>) -> ResourceCell<'w, T, M> {

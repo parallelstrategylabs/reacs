@@ -1099,6 +1099,9 @@ pub fn register_signal<S: SignalType>() {
             .get_or_insert_with(Vec::new)
             .push(cleanup_in_world::<S>);
 
+        let ptr = addr_of_mut!(SIGNAL_INITS);
+        (*ptr).get_or_insert_with(Vec::new).push(init_in_world::<S>);
+
         if S::Filter::ACTIVE {
             let ptr = addr_of_mut!(SWEEP_REGISTRY);
             let sweeps = (*ptr).get_or_insert_with(Vec::new);
@@ -1122,28 +1125,18 @@ pub fn register_signal<S: SignalType>() {
 )]
 pub trait InputSignal: SignalType {}
 
-static mut INPUT_REGISTRY: Option<Vec<(u128, fn(&mut World))>> = None;
+static mut SIGNAL_INITS: Option<Vec<fn(&mut World)>> = None;
 
-fn init_input_signal<S: SignalType>(world: &mut World) {
+fn init_in_world<S: SignalType>(world: &mut World) {
     world.init_signal::<S>();
 }
 
-pub fn register_input_signal<S: InputSignal>() {
-    let uuid = Signals::<S>::TYPE_UUID;
-    unsafe {
-        let ptr = addr_of_mut!(INPUT_REGISTRY);
-        let inputs = (*ptr).get_or_insert_with(Vec::new);
-        let i = inputs.partition_point(|x| x.0 < uuid);
-        inputs.insert(i, (uuid, init_input_signal::<S>));
-    }
-}
-
-pub(crate) fn init_input_signals(world: &mut World) {
-    let inputs = unsafe {
-        let ptr = addr_of_mut!(INPUT_REGISTRY);
+pub(crate) fn init_signals(world: &mut World) {
+    let inits = unsafe {
+        let ptr = addr_of_mut!(SIGNAL_INITS);
         (*ptr).as_deref().unwrap_or(&[])
     };
-    for (_, init) in inputs {
+    for init in inits {
         init(world);
     }
 }
@@ -1615,10 +1608,10 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_signals_skips_uninitialized() {
+    fn every_registered_signal_exists_in_a_new_world() {
         let world = World::new();
-        world.cleanup_signals();
-        assert!(!world.has_resource::<Signals<NumSignal>>());
+        assert!(world.has_resource::<Signals<NumSignal>>());
+        assert!(world.has_resource::<SignalData<NumSignal>>());
     }
 
     #[test]
