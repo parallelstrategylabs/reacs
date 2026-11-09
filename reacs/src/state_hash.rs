@@ -1,15 +1,18 @@
-use std::fmt;
+use std::fmt::Error;
 
 use serde::{
     Serialize, Serializer,
     ser::{
-        self, SerializeMap, SerializeSeq, SerializeStruct, SerializeStructVariant, SerializeTuple,
+        SerializeMap, SerializeSeq, SerializeStruct, SerializeStructVariant, SerializeTuple,
         SerializeTupleStruct, SerializeTupleVariant,
     },
 };
 
 const FIRST: u64 = 0x9E37_79B9_7F4A_7C15;
 const BLOCK_KEY: u64 = 0x8EBC_6AF0_9C88_C6E3;
+
+type Done = Result<(), Error>;
+type Name = &'static str;
 
 #[inline(always)]
 fn mix(a: u64, b: u64) -> u64 {
@@ -31,24 +34,7 @@ pub fn hash_value<T: Serialize>(value: &T) -> u64 {
     hasher.finish()
 }
 
-#[derive(Debug)]
-pub(crate) struct HashError;
-
-impl fmt::Display for HashError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "failed to hash a value")
-    }
-}
-
-impl std::error::Error for HashError {}
-
-impl ser::Error for HashError {
-    fn custom<T: fmt::Display>(_message: T) -> Self {
-        HashError
-    }
-}
-
-pub(crate) struct StateHasher {
+struct StateHasher {
     state: u64,
     buffer: [u64; 2],
     used: usize,
@@ -111,21 +97,19 @@ impl StateHasher {
     }
 }
 
-macro_rules! write_as {
-    ($($method:ident: $ty:ty as $unsigned:ty),* $(,)?) => {
-        $(
-            #[inline(always)]
-            fn $method(self, value: $ty) -> Result<(), HashError> {
-                self.write(value as $unsigned as u64, <$unsigned>::BITS);
-                Ok(())
-            }
-        )*
-    };
+macro_rules! write_value {
+    ($($method:ident($value:ident: $ty:ty) => ($word:expr, $bits:expr);)*) => {$(
+        #[inline(always)]
+        fn $method(self, $value: $ty) -> Done {
+            self.write($word, $bits);
+            Ok(())
+        }
+    )*};
 }
 
 impl Serializer for &mut StateHasher {
     type Ok = ();
-    type Error = HashError;
+    type Error = Error;
     type SerializeSeq = Self;
     type SerializeTuple = Self;
     type SerializeTupleStruct = Self;
@@ -134,166 +118,131 @@ impl Serializer for &mut StateHasher {
     type SerializeStruct = Self;
     type SerializeStructVariant = Self;
 
-    write_as!(
-        serialize_i8: i8 as u8,
-        serialize_i16: i16 as u16,
-        serialize_i32: i32 as u32,
-        serialize_i64: i64 as u64,
-        serialize_u8: u8 as u8,
-        serialize_u16: u16 as u16,
-        serialize_u32: u32 as u32,
-        serialize_u64: u64 as u64,
-    );
+    write_value! {
+        serialize_bool(v: bool) => (v as u64, 8);
+        serialize_i8(v: i8) => (v as u8 as u64, 8);
+        serialize_i16(v: i16) => (v as u16 as u64, 16);
+        serialize_i32(v: i32) => (v as u32 as u64, 32);
+        serialize_i64(v: i64) => (v as u64, 64);
+        serialize_u8(v: u8) => (v as u64, 8);
+        serialize_u16(v: u16) => (v as u64, 16);
+        serialize_u32(v: u32) => (v as u64, 32);
+        serialize_u64(v: u64) => (v, 64);
+        serialize_f32(v: f32) => (v.to_bits() as u64, 32);
+        serialize_f64(v: f64) => (v.to_bits(), 64);
+        serialize_char(v: char) => (v as u64, 32);
+    }
 
     #[inline(always)]
-    fn serialize_bool(self, value: bool) -> Result<(), HashError> {
-        self.write(value as u64, 8);
+    fn serialize_unit(self) -> Done {
         Ok(())
     }
 
     #[inline(always)]
-    fn serialize_i128(self, value: i128) -> Result<(), HashError> {
+    fn serialize_unit_struct(self, _: Name) -> Done {
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn serialize_tuple(self, _: usize) -> Result<Self, Error> {
+        Ok(self)
+    }
+
+    #[inline(always)]
+    fn serialize_tuple_struct(self, _: Name, _: usize) -> Result<Self, Error> {
+        Ok(self)
+    }
+
+    #[inline(always)]
+    fn serialize_struct(self, _: Name, _: usize) -> Result<Self, Error> {
+        Ok(self)
+    }
+
+    #[inline(always)]
+    fn serialize_i128(self, value: i128) -> Done {
         self.serialize_u128(value as u128)
     }
 
     #[inline(always)]
-    fn serialize_u128(self, value: u128) -> Result<(), HashError> {
+    fn serialize_u128(self, value: u128) -> Done {
         self.write(value as u64, 64);
-        self.write((value >> 64) as u64, 64);
-        Ok(())
+        self.serialize_u64((value >> 64) as u64)
     }
 
-    #[inline(always)]
-    fn serialize_f32(self, value: f32) -> Result<(), HashError> {
-        self.write(value.to_bits() as u64, 32);
-        Ok(())
+    fn serialize_str(self, value: &str) -> Done {
+        self.serialize_bytes(value.as_bytes())
     }
 
-    #[inline(always)]
-    fn serialize_f64(self, value: f64) -> Result<(), HashError> {
-        self.write(value.to_bits(), 64);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn serialize_char(self, value: char) -> Result<(), HashError> {
-        self.write(value as u64, 32);
-        Ok(())
-    }
-
-    fn serialize_str(self, value: &str) -> Result<(), HashError> {
-        self.write_bytes(value.as_bytes());
-        Ok(())
-    }
-
-    fn serialize_bytes(self, value: &[u8]) -> Result<(), HashError> {
+    fn serialize_bytes(self, value: &[u8]) -> Done {
         self.write_bytes(value);
         Ok(())
     }
 
     #[inline(always)]
-    fn serialize_none(self) -> Result<(), HashError> {
-        self.write(0, 8);
-        Ok(())
+    fn serialize_none(self) -> Done {
+        self.serialize_u8(0)
     }
 
     #[inline(always)]
-    fn serialize_some<T: ?Sized + Serialize>(self, value: &T) -> Result<(), HashError> {
+    fn serialize_some<T: ?Sized + Serialize>(self, value: &T) -> Done {
         self.write(1, 8);
         value.serialize(self)
     }
 
     #[inline(always)]
-    fn serialize_unit(self) -> Result<(), HashError> {
-        Ok(())
+    fn serialize_unit_variant(self, _: Name, index: u32, _: Name) -> Done {
+        self.serialize_u32(index)
     }
 
     #[inline(always)]
-    fn serialize_unit_struct(self, _name: &'static str) -> Result<(), HashError> {
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn serialize_unit_variant(
-        self,
-        _name: &'static str,
-        index: u32,
-        _variant: &'static str,
-    ) -> Result<(), HashError> {
-        self.write(index as u64, 32);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn serialize_newtype_struct<T: ?Sized + Serialize>(
-        self,
-        _name: &'static str,
-        value: &T,
-    ) -> Result<(), HashError> {
+    fn serialize_newtype_struct<T: ?Sized + Serialize>(self, _: Name, value: &T) -> Done {
         value.serialize(self)
     }
 
     #[inline(always)]
     fn serialize_newtype_variant<T: ?Sized + Serialize>(
         self,
-        _name: &'static str,
+        _: Name,
         index: u32,
-        _variant: &'static str,
+        _: Name,
         value: &T,
-    ) -> Result<(), HashError> {
+    ) -> Done {
         self.write(index as u64, 32);
         value.serialize(self)
     }
 
     #[inline(always)]
-    fn serialize_seq(self, len: Option<usize>) -> Result<Self, HashError> {
+    fn serialize_seq(self, len: Option<usize>) -> Result<Self, Error> {
         self.write(len.map_or(u64::MAX, |len| len as u64), 64);
         Ok(self)
     }
 
     #[inline(always)]
-    fn serialize_tuple(self, _len: usize) -> Result<Self, HashError> {
-        Ok(self)
-    }
-
-    #[inline(always)]
-    fn serialize_tuple_struct(self, _name: &'static str, _len: usize) -> Result<Self, HashError> {
-        Ok(self)
+    fn serialize_map(self, len: Option<usize>) -> Result<Self, Error> {
+        self.serialize_seq(len)
     }
 
     #[inline(always)]
     fn serialize_tuple_variant(
         self,
-        _name: &'static str,
+        _: Name,
         index: u32,
-        _variant: &'static str,
-        _len: usize,
-    ) -> Result<Self, HashError> {
+        _: Name,
+        _: usize,
+    ) -> Result<Self, Error> {
         self.write(index as u64, 32);
-        Ok(self)
-    }
-
-    #[inline(always)]
-    fn serialize_map(self, len: Option<usize>) -> Result<Self, HashError> {
-        self.write(len.map_or(u64::MAX, |len| len as u64), 64);
-        Ok(self)
-    }
-
-    #[inline(always)]
-    fn serialize_struct(self, _name: &'static str, _len: usize) -> Result<Self, HashError> {
         Ok(self)
     }
 
     #[inline(always)]
     fn serialize_struct_variant(
         self,
-        _name: &'static str,
+        name: Name,
         index: u32,
-        _variant: &'static str,
-        _len: usize,
-    ) -> Result<Self, HashError> {
-        self.write(index as u64, 32);
-        Ok(self)
+        variant: Name,
+        len: usize,
+    ) -> Result<Self, Error> {
+        self.serialize_tuple_variant(name, index, variant, len)
     }
 
     fn is_human_readable(&self) -> bool {
@@ -302,79 +251,35 @@ impl Serializer for &mut StateHasher {
 }
 
 macro_rules! compound {
-    ($($name:ident :: $method:ident),* $(,)?) => {
-        $(
-            impl $name for &mut StateHasher {
-                type Ok = ();
-                type Error = HashError;
+    ($($name:ident: $($method:ident($($key:ty)?))+;)*) => {$(
+        impl $name for &mut StateHasher {
+            type Ok = ();
+            type Error = Error;
 
+            $(
                 #[inline(always)]
-                fn $method<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), HashError> {
+                fn $method<T: ?Sized + Serialize>(&mut self, $(_: $key,)? value: &T) -> Done {
                     value.serialize(&mut **self)
                 }
+            )+
 
-                #[inline(always)]
-                fn end(self) -> Result<(), HashError> {
-                    Ok(())
-                }
+            #[inline(always)]
+            fn end(self) -> Done {
+                Ok(())
             }
-        )*
-    };
+        }
+    )*};
 }
 
-compound!(
-    SerializeSeq::serialize_element,
-    SerializeTuple::serialize_element,
-    SerializeTupleStruct::serialize_field,
-    SerializeTupleVariant::serialize_field,
-);
-
-impl SerializeMap for &mut StateHasher {
-    type Ok = ();
-    type Error = HashError;
-
-    #[inline(always)]
-    fn serialize_key<T: ?Sized + Serialize>(&mut self, key: &T) -> Result<(), HashError> {
-        key.serialize(&mut **self)
-    }
-
-    #[inline(always)]
-    fn serialize_value<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), HashError> {
-        value.serialize(&mut **self)
-    }
-
-    #[inline(always)]
-    fn end(self) -> Result<(), HashError> {
-        Ok(())
-    }
+compound! {
+    SerializeSeq: serialize_element();
+    SerializeTuple: serialize_element();
+    SerializeTupleStruct: serialize_field();
+    SerializeTupleVariant: serialize_field();
+    SerializeMap: serialize_key() serialize_value();
+    SerializeStruct: serialize_field(Name);
+    SerializeStructVariant: serialize_field(Name);
 }
-
-macro_rules! named_fields {
-    ($($name:ident),* $(,)?) => {
-        $(
-            impl $name for &mut StateHasher {
-                type Ok = ();
-                type Error = HashError;
-
-                #[inline(always)]
-                fn serialize_field<T: ?Sized + Serialize>(
-                    &mut self,
-                    _key: &'static str,
-                    value: &T,
-                ) -> Result<(), HashError> {
-                    value.serialize(&mut **self)
-                }
-
-                #[inline(always)]
-                fn end(self) -> Result<(), HashError> {
-                    Ok(())
-                }
-            }
-        )*
-    };
-}
-
-named_fields!(SerializeStruct, SerializeStructVariant);
 
 #[cfg(test)]
 mod tests {

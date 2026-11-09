@@ -1,5 +1,5 @@
 use reacs::prelude::*;
-use reacs::record::{Recorder, Recording, RecordingError, send_recorded};
+use reacs::record::{Recorder, Recording, send_recorded};
 use std::fs;
 use std::path::PathBuf;
 
@@ -199,11 +199,7 @@ fn a_recording_reads_back_as_data_a_tool_can_run_again() {
             }
         }
         if let Some(hashes) = &recorded.hashes {
-            assert!(
-                hashes.iter().eq(copy.resource_hashes()),
-                "tick {}",
-                recorded.tick
-            );
+            assert_eq!(*hashes, copy.resource_hashes(), "tick {}", recorded.tick);
         }
     }
     assert!(!send_recorded(&mut copy, 12345, &[1]));
@@ -217,5 +213,5 @@ fn a_file_that_is_not_a_recording_is_rejected() {
     let result = Recording::open(&file);
     fs::remove_file(&file).unwrap();
 
-    assert!(matches!(result, Err(RecordingError::NotARecording)));
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
 }
