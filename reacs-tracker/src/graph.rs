@@ -33,6 +33,8 @@ pub struct Port {
     pub signal: u128,
     pub label: String,
     pub count: u64,
+    pub cancelled: u64,
+    pub modified: u64,
     pub external: bool,
     pub wired: bool,
     pub stub_x: f32,
@@ -42,8 +44,22 @@ pub struct Port {
 
 impl Port {
     pub fn text(&self) -> String {
-        format!("{} ({})", self.label, self.count)
+        counted(&self.label, self.count, self.cancelled, self.modified)
     }
+}
+
+pub fn counted(label: &str, count: u64, cancelled: u64, modified: u64) -> String {
+    let mut parts = Vec::new();
+    if count > 0 || (cancelled == 0 && modified == 0) {
+        parts.push(count.to_string());
+    }
+    if cancelled > 0 {
+        parts.push(format!("cancel {cancelled}"));
+    }
+    if modified > 0 {
+        parts.push(format!("modify {modified}"));
+    }
+    format!("{label} ({})", parts.join(", "))
 }
 
 pub type Measure<'a> = &'a dyn Fn(&str, f32) -> f32;
@@ -369,6 +385,8 @@ fn add_input(
                 signal,
                 label: label.to_string(),
                 count: 0,
+                cancelled: 0,
+                modified: 0,
                 external: false,
                 wired: false,
                 stub_x: 0.0,
@@ -402,6 +420,8 @@ fn outputs_of(save: &TrackingSave, frame: &TrackedFrame, system: u128) -> Vec<Po
                     signal: signal.signal,
                     label: name.clone(),
                     count: sent.count,
+                    cancelled: 0,
+                    modified: 0,
                     external: false,
                     wired: false,
                     stub_x: 0.0,
@@ -438,10 +458,17 @@ fn add_inputs_and_wires(
                 let node = &mut graph.nodes[to_node];
                 if let Some((from_node, from_port)) = source {
                     let to_port = add_input(node, signal.signal, &name, received.count, None);
+                    node.inputs[to_port].cancelled += received.cancelled;
+                    node.inputs[to_port].modified += received.modified;
                     graph.nodes[from_node].outputs[from_port].wired = true;
                     graph.wires.push(Wire {
                         signal: signal.signal,
-                        label: format!("{name} ({})", received.count),
+                        label: counted(
+                            &name,
+                            received.count,
+                            received.cancelled,
+                            received.modified,
+                        ),
                         windowed: received.windowed,
                         from_node,
                         from_port,
@@ -460,7 +487,9 @@ fn add_inputs_and_wires(
                     Some(sent_tick) => format!("from {sender}, tick {sent_tick}"),
                     None => format!("from {sender}, sent before recording"),
                 };
-                add_input(node, signal.signal, &name, received.count, Some(note));
+                let port = add_input(node, signal.signal, &name, received.count, Some(note));
+                node.inputs[port].cancelled += received.cancelled;
+                node.inputs[port].modified += received.modified;
             }
         }
     }
@@ -938,6 +967,7 @@ pub fn build(
 
 #[cfg(test)]
 mod tests {
+    use super::counted;
     use super::{
         BLOCK_PADDING, Focus, GRID_STEP, NODE_WIDTH, Node, NodeKey, PORT_MARGIN, PORT_TEXT_SIZE,
         PORT_TRACK_STEP, Port, Target, TickGraph, Wire, build, fade, label_position, lane_cells,
@@ -1189,6 +1219,8 @@ mod tests {
             signal,
             label: signal.to_string(),
             count: 1,
+            cancelled: 0,
+            modified: 0,
             external: false,
             wired: false,
             stub_x: 0.0,
@@ -1644,6 +1676,14 @@ mod tests {
 
         fade(&mut graph, &[Target::Node(1)]);
         assert!(!graph.nodes[0].outputs[1].faded);
+    }
+
+    #[test]
+    fn counts_show_only_what_happened() {
+        assert_eq!(counted("Wave", 3, 0, 0), "Wave (3)");
+        assert_eq!(counted("Wave", 0, 1, 0), "Wave (cancel 1)");
+        assert_eq!(counted("Wave", 0, 0, 2), "Wave (modify 2)");
+        assert_eq!(counted("Wave", 3, 1, 2), "Wave (3, cancel 1, modify 2)");
     }
 
     #[test]

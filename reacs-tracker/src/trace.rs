@@ -1,4 +1,4 @@
-use crate::graph::{NodeKey, StubKey, WireKey, sender_name, short_name};
+use crate::graph::{NodeKey, StubKey, WireKey, counted, sender_name, short_name};
 use reacs::tracking::{TrackedFrame, TrackingSave, UNKNOWN_SENDER};
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -17,6 +17,8 @@ pub struct NodeLinks {
 struct Reads {
     first: u64,
     first_count: u64,
+    first_cancelled: u64,
+    first_modified: u64,
     last: u64,
     ticks: u64,
 }
@@ -49,7 +51,10 @@ fn inputs_of(save: &TrackingSave, frames: &[&TrackedFrame], node: NodeKey) -> Ve
             };
             links.push(Link {
                 signal: signal.signal,
-                text: format!("{name} ({}) from {sender}, {origin}", received.count),
+                text: format!(
+                    "{} from {sender}, {origin}",
+                    counted(name, received.count, received.cancelled, received.modified)
+                ),
                 target: recorded.map(|sent| (sent, received.sender)),
             });
         }
@@ -72,6 +77,8 @@ fn reads_of(frames: &[&TrackedFrame], node: NodeKey) -> BTreeMap<(u128, u128), R
                     .or_insert(Reads {
                         first: frame.tick,
                         first_count: received.count,
+                        first_cancelled: received.cancelled,
+                        first_modified: received.modified,
                         last: frame.tick,
                         ticks: 1,
                     });
@@ -121,8 +128,14 @@ fn outputs_of(save: &TrackingSave, frames: &[&TrackedFrame], node: NodeKey) -> V
                     Link {
                         signal: signal.signal,
                         text: format!(
-                            "{name} ({}) to {receiver_name}, tick {}{more}",
-                            read.first_count, read.first
+                            "{} to {receiver_name}, tick {}{more}",
+                            counted(
+                                name,
+                                read.first_count,
+                                read.first_cancelled,
+                                read.first_modified
+                            ),
+                            read.first
                         ),
                         target: Some((read.first, *receiver)),
                     },

@@ -20,7 +20,9 @@ use crate::{
 pub const UNKNOWN_SENDER: u128 = u128::MAX;
 pub const TRACKER_WINDOW_TICKS: u64 = 4096;
 const MIN_TRIM_RUNS: usize = 64;
-const SNAPSHOT_MAGIC: [u8; 8] = *b"REACSTRK";
+const SNAPSHOT_MAGIC: [u8; 8] = *b"REACSTR2";
+const HASH_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const HASH_PRIME: u64 = 0x0000_0100_0000_01b3;
 const MAX_MESSAGE_BYTES: usize = 1 << 30;
 const MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
 
@@ -37,6 +39,8 @@ pub struct ReceivedCount {
     pub sent_tick: Option<u64>,
     pub windowed: bool,
     pub count: u64,
+    pub cancelled: u64,
+    pub modified: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +78,11 @@ struct LiveSignal {
     runs: Vec<SenderRun>,
     sent: Vec<SentCount>,
     received: Vec<ReceivedCount>,
+    born: Vec<(u64, u64)>,
+    suspects: Vec<u64>,
+    states: Vec<Option<SignalState>>,
+    old_bytes: Vec<u8>,
+    new_bytes: Vec<u8>,
 }
 
 impl LiveSignal {
@@ -94,24 +103,356 @@ impl LiveSignal {
         }
     }
 
+    fn row(
+        &mut self,
+        receiver: u128,
+        sender: u128,
+        sent_tick: Option<u64>,
+        windowed: bool,
+    ) -> &mut ReceivedCount {
+        let existing = self.received.iter().position(|x| {
+            x.receiver == receiver
+                && x.sender == sender
+                && x.sent_tick == sent_tick
+                && x.windowed == windowed
+        });
+        let index = existing.unwrap_or_else(|| {
+            self.received.push(ReceivedCount {
+                receiver,
+                sender,
+                sent_tick,
+                windowed,
+                count: 0,
+                cancelled: 0,
+                modified: 0,
+            });
+            self.received.len() - 1
+        });
+        &mut self.received[index]
+    }
+
     fn add_received(&mut self, receiver: u128, tally: Tally) {
         for (sender, sent_tick, windowed, count) in tally {
-            let existing = self.received.iter_mut().find(|x| {
-                x.receiver == receiver
-                    && x.sender == sender
-                    && x.sent_tick == sent_tick
-                    && x.windowed == windowed
+            self.row(receiver, sender, sent_tick, windowed).count += count;
+        }
+    }
+}
+
+struct PayloadHash(u64);
+
+impl Write for PayloadHash {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        for byte in bytes {
+            self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(HASH_PRIME);
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn payload_hash<S: Serialize>(payload: &S) -> u64 {
+    let mut hash = PayloadHash(HASH_OFFSET);
+    let _ = bincode::serialize_into(&mut hash, payload);
+    hash.0
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SignalState {
+    payload: u64,
+    cancelled: bool,
+    windowed: bool,
+    one_tick: bool,
+    running: bool,
+}
+
+fn sender_of(runs: &[SenderRun], id: u64) -> (u128, Option<u64>) {
+    let at = runs.partition_point(|run| run.end <= id);
+    let run = runs.get(at).filter(|run| run.start <= id);
+    (
+        run.map_or(UNKNOWN_SENDER, |run| run.sender),
+        run.map(|run| run.tick),
+    )
+}
+
+fn entry_in<S: Copy>(list: &[WindowEntry<S>], id: u64) -> Option<&WindowEntry<S>> {
+    list.binary_search_by_key(&id, |x| x.1.id)
+        .ok()
+        .map(|i| &list[i])
+}
+
+fn locate<S: SignalType>(signals: &Signals<S>, id: u64) -> Option<SignalState> {
+    let one_tick_copy = [&signals.transient, &signals.transient_buffer]
+        .into_iter()
+        .find_map(|list| {
+            let i = list.binary_search_by_key(&id, |x| x.id).ok()?;
+            Some(payload_hash(&list[i].payload))
+        });
+
+    let permanent = |range: Range<usize>| {
+        let list = &signals.permanent[range.clone()];
+        let i = list.binary_search_by_key(&id, |x| x.id).ok()?;
+        Some((range.start + i, &list[i]))
+    };
+    let found = permanent(0..signals.permanent_write)
+        .or_else(|| permanent(signals.permanent_read..signals.permanent.len()));
+    if let Some((position, instance)) = found {
+        return Some(SignalState {
+            payload: payload_hash(&instance.payload),
+            cancelled: signals.permanent_cancelled > 0
+                && signals.permanent_cancelled_bits.get(position),
+            windowed: true,
+            one_tick: false,
+            running: true,
+        });
+    }
+
+    let lists = [
+        (&signals.transitory_pending[..], false),
+        (&signals.permanent_joining[..], true),
+    ]
+    .into_iter()
+    .chain(
+        signals
+            .transitory_active
+            .iter()
+            .map(|chunk| (chunk.live(), true)),
+    )
+    .chain(
+        signals
+            .transitory_inactive
+            .iter()
+            .map(|chunk| (chunk.live(), false)),
+    );
+    for (list, running) in lists {
+        if let Some(entry) = entry_in(list, id) {
+            return Some(SignalState {
+                payload: payload_hash(&entry.1.payload),
+                cancelled: entry.0.is_cancelled(),
+                windowed: true,
+                one_tick: one_tick_copy.is_some(),
+                running,
             });
-            match existing {
-                Some(existing) => existing.count += count,
-                None => self.received.push(ReceivedCount {
-                    receiver,
-                    sender,
-                    sent_tick,
-                    windowed,
-                    count,
-                }),
+        }
+    }
+
+    one_tick_copy.map(|payload| SignalState {
+        payload,
+        cancelled: false,
+        windowed: false,
+        one_tick: true,
+        running: false,
+    })
+}
+
+fn same_prefix<T: Serialize>(
+    old: &[T],
+    new: &[T],
+    old_bytes: &mut Vec<u8>,
+    new_bytes: &mut Vec<u8>,
+) -> bool {
+    if old.len() > new.len() {
+        return false;
+    }
+    old_bytes.clear();
+    new_bytes.clear();
+    let _ = bincode::serialize_into(&mut *old_bytes, old);
+    let _ = bincode::serialize_into(&mut *new_bytes, &new[..old.len()]);
+    old_bytes == new_bytes
+}
+
+fn add_differences<T: Serialize>(
+    old: &[T],
+    new: &[T],
+    id: impl Fn(&T) -> u64,
+    live: &mut LiveSignal,
+) {
+    if same_prefix(old, new, &mut live.old_bytes, &mut live.new_bytes) {
+        return;
+    }
+    let mut at = 0;
+    for was in old {
+        while new.get(at).is_some_and(|x| id(x) < id(was)) {
+            at += 1;
+        }
+        let same = new.get(at).filter(|x| id(x) == id(was)).is_some_and(|now| {
+            live.old_bytes.clear();
+            live.new_bytes.clear();
+            let _ = bincode::serialize_into(&mut live.old_bytes, was);
+            let _ = bincode::serialize_into(&mut live.new_bytes, now);
+            live.old_bytes == live.new_bytes
+        });
+        if !same {
+            live.suspects.push(id(was));
+        }
+    }
+}
+
+fn capture_born<S: SignalType>(signals: &Signals<S>, start: u64, live: &mut LiveSignal) {
+    let first = live.born.len();
+    let buffer = &signals.transient_buffer;
+    let new = &buffer[buffer.partition_point(|x| x.id < start)..];
+    live.born
+        .extend(new.iter().map(|x| (x.id, payload_hash(&x.payload))));
+    let pending = &signals.transitory_pending;
+    let new = &pending[pending.partition_point(|x| x.1.id < start)..];
+    live.born
+        .extend(new.iter().map(|x| (x.1.id, payload_hash(&x.1.payload))));
+    live.born[first..].sort_unstable_by_key(|x| x.0);
+}
+
+fn add_changed_born<S: SignalType>(signals: &Signals<S>, live: &mut LiveSignal) {
+    let mut suspects = std::mem::take(&mut live.suspects);
+    let (mut in_buffer, mut in_pending) = (0, 0);
+    let (buffer, pending) = (&signals.transient_buffer, &signals.transitory_pending);
+    for (id, payload) in &live.born {
+        while buffer.get(in_buffer).is_some_and(|x| x.id < *id) {
+            in_buffer += 1;
+        }
+        while pending.get(in_pending).is_some_and(|x| x.1.id < *id) {
+            in_pending += 1;
+        }
+        let one_tick = buffer.get(in_buffer).filter(|x| x.id == *id);
+        let window = pending.get(in_pending).filter(|x| x.1.id == *id);
+        let unchanged = match (window, one_tick) {
+            (Some(entry), _) => {
+                !entry.0.is_cancelled() && payload_hash(&entry.1.payload) == *payload
             }
+            (None, Some(instance)) => payload_hash(&instance.payload) == *payload,
+            (None, None) => false,
+        };
+        if !unchanged {
+            suspects.push(*id);
+        }
+    }
+    live.suspects = suspects;
+}
+
+fn find_suspects<S: SignalType>(world: &World, copy: &World, live: &mut LiveSignal) -> bool {
+    live.suspects.clear();
+    let (Some(old), Some(new)) = (
+        world.get_resource::<Signals<S>>(),
+        copy.get_resource::<Signals<S>>(),
+    ) else {
+        return false;
+    };
+
+    let instance_id = |x: &SignalInstance<S>| x.id;
+    let entry_id = |x: &WindowEntry<S>| x.1.id;
+    add_differences(&old.transient, &new.transient, instance_id, live);
+    add_differences(
+        &old.transient_buffer,
+        &new.transient_buffer,
+        instance_id,
+        live,
+    );
+    add_differences(
+        &old.transitory_pending,
+        &new.transitory_pending,
+        entry_id,
+        live,
+    );
+    add_differences(
+        &old.permanent_joining,
+        &new.permanent_joining,
+        entry_id,
+        live,
+    );
+    for (old_chunks, new_chunks) in [
+        (&old.transitory_active, &new.transitory_active),
+        (&old.transitory_inactive, &new.transitory_inactive),
+    ] {
+        for (was, now) in old_chunks.iter().zip(new_chunks) {
+            add_differences(was.live(), now.live(), entry_id, live);
+        }
+    }
+
+    let ranges = [
+        0..old.permanent_write,
+        old.permanent_read..old.permanent.len(),
+    ];
+    for range in ranges {
+        add_differences(
+            &old.permanent[range.clone()],
+            &new.permanent[range.clone()],
+            instance_id,
+            live,
+        );
+        if old.permanent_cancelled != new.permanent_cancelled {
+            let mut position = range.start;
+            while position < range.end {
+                position = new.permanent_cancelled_bits.next_set(position, range.end);
+                if position < range.end && !old.permanent_cancelled_bits.get(position) {
+                    live.suspects.push(new.permanent[position].id);
+                }
+                position += 1;
+            }
+        }
+    }
+
+    add_changed_born(&new, live);
+    live.suspects.sort_unstable();
+    live.suspects.dedup();
+    !live.suspects.is_empty()
+}
+
+fn begin_attribution<S: SignalType>(copy: &World, live: &mut LiveSignal) {
+    live.states.clear();
+    if let Some(signals) = copy.get_resource::<Signals<S>>() {
+        let located = live.suspects.iter().map(|id| locate(&signals, *id));
+        live.states.extend(located);
+    }
+}
+
+fn cursor_before<S: SignalType>(copy: &World, system: u128) -> Option<(u64, u64)> {
+    let data = copy.get_resource::<SignalData<S>>()?;
+    cursor_of(&data, system)
+}
+
+fn attribute<S: SignalType>(
+    copy: &World,
+    system: u128,
+    tick: u64,
+    before: Option<(u64, u64)>,
+    live: &mut LiveSignal,
+) {
+    let (Some(signals), Some(data)) = (
+        copy.get_resource::<Signals<S>>(),
+        copy.get_resource::<SignalData<S>>(),
+    ) else {
+        return;
+    };
+    let after = cursor_of(&data, system);
+    let read_now = after.is_some_and(|x| x.1 == tick) && before.is_none_or(|x| x.1 != tick);
+    let counted_before_running = S::Filter::ACTIVE && before.is_some();
+    let from = before.map_or(0, |x| x.0);
+    let to = after.map_or(0, |x| x.0);
+
+    for index in 0..live.suspects.len() {
+        let id = live.suspects[index];
+        let now = locate(&signals, id);
+        let was = std::mem::replace(&mut live.states[index], now);
+        let Some(was) = was.filter(|was| !was.cancelled) else {
+            continue;
+        };
+        let cancelled = now.is_none_or(|now| now.cancelled);
+        let modified = now.is_some_and(|now| !now.cancelled && now.payload != was.payload);
+        if !cancelled && !modified {
+            continue;
+        }
+
+        let (sender, sent_tick) = sender_of(&live.runs, id);
+        let row = live.row(system, sender, sent_tick, was.windowed);
+        if modified {
+            row.modified += 1;
+            continue;
+        }
+        row.cancelled += 1;
+        let delivered = was.running || (was.one_tick && (from..to).contains(&id));
+        if read_now && delivered && !counted_before_running {
+            row.count += 1;
         }
     }
 }
@@ -313,6 +654,9 @@ fn after_system<S: SignalType>(
     };
 
     record_sent(&signals, data.next, system, tick, live);
+    if data.next > before.next {
+        capture_born(&signals, before.next, live);
+    }
 
     let Some((to, windows_tick)) = cursor_of(&data, system) else {
         return;
@@ -351,6 +695,7 @@ fn record_outside<S: SignalType>(world: &World, tick: u64, live: &mut LiveSignal
             return;
         }
         record_sent(&signals, data.next, ANONYMOUS_SYSTEM, tick, live);
+        live.born.clear();
     }
 }
 
@@ -366,6 +711,10 @@ struct SignalProbe {
     before: fn(&World, u128, &LiveSignal) -> Option<Before>,
     after: fn(&World, u128, u64, Before, &mut LiveSignal),
     outside: fn(&World, u64, &mut LiveSignal),
+    find_suspects: fn(&World, &World, &mut LiveSignal) -> bool,
+    begin_attribution: fn(&World, &mut LiveSignal),
+    cursor_before: fn(&World, u128) -> Option<(u64, u64)>,
+    attribute: fn(&World, u128, u64, Option<(u64, u64)>, &mut LiveSignal),
     baseline: fn(&World) -> u64,
 }
 
@@ -378,6 +727,10 @@ pub(crate) fn register_signal_probe<S: SignalType>() {
         before: before_system::<S>,
         after: after_system::<S>,
         outside: record_outside::<S>,
+        find_suspects: find_suspects::<S>,
+        begin_attribution: begin_attribution::<S>,
+        cursor_before: cursor_before::<S>,
+        attribute: attribute::<S>,
         baseline: baseline::<S>,
     };
     unsafe {
@@ -730,7 +1083,44 @@ impl Tracker {
             }
         }
 
+        self.attribute_changes(world, tick);
         self.finish_frame(tick);
+    }
+
+    fn attribute_changes(&mut self, world: &World, tick: u64) {
+        let Some(copy) = self.copy.as_mut() else {
+            return;
+        };
+        let mut touched = Vec::new();
+        for (index, (probe, live)) in probes().iter().zip(&mut self.live).enumerate() {
+            if (probe.find_suspects)(world, copy, live) {
+                touched.push(index);
+            }
+        }
+        if touched.is_empty() {
+            return;
+        }
+
+        copy_world(world, copy);
+        for index in &touched {
+            (probes()[*index].begin_attribution)(copy, &mut self.live[*index]);
+        }
+        for system in system_graph().iter() {
+            let cursors: Vec<_> = touched
+                .iter()
+                .map(|index| (probes()[*index].cursor_before)(copy, system.uuid))
+                .collect();
+            system.run(copy);
+            for (index, before) in touched.iter().zip(cursors) {
+                (probes()[*index].attribute)(
+                    copy,
+                    system.uuid,
+                    tick,
+                    before,
+                    &mut self.live[*index],
+                );
+            }
+        }
     }
 
     fn finish_frame(&mut self, tick: u64) {

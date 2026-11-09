@@ -99,6 +99,68 @@ fn track_canceller(mut pings: Mut<Signal<TrackPing>>, plan: Resource<TrackPlan>)
     }
 }
 
+#[signal]
+struct Acted(u64);
+
+#[signal]
+struct Untouched(u64);
+
+#[system]
+fn untouched_sender(mut signals: Mut<Signal<Untouched>>, plan: Resource<ActPlan>) {
+    if plan.kind == UNTOUCHED && signals.tick() == 0 {
+        signals.send(Untouched(1), ..);
+    }
+}
+
+#[resource]
+struct ActPlan {
+    kind: u64,
+    action: u64,
+    at: u64,
+    reads: bool,
+    id: u64,
+}
+
+const EMIT: u64 = 1;
+const WINDOW: u64 = 2;
+const OPEN: u64 = 3;
+const UNTOUCHED: u64 = 4;
+const CANCEL: u64 = 1;
+const MODIFY: u64 = 2;
+
+#[system]
+fn act_sender(mut signals: Mut<Signal<Acted>>, mut plan: Mut<Resource<ActPlan>>) {
+    let tick = signals.tick();
+    if tick != 0 {
+        return;
+    }
+    match plan.kind {
+        EMIT => plan.id = signals.emit(Acted(1)),
+        WINDOW => plan.id = signals.send(Acted(1), tick..tick + 8).unwrap(),
+        OPEN => plan.id = signals.send(Acted(1), ..).unwrap(),
+        _ => {}
+    }
+}
+
+#[system(run_after(act_sender))]
+fn act_meddler(mut signals: Mut<Signal<Acted>>, plan: Resource<ActPlan>) {
+    if plan.reads {
+        let _ = signals.receive().count();
+    }
+    if plan.at != signals.tick() + 1 {
+        return;
+    }
+    match plan.action {
+        CANCEL => {
+            signals.cancel(plan.id);
+        }
+        MODIFY => {
+            signals.modify(plan.id, Acted(2));
+        }
+        _ => {}
+    }
+}
+
 #[system]
 fn track_inbox_reader(mut pongs: Mut<Signal<TrackPong>>, inbox: LocalResource<TrackInbox>) {
     for i in 0..(*inbox).0.get() {
@@ -193,6 +255,7 @@ fn received(tracker: &Tracker, signal: &str) -> Vec<Row> {
     let mut out: Vec<Row> = frame
         .received
         .iter()
+        .filter(|x| x.count > 0)
         .map(|x| {
             (
                 short(log.system_name(x.receiver)),
@@ -208,6 +271,217 @@ fn received(tracker: &Tracker, signal: &str) -> Vec<Row> {
 
 fn row(receiver: &str, sender: &str, tick: Option<u64>, count: u64) -> Row {
     (receiver.to_string(), sender.to_string(), tick, count)
+}
+
+type Change = (String, String, Option<u64>, bool, u64, u64, u64);
+
+fn acted_on(tracker: &Tracker, tick: u64) -> Vec<Change> {
+    let log = tracker.log();
+    let Some(frame) = frame_of(log, tick, "Acted") else {
+        return Vec::new();
+    };
+    frame
+        .received
+        .iter()
+        .filter(|x| x.cancelled + x.modified > 0)
+        .map(|x| {
+            (
+                short(log.system_name(x.receiver)),
+                short(log.system_name(x.sender)),
+                x.sent_tick,
+                x.windowed,
+                x.count,
+                x.cancelled,
+                x.modified,
+            )
+        })
+        .collect()
+}
+
+fn run_plan(plan: ActPlan, ticks: u64) -> Tracker {
+    let mut world = World::new();
+    world.insert_resource(plan);
+    let mut tracker = world.to_tracker();
+    for _ in 0..ticks {
+        step(&mut tracker, &mut world);
+    }
+    tracker
+}
+
+fn change(tick: Option<u64>, windowed: bool, read: u64, cancelled: u64, modified: u64) -> Change {
+    (
+        "act_meddler".to_string(),
+        "act_sender".to_string(),
+        tick,
+        windowed,
+        read,
+        cancelled,
+        modified,
+    )
+}
+
+#[test]
+fn a_system_that_only_cancels_is_credited_with_the_sender() {
+    let tracker = run_plan(
+        ActPlan {
+            kind: EMIT,
+            action: CANCEL,
+            at: 1,
+            ..Default::default()
+        },
+        2,
+    );
+    assert_eq!(acted_on(&tracker, 0), [change(Some(0), false, 0, 1, 0)]);
+    assert!(acted_on(&tracker, 1).is_empty());
+}
+
+#[test]
+fn modifying_a_one_tick_signal_on_the_next_tick_is_recorded() {
+    let tracker = run_plan(
+        ActPlan {
+            kind: EMIT,
+            action: MODIFY,
+            at: 2,
+            ..Default::default()
+        },
+        3,
+    );
+    assert_eq!(acted_on(&tracker, 1), [change(Some(0), false, 0, 0, 1)]);
+}
+
+#[test]
+fn cancelling_a_window_on_its_send_tick_counts_once() {
+    let tracker = run_plan(
+        ActPlan {
+            kind: WINDOW,
+            action: CANCEL,
+            at: 1,
+            ..Default::default()
+        },
+        2,
+    );
+    assert_eq!(acted_on(&tracker, 0), [change(Some(0), true, 0, 1, 0)]);
+}
+
+#[test]
+fn modifying_a_window_on_its_send_tick_counts_once() {
+    let tracker = run_plan(
+        ActPlan {
+            kind: WINDOW,
+            action: MODIFY,
+            at: 1,
+            ..Default::default()
+        },
+        2,
+    );
+    assert_eq!(acted_on(&tracker, 0), [change(Some(0), true, 0, 0, 1)]);
+}
+
+#[test]
+fn a_running_window_can_be_cancelled_and_modified_later() {
+    for (action, expected) in [
+        (CANCEL, change(Some(0), true, 0, 1, 0)),
+        (MODIFY, change(Some(0), true, 0, 0, 1)),
+    ] {
+        let tracker = run_plan(
+            ActPlan {
+                kind: WINDOW,
+                action,
+                at: 4,
+                ..Default::default()
+            },
+            5,
+        );
+        assert_eq!(acted_on(&tracker, 3), [expected]);
+    }
+}
+
+#[test]
+fn a_permanent_signal_can_be_cancelled_and_modified_later() {
+    for (action, expected) in [
+        (CANCEL, change(Some(0), true, 0, 1, 0)),
+        (MODIFY, change(Some(0), true, 0, 0, 1)),
+    ] {
+        let tracker = run_plan(
+            ActPlan {
+                kind: OPEN,
+                action,
+                at: 6,
+                ..Default::default()
+            },
+            7,
+        );
+        assert_eq!(acted_on(&tracker, 5), [expected]);
+    }
+}
+
+#[test]
+fn reading_and_cancelling_share_one_record() {
+    let tracker = run_plan(
+        ActPlan {
+            kind: EMIT,
+            action: CANCEL,
+            at: 1,
+            reads: true,
+            ..Default::default()
+        },
+        2,
+    );
+    assert_eq!(acted_on(&tracker, 0), [change(Some(0), false, 1, 1, 0)]);
+}
+
+#[test]
+fn reading_and_cancelling_a_running_window_counts_the_read() {
+    let tracker = run_plan(
+        ActPlan {
+            kind: WINDOW,
+            action: CANCEL,
+            at: 4,
+            reads: true,
+            ..Default::default()
+        },
+        5,
+    );
+    assert_eq!(acted_on(&tracker, 3), [change(Some(0), true, 1, 1, 0)]);
+}
+
+#[test]
+fn a_signal_nobody_touches_records_no_change() {
+    let tracker = run_plan(
+        ActPlan {
+            kind: UNTOUCHED,
+            ..Default::default()
+        },
+        3,
+    );
+    assert!(
+        tracker
+            .log()
+            .frames()
+            .flat_map(|frame| &frame.signals)
+            .flat_map(|signal| &signal.received)
+            .all(|x| x.cancelled == 0 && x.modified == 0)
+    );
+}
+
+#[test]
+fn tracking_changes_does_not_affect_the_world() {
+    let plan = || ActPlan {
+        kind: OPEN,
+        action: CANCEL,
+        at: 3,
+        ..Default::default()
+    };
+    let mut plain = World::new();
+    plain.insert_resource(plan());
+    let mut tracked = World::new();
+    tracked.insert_resource(plan());
+    let mut tracker = tracked.to_tracker();
+    for _ in 0..6 {
+        plain.step();
+        step(&mut tracker, &mut tracked);
+    }
+    assert_eq!(plain.save(), tracked.save());
 }
 
 #[test]
