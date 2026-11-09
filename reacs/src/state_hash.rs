@@ -76,7 +76,7 @@ impl StateHasher {
         self.filled = 0;
         if self.used == 2 {
             self.used = 0;
-            self.state = mix(self.buffer[0] ^ BLOCK_KEY, self.buffer[1] ^ self.state);
+            self.state ^= mix(self.buffer[0] ^ BLOCK_KEY, self.buffer[1] ^ self.state);
         }
     }
 
@@ -378,7 +378,7 @@ named_fields!(SerializeStruct, SerializeStructVariant);
 
 #[cfg(test)]
 mod tests {
-    use super::{FIRST, hash_bytes, hash_value};
+    use super::{BLOCK_KEY, FIRST, hash_bytes, hash_value};
     use serde::Serialize;
 
     #[derive(Serialize)]
@@ -469,6 +469,14 @@ mod tests {
         assert_ne!(
             hash_value(&[1u64, 2, FIRST, 7]),
             hash_value(&[9u64, 2, FIRST, 7])
+        );
+    }
+
+    #[test]
+    fn a_word_equal_to_the_key_does_not_erase_what_came_before() {
+        assert_ne!(
+            hash_value(&[1u64, 2, BLOCK_KEY, 7]),
+            hash_value(&[9u64, 2, BLOCK_KEY, 7])
         );
     }
 
