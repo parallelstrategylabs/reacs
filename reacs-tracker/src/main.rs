@@ -1,9 +1,11 @@
 mod app;
 mod canvas;
 mod graph;
+mod hint;
 mod source;
 #[cfg(test)]
 mod test_support;
+mod trace;
 
 use app::TrackerApp;
 use source::Source;

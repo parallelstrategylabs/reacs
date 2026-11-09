@@ -63,8 +63,8 @@ impl Source {
                 if sender.send(event).is_err() {
                     return;
                 }
-                context.request_repaint();
                 if closed {
+                    context.request_repaint();
                     return;
                 }
             }
