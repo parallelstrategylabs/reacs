@@ -4,7 +4,6 @@ resolver = "2"
 members = [
     "derive",
     "reacs",
-    "reacs-tracker",
     "external-tests",
     "external-tests/plugins/leaf",
     "external-tests/plugins/mid",

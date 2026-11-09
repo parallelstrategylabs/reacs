@@ -15,7 +15,6 @@ use crate::{
     registry::get_registry_entry,
     resource::Resource,
     schedule::{CurrentSystem, Mut, WorldAccess, Write},
-    tracking::register_signal_probe,
     world::World,
 };
 
@@ -1091,8 +1090,6 @@ pub struct SweepCursor {
 }
 
 pub fn register_signal<S: SignalType>() {
-    register_signal_probe::<S>();
-
     unsafe {
         let ptr = addr_of_mut!(SIGNAL_REGISTRY);
         (*ptr)
