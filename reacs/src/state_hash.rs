@@ -17,13 +17,13 @@ fn mix(a: u64, b: u64) -> u64 {
     product as u64 ^ (product >> 64) as u64
 }
 
-pub(crate) fn hash_bytes(bytes: &[u8]) -> u64 {
+pub fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut hasher = StateHasher::new();
     hasher.write_bytes(bytes);
     hasher.finish()
 }
 
-pub(crate) fn hash_value<T: Serialize>(value: &T) -> u64 {
+pub fn hash_value<T: Serialize>(value: &T) -> u64 {
     let mut hasher = StateHasher::new();
     value
         .serialize(&mut hasher)

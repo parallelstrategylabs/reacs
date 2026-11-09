@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::state_hash::hash_bytes;
+use reacs::state_hash::hash_bytes;
 
 const MAGIC: &[u8; 8] = b"REACSSN1";
 const HEADER_BYTES: usize = 40;

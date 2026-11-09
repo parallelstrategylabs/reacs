@@ -49,7 +49,7 @@ where
     }
 }
 
-pub(crate) fn registered_ids() -> Vec<u128> {
+pub fn registered_ids() -> Vec<u128> {
     unsafe {
         let ptr = addr_of_mut!(REGISTRY);
         (*ptr)

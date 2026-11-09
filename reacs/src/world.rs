@@ -220,7 +220,7 @@ impl World {
         bincode::serialize(&(header, saved)).expect("failed to encode save")
     }
 
-    pub(crate) fn resource_hashes(&self) -> Vec<(u128, u64)> {
+    pub fn resource_hashes(&self) -> Vec<(u128, u64)> {
         self.resources
             .iter()
             .map(|(id, cell)| {
@@ -280,7 +280,7 @@ impl World {
         self.finish_load();
     }
 
-    pub(crate) fn restore_recorded(&mut self, bytes: &[u8]) -> Option<()> {
+    pub fn restore(&mut self, bytes: &[u8]) -> Option<()> {
         let mut body = bytes;
         let header: SaveHeader = bincode::deserialize_from(&mut body).ok()?;
         let saved: Vec<(u128, Vec<u8>)> = bincode::deserialize(body).ok()?;

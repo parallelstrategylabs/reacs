@@ -2,8 +2,7 @@ use std::{
     fmt,
     fs::File,
     io::{self, BufRead, BufReader, BufWriter, ErrorKind, Read, Write},
-    ops::Range,
-    path::{Path, PathBuf},
+    path::Path,
     ptr::addr_of_mut,
     rc::Rc,
 };
@@ -14,10 +13,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Tick,
     hashed::Hashed,
-    registry::{get_registry_entry, registered_ids},
+    registry::registered_ids,
     schedule::{Mut, system_graph},
     signal::{InputSignal, Signal, SignalData, SignalType, Signals},
-    snapshot::{SNAPSHOT_BUDGET_BYTES, SNAPSHOT_EVERY, SnapshotStore},
     state_hash::hash_bytes,
     world::World,
 };
@@ -35,6 +33,14 @@ struct InputEntry {
     next_id: fn(&World) -> u64,
     capture: fn(&World, u64, &mut Vec<Vec<u8>>),
     resend: fn(&mut World, &[u8]) -> bool,
+}
+
+pub fn send_recorded(world: &mut World, signal: u128, payload: &[u8]) -> bool {
+    let inputs = input_signals();
+    match inputs.binary_search_by_key(&signal, |input| input.uuid) {
+        Ok(at) => (inputs[at].resend)(world, payload),
+        Err(_) => false,
+    }
 }
 
 static mut INPUT_REGISTRY: Option<Vec<InputEntry>> = None;
@@ -109,7 +115,7 @@ pub(crate) fn init_input_signals(world: &mut World) {
     }
 }
 
-fn build_id() -> u64 {
+pub fn build_id() -> u64 {
     let mut registered = registered_ids();
     registered.sort_unstable();
 
@@ -309,189 +315,78 @@ impl World {
 }
 
 #[derive(Debug)]
-pub enum ReplayError {
+pub enum RecordingError {
     Io(io::Error),
-    NotAReplay,
+    NotARecording,
     DifferentBuild,
     Corrupted,
-    BeforeStart { tick: u64, start: u64 },
-    Diverged(Divergence),
 }
 
-impl fmt::Display for ReplayError {
+impl fmt::Display for RecordingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ReplayError::Io(error) => write!(f, "can't read the replay: {error}"),
-            ReplayError::NotAReplay => write!(f, "this file is not a replay"),
-            ReplayError::DifferentBuild => {
-                write!(f, "this replay was recorded by a different build")
+            RecordingError::Io(error) => write!(f, "can't read the recording: {error}"),
+            RecordingError::NotARecording => write!(f, "this file is not a recording"),
+            RecordingError::DifferentBuild => {
+                write!(f, "this recording was made by a different build")
             }
-            ReplayError::Corrupted => write!(f, "this replay is corrupted"),
-            ReplayError::BeforeStart { tick, start } => {
-                write!(
-                    f,
-                    "tick {tick} is before the recording, which starts at tick {start}"
-                )
-            }
-            ReplayError::Diverged(divergence) => {
-                match divergence.last_match {
-                    Some(last) => write!(
-                        f,
-                        "the replay diverged between ticks {last} and {}:",
-                        divergence.tick
-                    )?,
-                    None => write!(
-                        f,
-                        "the replay diverged at or before tick {}:",
-                        divergence.tick
-                    )?,
-                }
-                for resource in &divergence.resources {
-                    write!(f, " {}", resource.name)?;
-                }
-                Ok(())
-            }
+            RecordingError::Corrupted => write!(f, "this recording is corrupted"),
         }
     }
 }
 
-impl std::error::Error for ReplayError {}
+impl std::error::Error for RecordingError {}
 
-impl From<io::Error> for ReplayError {
+impl From<io::Error> for RecordingError {
     fn from(error: io::Error) -> Self {
-        ReplayError::Io(error)
+        RecordingError::Io(error)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResourceDifference {
-    pub name: &'static str,
-    pub expected: Option<u64>,
-    pub found: Option<u64>,
+pub struct RecordedInputs {
+    pub signal: u128,
+    pub payloads: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Divergence {
-    pub last_match: Option<u64>,
-    pub tick: u64,
-    pub resources: Vec<ResourceDifference>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReplayReport {
-    pub last_tick: u64,
-    pub inputs: u64,
-    pub hashes_checked: u64,
-    pub divergence: Option<Divergence>,
-    pub truncated: bool,
-}
-
-struct HashCheck {
-    table: Rc<[u128]>,
+pub struct RecordedHashes {
+    ids: Rc<[u128]>,
     values: Vec<u64>,
 }
 
-fn resource_name(id: u128) -> &'static str {
-    get_registry_entry(id).map_or("unregistered", |entry| entry.type_name)
-}
-
-fn differences(check: &HashCheck, found: &[(u128, u64)]) -> Vec<ResourceDifference> {
-    let mut out = Vec::new();
-    let (mut expected_at, mut found_at) = (0, 0);
-    while expected_at < check.table.len() || found_at < found.len() {
-        let expected_id = check.table.get(expected_at).copied().unwrap_or(u128::MAX);
-        let found_id = found.get(found_at).map_or(u128::MAX, |hash| hash.0);
-        if expected_id == found_id {
-            if check.values[expected_at] != found[found_at].1 {
-                out.push(ResourceDifference {
-                    name: resource_name(expected_id),
-                    expected: Some(check.values[expected_at]),
-                    found: Some(found[found_at].1),
-                });
-            }
-            expected_at += 1;
-            found_at += 1;
-        } else if expected_id < found_id {
-            out.push(ResourceDifference {
-                name: resource_name(expected_id),
-                expected: Some(check.values[expected_at]),
-                found: None,
-            });
-            expected_at += 1;
-        } else {
-            out.push(ResourceDifference {
-                name: resource_name(found_id),
-                expected: None,
-                found: Some(found[found_at].1),
-            });
-            found_at += 1;
-        }
+impl RecordedHashes {
+    pub fn ids(&self) -> &[u128] {
+        &self.ids
     }
-    out
-}
 
-struct TickItem {
-    tick: u64,
-    hash: Option<HashCheck>,
-    inputs: Vec<InputBatch>,
-}
-
-struct Segment {
-    tick: u64,
-    state: Vec<u8>,
-    items: Range<usize>,
-}
-
-#[derive(Default)]
-struct Progress {
-    inputs: u64,
-    hashes_checked: u64,
-    last_match: Option<u64>,
-}
-
-fn apply_item(
-    world: &mut World,
-    item: &TickItem,
-    progress: &mut Progress,
-) -> Result<Option<Divergence>, ReplayError> {
-    for batch in &item.inputs {
-        let input = input_signals()
-            .get(batch.kind as usize)
-            .ok_or(ReplayError::Corrupted)?;
-        for payload in &batch.payloads {
-            if !(input.resend)(world, payload) {
-                return Err(ReplayError::Corrupted);
-            }
-            progress.inputs += 1;
-        }
+    pub fn values(&self) -> &[u64] {
+        &self.values
     }
-    if let Some(check) = &item.hash {
-        progress.hashes_checked += 1;
-        let resources = differences(check, &world.resource_hashes());
-        if !resources.is_empty() {
-            return Ok(Some(Divergence {
-                last_match: progress.last_match,
-                tick: item.tick,
-                resources,
-            }));
-        }
-        progress.last_match = Some(item.tick);
+
+    pub fn iter(&self) -> impl Iterator<Item = (u128, u64)> + '_ {
+        self.ids.iter().copied().zip(self.values.iter().copied())
     }
-    Ok(None)
 }
 
-#[derive(Clone, Copy)]
-struct SnapshotSettings {
-    every: u64,
-    budget: u64,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedTick {
+    pub tick: u64,
+    pub inputs: Vec<RecordedInputs>,
+    pub hashes: Option<RecordedHashes>,
 }
 
-pub struct Replay {
-    path: PathBuf,
-    segments: Vec<Segment>,
-    items: Vec<TickItem>,
-    truncated: bool,
-    snapshots: Option<SnapshotSettings>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedSection {
+    pub tick: u64,
+    pub state: Vec<u8>,
+    pub ticks: Vec<RecordedTick>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recording {
+    pub sections: Vec<RecordedSection>,
+    pub truncated: bool,
 }
 
 fn read_state(reader: &mut impl Read, len: u64) -> io::Result<Option<Vec<u8>>> {
@@ -500,48 +395,47 @@ fn read_state(reader: &mut impl Read, len: u64) -> io::Result<Option<Vec<u8>>> {
     Ok((read as u64 == len).then_some(state))
 }
 
-impl Replay {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, ReplayError> {
-        let path = path.as_ref().to_path_buf();
-        let mut reader = BufReader::new(File::open(&path)?);
+impl Recording {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, RecordingError> {
+        let mut reader = BufReader::new(File::open(path)?);
 
         let mut magic = [0u8; 8];
         match reader.read_exact(&mut magic) {
             Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
-                return Err(ReplayError::NotAReplay);
+                return Err(RecordingError::NotARecording);
             }
             result => result?,
         }
         if &magic != MAGIC {
-            return Err(ReplayError::NotAReplay);
+            return Err(RecordingError::NotARecording);
         }
 
         let header: Header = options()
             .deserialize_from(&mut reader)
-            .map_err(|_| ReplayError::Corrupted)?;
+            .map_err(|_| RecordingError::Corrupted)?;
         if header.build_id != build_id() {
-            return Err(ReplayError::DifferentBuild);
+            return Err(RecordingError::DifferentBuild);
         }
-        let start_state =
-            read_state(&mut reader, header.state_len)?.ok_or(ReplayError::Corrupted)?;
+        let state = read_state(&mut reader, header.state_len)?.ok_or(RecordingError::Corrupted)?;
 
-        let mut replay = Self {
-            path,
-            snapshots: None,
-            segments: vec![Segment {
+        let mut recording = Self {
+            sections: vec![RecordedSection {
                 tick: header.start_tick,
-                state: start_state,
-                items: 0..0,
+                state,
+                ticks: Vec::new(),
             }],
-            items: Vec::new(),
             truncated: false,
         };
-        replay.truncated = replay.read_records(&mut reader)?;
-        Ok(replay)
+        recording.truncated = recording.read_records(&mut reader, &header.inputs)?;
+        Ok(recording)
     }
 
-    fn read_records(&mut self, reader: &mut BufReader<File>) -> Result<bool, ReplayError> {
-        let mut tick = self.segments[0].tick;
+    fn read_records(
+        &mut self,
+        reader: &mut BufReader<File>,
+        signals: &[u128],
+    ) -> Result<bool, RecordingError> {
+        let mut tick = self.sections[0].tick;
         let mut table: Rc<[u128]> = Rc::from(Vec::new());
         loop {
             if reader.fill_buf()?.is_empty() {
@@ -555,30 +449,42 @@ impl Replay {
                     {
                         return Ok(true);
                     }
-                    return Err(ReplayError::Corrupted);
+                    return Err(RecordingError::Corrupted);
                 }
             };
             match record {
                 Record::Tick { gap, hash, inputs } => {
-                    tick = tick.checked_add(gap).ok_or(ReplayError::Corrupted)?;
-                    let hash = match hash {
+                    tick = tick.checked_add(gap).ok_or(RecordingError::Corrupted)?;
+                    let hashes = match hash {
                         Some(record) => {
                             if let Some(new_table) = record.table {
                                 table = Rc::from(new_table);
                             }
                             if record.values.len() != table.len() {
-                                return Err(ReplayError::Corrupted);
+                                return Err(RecordingError::Corrupted);
                             }
-                            Some(HashCheck {
-                                table: Rc::clone(&table),
+                            Some(RecordedHashes {
+                                ids: Rc::clone(&table),
                                 values: record.values,
                             })
                         }
                         None => None,
                     };
-                    self.items.push(TickItem { tick, hash, inputs });
-                    let segment = self.segments.last_mut().unwrap();
-                    segment.items.end = self.items.len();
+                    let mut recorded = Vec::with_capacity(inputs.len());
+                    for batch in inputs {
+                        let signal = signals
+                            .get(batch.kind as usize)
+                            .ok_or(RecordingError::Corrupted)?;
+                        recorded.push(RecordedInputs {
+                            signal: *signal,
+                            payloads: batch.payloads,
+                        });
+                    }
+                    self.sections.last_mut().unwrap().ticks.push(RecordedTick {
+                        tick,
+                        inputs: recorded,
+                        hashes,
+                    });
                 }
                 Record::Section {
                     tick: section,
@@ -588,278 +494,13 @@ impl Replay {
                         return Ok(true);
                     };
                     tick = section;
-                    self.segments.push(Segment {
+                    self.sections.push(RecordedSection {
                         tick,
                         state,
-                        items: self.items.len()..self.items.len(),
+                        ticks: Vec::new(),
                     });
                 }
             }
         }
-    }
-
-    fn snapshot_settings(&mut self) -> &mut SnapshotSettings {
-        self.snapshots.get_or_insert(SnapshotSettings {
-            every: SNAPSHOT_EVERY,
-            budget: SNAPSHOT_BUDGET_BYTES,
-        })
-    }
-
-    pub fn with_snapshots(mut self) -> Self {
-        self.snapshot_settings();
-        self
-    }
-
-    pub fn with_snapshot_every(mut self, ticks: u64) -> Self {
-        assert!(ticks > 0, "snapshot_every must be at least 1");
-        self.snapshot_settings().every = ticks;
-        self
-    }
-
-    pub fn with_snapshot_budget(mut self, bytes: u64) -> Self {
-        self.snapshot_settings().budget = bytes;
-        self
-    }
-
-    pub fn snapshot_folder(&self) -> PathBuf {
-        let mut name = self.path.clone().into_os_string();
-        name.push(".snapshots");
-        PathBuf::from(name)
-    }
-
-    fn owner(&self, tick: u64) -> Option<usize> {
-        self.segments.iter().rposition(|x| x.tick <= tick)
-    }
-
-    fn recorded_until(&self, segment: usize) -> u64 {
-        let segment = &self.segments[segment];
-        self.items[segment.items.clone()]
-            .last()
-            .map_or(segment.tick, |item| item.tick)
-    }
-
-    pub fn start_tick(&self) -> u64 {
-        self.segments.iter().map(|x| x.tick).min().unwrap()
-    }
-
-    pub fn last_tick(&self) -> u64 {
-        self.recorded_until(self.segments.len() - 1)
-    }
-
-    pub fn verify(&self) -> Result<ReplayReport, ReplayError> {
-        let mut world = World::new();
-        let mut progress = Progress::default();
-        let mut report = ReplayReport {
-            last_tick: self.segments[0].tick,
-            inputs: 0,
-            hashes_checked: 0,
-            divergence: None,
-            truncated: self.truncated,
-        };
-
-        for segment in &self.segments {
-            world
-                .restore_recorded(&segment.state)
-                .ok_or(ReplayError::Corrupted)?;
-            report.last_tick = segment.tick;
-            progress.last_match = None;
-
-            for item in &self.items[segment.items.clone()] {
-                while current_tick(&world) < item.tick {
-                    world.step();
-                }
-                report.last_tick = item.tick;
-                report.divergence = apply_item(&mut world, item, &mut progress)?;
-                report.inputs = progress.inputs;
-                report.hashes_checked = progress.hashes_checked;
-                if report.divergence.is_some() {
-                    return Ok(report);
-                }
-            }
-        }
-        Ok(report)
-    }
-
-    pub fn seek(&self, tick: u64) -> Result<ReplayPlayer<'_>, ReplayError> {
-        let segment = self.owner(tick).ok_or(ReplayError::BeforeStart {
-            tick,
-            start: self.start_tick(),
-        })?;
-        let store = self
-            .snapshots
-            .map(|_| SnapshotStore::open(self.snapshot_folder(), build_id()));
-        let mut player = ReplayPlayer {
-            replay: self,
-            world: World::new(),
-            segment,
-            next: 0,
-            progress: Progress::default(),
-            store,
-            started_at: 0,
-            last_snapshot: 0,
-            snapshots_written: 0,
-            snapshot_error: None,
-        };
-        if !player.enter_snapshot(segment, tick) {
-            player.enter(segment)?;
-        }
-        player.started_at = player.tick();
-        while player.tick() < tick {
-            player.advance()?;
-        }
-        Ok(player)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PlayerReport {
-    pub tick: u64,
-    pub inputs: u64,
-    pub hashes_checked: u64,
-    pub past_recording: bool,
-    pub started_at: u64,
-    pub snapshots_written: u64,
-}
-
-pub struct ReplayPlayer<'a> {
-    replay: &'a Replay,
-    world: World,
-    segment: usize,
-    next: usize,
-    progress: Progress,
-    store: Option<SnapshotStore>,
-    started_at: u64,
-    last_snapshot: u64,
-    snapshots_written: u64,
-    snapshot_error: Option<io::Error>,
-}
-
-impl ReplayPlayer<'_> {
-    pub fn snapshot_error(&self) -> Option<&io::Error> {
-        self.snapshot_error.as_ref()
-    }
-
-    pub fn world(&self) -> &World {
-        &self.world
-    }
-
-    pub fn tick(&self) -> u64 {
-        current_tick(&self.world)
-    }
-
-    pub fn report(&self) -> PlayerReport {
-        let tick = self.tick();
-        PlayerReport {
-            tick,
-            inputs: self.progress.inputs,
-            hashes_checked: self.progress.hashes_checked,
-            past_recording: tick > self.replay.recorded_until(self.segment),
-            started_at: self.started_at,
-            snapshots_written: self.snapshots_written,
-        }
-    }
-
-    pub fn advance(&mut self) -> Result<(), ReplayError> {
-        let tick = self.tick() + 1;
-        let owner = self.replay.owner(tick).unwrap_or(self.segment);
-        if owner != self.segment {
-            return self.enter(owner);
-        }
-        self.world.step();
-        self.apply()
-    }
-
-    fn enter(&mut self, segment: usize) -> Result<(), ReplayError> {
-        let entered = &self.replay.segments[segment];
-        self.world
-            .restore_recorded(&entered.state)
-            .ok_or(ReplayError::Corrupted)?;
-        self.segment = segment;
-        self.next = entered.items.start;
-        self.progress.last_match = None;
-        self.last_snapshot = entered.tick;
-        self.apply()
-    }
-
-    fn enter_snapshot(&mut self, segment: usize, tick: u64) -> bool {
-        let replay = self.replay;
-        let items = replay.segments[segment].items.clone();
-        loop {
-            let Some(store) = &mut self.store else {
-                return false;
-            };
-            let Some(at) = store.latest(segment as u64, tick) else {
-                return false;
-            };
-
-            let index = items.start + replay.items[items.clone()].partition_point(|x| x.tick < at);
-            let check = replay.items[..items.end]
-                .get(index)
-                .filter(|item| item.tick == at)
-                .and_then(|item| item.hash.as_ref());
-            let restored = check.is_some_and(|check| {
-                store.read(segment as u64, at).is_some_and(|state| {
-                    self.world.restore_recorded(&state).is_some()
-                        && differences(check, &self.world.resource_hashes()).is_empty()
-                })
-            });
-            if !restored {
-                store.remove(segment as u64, at);
-                continue;
-            }
-
-            self.segment = segment;
-            self.next = index + 1;
-            self.progress.hashes_checked += 1;
-            self.progress.last_match = Some(at);
-            self.last_snapshot = at;
-            return true;
-        }
-    }
-
-    fn write_snapshot(&mut self, tick: u64) {
-        let (Some(settings), Some(store)) = (self.replay.snapshots, &mut self.store) else {
-            return;
-        };
-        if self.snapshot_error.is_some() {
-            return;
-        }
-        let segment = self.segment as u64;
-        if store.contains(segment, tick) {
-            self.last_snapshot = tick;
-            return;
-        }
-        if tick - self.last_snapshot < settings.every {
-            return;
-        }
-
-        let starts: Vec<u64> = self.replay.segments.iter().map(|x| x.tick).collect();
-        match store.write(segment, tick, &self.world.save(), settings.budget, &starts) {
-            Ok(true) => {
-                self.snapshots_written += 1;
-                self.last_snapshot = tick;
-            }
-            Ok(false) => {}
-            Err(error) => self.snapshot_error = Some(error),
-        }
-    }
-
-    fn apply(&mut self) -> Result<(), ReplayError> {
-        let tick = self.tick();
-        let end = self.replay.segments[self.segment].items.end;
-        while self.next < end && self.replay.items[self.next].tick <= tick {
-            let item = &self.replay.items[self.next];
-            self.next += 1;
-            if item.tick < tick {
-                continue;
-            }
-            if let Some(divergence) = apply_item(&mut self.world, item, &mut self.progress)? {
-                return Err(ReplayError::Diverged(divergence));
-            }
-            if item.hash.is_some() {
-                self.write_snapshot(tick);
-            }
-        }
-        Ok(())
     }
 }
