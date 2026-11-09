@@ -3,7 +3,7 @@ use std::{
     fs::File,
     io::{self, BufRead, BufReader, BufWriter, ErrorKind, Read, Write},
     ops::Range,
-    path::Path,
+    path::{Path, PathBuf},
     ptr::addr_of_mut,
     rc::Rc,
 };
@@ -17,6 +17,7 @@ use crate::{
     registry::{get_registry_entry, registered_ids},
     schedule::{Mut, system_graph},
     signal::{InputSignal, Signal, SignalData, SignalType, Signals},
+    snapshot::{SNAPSHOT_BUDGET_BYTES, SNAPSHOT_EVERY, SnapshotStore},
     state_hash::hash_bytes,
     world::World,
 };
@@ -479,10 +480,18 @@ fn apply_item(
     Ok(None)
 }
 
+#[derive(Clone, Copy)]
+struct SnapshotSettings {
+    every: u64,
+    budget: u64,
+}
+
 pub struct Replay {
+    path: PathBuf,
     segments: Vec<Segment>,
     items: Vec<TickItem>,
     truncated: bool,
+    snapshots: Option<SnapshotSettings>,
 }
 
 fn read_state(reader: &mut impl Read, len: u64) -> io::Result<Option<Vec<u8>>> {
@@ -493,7 +502,8 @@ fn read_state(reader: &mut impl Read, len: u64) -> io::Result<Option<Vec<u8>>> {
 
 impl Replay {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ReplayError> {
-        let mut reader = BufReader::new(File::open(path)?);
+        let path = path.as_ref().to_path_buf();
+        let mut reader = BufReader::new(File::open(&path)?);
 
         let mut magic = [0u8; 8];
         match reader.read_exact(&mut magic) {
@@ -516,6 +526,8 @@ impl Replay {
             read_state(&mut reader, header.state_len)?.ok_or(ReplayError::Corrupted)?;
 
         let mut replay = Self {
+            path,
+            snapshots: None,
             segments: vec![Segment {
                 tick: header.start_tick,
                 state: start_state,
@@ -586,6 +598,35 @@ impl Replay {
         }
     }
 
+    fn snapshot_settings(&mut self) -> &mut SnapshotSettings {
+        self.snapshots.get_or_insert(SnapshotSettings {
+            every: SNAPSHOT_EVERY,
+            budget: SNAPSHOT_BUDGET_BYTES,
+        })
+    }
+
+    pub fn with_snapshots(mut self) -> Self {
+        self.snapshot_settings();
+        self
+    }
+
+    pub fn with_snapshot_every(mut self, ticks: u64) -> Self {
+        assert!(ticks > 0, "snapshot_every must be at least 1");
+        self.snapshot_settings().every = ticks;
+        self
+    }
+
+    pub fn with_snapshot_budget(mut self, bytes: u64) -> Self {
+        self.snapshot_settings().budget = bytes;
+        self
+    }
+
+    pub fn snapshot_folder(&self) -> PathBuf {
+        let mut name = self.path.clone().into_os_string();
+        name.push(".snapshots");
+        PathBuf::from(name)
+    }
+
     fn owner(&self, tick: u64) -> Option<usize> {
         self.segments.iter().rposition(|x| x.tick <= tick)
     }
@@ -644,14 +685,25 @@ impl Replay {
             tick,
             start: self.start_tick(),
         })?;
+        let store = self
+            .snapshots
+            .map(|_| SnapshotStore::open(self.snapshot_folder(), build_id()));
         let mut player = ReplayPlayer {
             replay: self,
             world: World::new(),
             segment,
             next: 0,
             progress: Progress::default(),
+            store,
+            started_at: 0,
+            last_snapshot: 0,
+            snapshots_written: 0,
+            snapshot_error: None,
         };
-        player.enter(segment)?;
+        if !player.enter_snapshot(segment, tick) {
+            player.enter(segment)?;
+        }
+        player.started_at = player.tick();
         while player.tick() < tick {
             player.advance()?;
         }
@@ -665,6 +717,8 @@ pub struct PlayerReport {
     pub inputs: u64,
     pub hashes_checked: u64,
     pub past_recording: bool,
+    pub started_at: u64,
+    pub snapshots_written: u64,
 }
 
 pub struct ReplayPlayer<'a> {
@@ -673,9 +727,18 @@ pub struct ReplayPlayer<'a> {
     segment: usize,
     next: usize,
     progress: Progress,
+    store: Option<SnapshotStore>,
+    started_at: u64,
+    last_snapshot: u64,
+    snapshots_written: u64,
+    snapshot_error: Option<io::Error>,
 }
 
 impl ReplayPlayer<'_> {
+    pub fn snapshot_error(&self) -> Option<&io::Error> {
+        self.snapshot_error.as_ref()
+    }
+
     pub fn world(&self) -> &World {
         &self.world
     }
@@ -691,6 +754,8 @@ impl ReplayPlayer<'_> {
             inputs: self.progress.inputs,
             hashes_checked: self.progress.hashes_checked,
             past_recording: tick > self.replay.recorded_until(self.segment),
+            started_at: self.started_at,
+            snapshots_written: self.snapshots_written,
         }
     }
 
@@ -712,7 +777,71 @@ impl ReplayPlayer<'_> {
         self.segment = segment;
         self.next = entered.items.start;
         self.progress.last_match = None;
+        self.last_snapshot = entered.tick;
         self.apply()
+    }
+
+    fn enter_snapshot(&mut self, segment: usize, tick: u64) -> bool {
+        let replay = self.replay;
+        let items = replay.segments[segment].items.clone();
+        loop {
+            let Some(store) = &mut self.store else {
+                return false;
+            };
+            let Some(at) = store.latest(segment as u64, tick) else {
+                return false;
+            };
+
+            let index = items.start + replay.items[items.clone()].partition_point(|x| x.tick < at);
+            let check = replay.items[..items.end]
+                .get(index)
+                .filter(|item| item.tick == at)
+                .and_then(|item| item.hash.as_ref());
+            let restored = check.is_some_and(|check| {
+                store.read(segment as u64, at).is_some_and(|state| {
+                    self.world.restore_recorded(&state).is_some()
+                        && differences(check, &self.world.resource_hashes()).is_empty()
+                })
+            });
+            if !restored {
+                store.remove(segment as u64, at);
+                continue;
+            }
+
+            self.segment = segment;
+            self.next = index + 1;
+            self.progress.hashes_checked += 1;
+            self.progress.last_match = Some(at);
+            self.last_snapshot = at;
+            return true;
+        }
+    }
+
+    fn write_snapshot(&mut self, tick: u64) {
+        let (Some(settings), Some(store)) = (self.replay.snapshots, &mut self.store) else {
+            return;
+        };
+        if self.snapshot_error.is_some() {
+            return;
+        }
+        let segment = self.segment as u64;
+        if store.contains(segment, tick) {
+            self.last_snapshot = tick;
+            return;
+        }
+        if tick - self.last_snapshot < settings.every {
+            return;
+        }
+
+        let starts: Vec<u64> = self.replay.segments.iter().map(|x| x.tick).collect();
+        match store.write(segment, tick, &self.world.save(), settings.budget, &starts) {
+            Ok(true) => {
+                self.snapshots_written += 1;
+                self.last_snapshot = tick;
+            }
+            Ok(false) => {}
+            Err(error) => self.snapshot_error = Some(error),
+        }
     }
 
     fn apply(&mut self) -> Result<(), ReplayError> {
@@ -726,6 +855,9 @@ impl ReplayPlayer<'_> {
             }
             if let Some(divergence) = apply_item(&mut self.world, item, &mut self.progress)? {
                 return Err(ReplayError::Diverged(divergence));
+            }
+            if item.hash.is_some() {
+                self.write_snapshot(tick);
             }
         }
         Ok(())

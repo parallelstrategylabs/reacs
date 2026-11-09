@@ -620,3 +620,170 @@ fn seeking_past_the_last_record_runs_on_with_no_inputs() {
     assert!(player.world().save() == at_19);
     assert!(replay.seek(22).unwrap().world().save() == at_22);
 }
+
+fn record_run(file: &PathBuf, ticks: u64, extra: u64) -> Vec<Vec<u8>> {
+    let mut world = World::new();
+    let mut recorder = world.to_recorder(file).unwrap().with_hash_every(8);
+    let saves = play_saving(&mut world, &mut recorder, 0..ticks, extra);
+    recorder.finish().unwrap();
+    saves
+}
+
+fn snapshot_files(replay: &Replay) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = fs::read_dir(replay.snapshot_folder())
+        .into_iter()
+        .flatten()
+        .map(|file| file.unwrap().path())
+        .collect();
+    files.sort();
+    files
+}
+
+fn remove_recording(file: &PathBuf, replay: &Replay) {
+    for snapshot in snapshot_files(replay) {
+        fs::remove_file(snapshot).unwrap();
+    }
+    let _ = fs::remove_dir(replay.snapshot_folder());
+    fs::remove_file(file).unwrap();
+}
+
+#[test]
+fn a_second_trip_starts_from_the_nearest_snapshot() {
+    let file = path("snapshots");
+    let saves = record_run(&file, 300, 0);
+    let replay = Replay::open(&file).unwrap().with_snapshot_every(32);
+
+    let first = replay.seek(250).unwrap();
+    assert!(first.world().save() == saves[250]);
+    let report = first.report();
+    assert_eq!((report.started_at, report.snapshots_written), (0, 7));
+    assert_eq!(snapshot_files(&replay).len(), 7);
+
+    for (tick, start, hashes) in [(250, 224, 4), (100, 96, 1), (63, 32, 4), (20, 0, 3)] {
+        let player = replay.seek(tick).unwrap();
+        assert!(player.world().save() == saves[tick as usize], "tick {tick}");
+        let report = player.report();
+        assert_eq!(report.started_at, start);
+        assert_eq!(report.hashes_checked, hashes);
+        assert_eq!(report.snapshots_written, 0);
+        assert!(player.snapshot_error().is_none());
+    }
+
+    let mut player = replay.seek(224).unwrap();
+    assert_eq!(player.report().started_at, 224);
+    for _ in 0..70 {
+        player.advance().unwrap();
+    }
+    assert!(player.world().save() == saves[294]);
+    assert_eq!(player.report().snapshots_written, 2);
+    remove_recording(&file, &replay);
+}
+
+#[test]
+fn seeking_without_snapshots_writes_no_folder() {
+    let file = path("no-snapshots");
+    record_run(&file, 100, 0);
+    let replay = Replay::open(&file).unwrap();
+    replay.seek(90).unwrap();
+
+    assert!(!replay.snapshot_folder().exists());
+    remove_recording(&file, &replay);
+}
+
+#[test]
+fn snapshots_of_another_recording_are_dropped_and_rebuilt() {
+    let file = path("stale");
+    record_run(&file, 300, 0);
+    let replay = Replay::open(&file).unwrap().with_snapshot_every(32);
+    replay.seek(250).unwrap();
+    let stale = snapshot_files(&replay);
+
+    let saves = record_run(&file, 300, 1000);
+    let replay = Replay::open(&file).unwrap().with_snapshot_every(32);
+    assert_eq!(snapshot_files(&replay), stale);
+
+    let player = replay.seek(250).unwrap();
+    assert!(player.world().save() == saves[250]);
+    let report = player.report();
+    assert_eq!((report.started_at, report.snapshots_written), (0, 7));
+
+    let player = replay.seek(250).unwrap();
+    assert!(player.world().save() == saves[250]);
+    assert_eq!(player.report().started_at, 224);
+    remove_recording(&file, &replay);
+}
+
+#[test]
+fn a_damaged_snapshot_is_skipped_and_written_again() {
+    let file = path("damaged");
+    let saves = record_run(&file, 300, 0);
+    let replay = Replay::open(&file).unwrap().with_snapshot_every(32);
+    replay.seek(250).unwrap();
+
+    let newest = replay.snapshot_folder().join("0-224.snap");
+    let mut bytes = fs::read(&newest).unwrap();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0x10;
+    fs::write(&newest, &bytes).unwrap();
+    fs::write(replay.snapshot_folder().join("0-192.snap"), b"cut").unwrap();
+
+    let player = replay.seek(250).unwrap();
+    assert!(player.world().save() == saves[250]);
+    let report = player.report();
+    assert_eq!((report.started_at, report.snapshots_written), (160, 2));
+    assert_eq!(replay.seek(250).unwrap().report().started_at, 224);
+    remove_recording(&file, &replay);
+}
+
+#[test]
+fn snapshots_stay_inside_their_budget() {
+    let file = path("budget");
+    let saves = record_run(&file, 600, 0);
+    let one = saves[300].len() as u64 + 40;
+    let replay = Replay::open(&file)
+        .unwrap()
+        .with_snapshot_every(16)
+        .with_snapshot_budget(one * 5 + one / 2);
+
+    let player = replay.seek(590).unwrap();
+    assert!(player.world().save() == saves[590]);
+    assert!(player.report().snapshots_written > 30);
+
+    let files = snapshot_files(&replay);
+    let total: u64 = files.iter().map(|x| fs::metadata(x).unwrap().len()).sum();
+    assert!(files.len() >= 4 && total <= one * 5 + one / 2, "{files:?}");
+    assert!(replay.seek(590).unwrap().report().started_at >= 560);
+    assert!(replay.seek(40).unwrap().world().save() == saves[40]);
+    remove_recording(&file, &replay);
+}
+
+#[test]
+fn each_section_keeps_its_own_snapshots() {
+    let file = path("section-snapshots");
+    let mut world = World::new();
+    let mut recorder = world.to_recorder(&file).unwrap().with_hash_every(4);
+    let before = play_saving(&mut world, &mut recorder, 0..10, 0);
+    let save = world.save();
+    play_saving(&mut world, &mut recorder, 10..30, 0);
+    world.load(&save);
+    let kept = play_saving(&mut world, &mut recorder, 10..30, 1000);
+    recorder.finish().unwrap();
+
+    let replay = Replay::open(&file).unwrap().with_snapshot_every(8);
+    assert_eq!(replay.seek(29).unwrap().report().snapshots_written, 2);
+    assert_eq!(replay.seek(9).unwrap().report().snapshots_written, 1);
+
+    let player = replay.seek(29).unwrap();
+    assert_eq!(player.report().started_at, 28);
+    assert!(player.world().save() == kept[19]);
+    let player = replay.seek(9).unwrap();
+    assert_eq!(player.report().started_at, 8);
+    assert!(player.world().save() == before[9]);
+
+    let mut player = replay.seek(9).unwrap();
+    for _ in 0..12 {
+        player.advance().unwrap();
+    }
+    assert!(player.world().save() == kept[11]);
+    remove_recording(&file, &replay);
+}
