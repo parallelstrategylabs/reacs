@@ -576,6 +576,119 @@ fn changes_record_which_signal_and_its_new_payload() {
     assert_eq!(frame.changes[0].payload, None);
 }
 
+fn signal_id(tracker: &Tracker, name: &str) -> u128 {
+    let log = tracker.log();
+    log.signal_ids()
+        .find(|id| log.signal_name(*id).ends_with(name))
+        .unwrap()
+}
+
+fn tracked_with(plan: ActPlan, window: u64, ticks: u64) -> Tracker {
+    let mut world = World::new();
+    world.insert_resource(plan);
+    let mut tracker = world.to_tracker().with_window(window);
+    for _ in 0..ticks {
+        step(&mut tracker, &mut world);
+    }
+    tracker
+}
+
+#[test]
+fn every_signal_is_recorded_by_default() {
+    let mut world = world_with(TrackPlan {
+        emits_a: 1000,
+        ..Default::default()
+    });
+    let mut tracker = world.to_tracker();
+    step(&mut tracker, &mut world);
+    let frame = recorded_details(&tracker, "TrackPing", 0);
+    assert_eq!(frame.instances.len(), 1000);
+    assert_eq!(frame.instances_omitted, 0);
+}
+
+fn busy_tracker(limit: u64, ticks: u64) -> Tracker {
+    let mut world = world_with(TrackPlan {
+        emits_a: 100,
+        ..Default::default()
+    });
+    let mut tracker = world.to_tracker().with_memory_limit(limit);
+    for _ in 0..ticks {
+        step(&mut tracker, &mut world);
+    }
+    tracker
+}
+
+#[test]
+fn the_memory_limit_drops_the_oldest_ticks() {
+    let tracker = busy_tracker(30_000, 20);
+    let log = tracker.log();
+    let frames: Vec<u64> = log.frames().map(|x| x.tick).collect();
+    assert!(frames.len() < 20, "{}", frames.len());
+    assert_eq!(*frames.last().unwrap(), 19);
+    assert_eq!(log.tick_range(), frames[0]..20);
+}
+
+#[test]
+fn the_newest_tick_survives_even_past_the_memory_limit() {
+    let tracker = busy_tracker(1, 5);
+    let frames: Vec<u64> = tracker.log().frames().map(|x| x.tick).collect();
+    assert_eq!(frames, [4]);
+}
+
+#[test]
+#[should_panic(expected = "needs some memory")]
+fn a_memory_limit_of_zero_is_rejected() {
+    let world = World::new();
+    let _ = world.to_tracker().with_memory_limit(0);
+}
+
+#[test]
+fn a_running_window_keeps_its_details_after_its_send_tick_leaves() {
+    let tracker = tracked_with(
+        ActPlan {
+            kind: OPEN,
+            ..Default::default()
+        },
+        2,
+        10,
+    );
+    assert_eq!(tracker.log().tick_range(), 8..10);
+    let (instances, omitted) = tracker
+        .log()
+        .sent_instances(0, signal_id(&tracker, "Acted"))
+        .expect("the signal is still running");
+    assert_eq!(instances[0].payload, "Acted { _: 1 }");
+    assert_eq!(omitted, 0);
+}
+
+#[test]
+fn a_finished_window_forgets_its_details() {
+    let plan = || ActPlan {
+        kind: WINDOW,
+        ..Default::default()
+    };
+    let running = tracked_with(plan(), 2, 6);
+    let id = signal_id(&running, "Acted");
+    assert!(running.log().sent_instances(0, id).is_some());
+
+    let finished = tracked_with(plan(), 2, 12);
+    assert!(finished.log().sent_instances(0, id).is_none());
+}
+
+#[test]
+fn kept_details_survive_a_save() {
+    let tracker = tracked_with(
+        ActPlan {
+            kind: OPEN,
+            ..Default::default()
+        },
+        2,
+        10,
+    );
+    let loaded = TrackingSave::from_bytes(&tracker.snapshot()).unwrap();
+    assert_eq!(&loaded, tracker.log());
+}
+
 #[test]
 fn a_signal_nobody_touches_records_no_change() {
     let tracker = run_plan(

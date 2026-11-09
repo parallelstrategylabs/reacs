@@ -20,9 +20,10 @@ use crate::{
 
 pub const UNKNOWN_SENDER: u128 = u128::MAX;
 pub const TRACKER_WINDOW_TICKS: u64 = 4096;
-pub const TRACKER_PAYLOADS_PER_TICK: u64 = 64;
+pub const TRACKER_PAYLOADS_PER_TICK: u64 = u64::MAX;
+pub const TRACKER_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
 const MIN_TRIM_RUNS: usize = 64;
-const SNAPSHOT_MAGIC: [u8; 8] = *b"REACSTR3";
+const SNAPSHOT_MAGIC: [u8; 8] = *b"REACSTR4";
 const HASH_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const HASH_PRIME: u64 = 0x0000_0100_0000_01b3;
 const MAX_MESSAGE_BYTES: usize = 1 << 30;
@@ -875,6 +876,41 @@ pub struct TrackingSave {
     end_tick: u64,
     frames: VecDeque<TrackedFrame>,
     intervals: BTreeMap<u64, TrackedInterval>,
+    memory_limit: u64,
+    used_bytes: u64,
+    kept: BTreeMap<(u128, u64), KeptInstances>,
+    next_kept_end: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct KeptInstances {
+    latest_end: u64,
+    instances: Vec<TrackedInstance>,
+}
+
+fn instance_bytes(instance: &TrackedInstance) -> u64 {
+    (size_of::<TrackedInstance>()
+        + instance.payload.len()
+        + instance.entities.len() * size_of::<u64>()) as u64
+}
+
+fn change_bytes(change: &TrackedChange) -> u64 {
+    (size_of::<TrackedChange>() + change.payload.as_ref().map_or(0, String::len)) as u64
+}
+
+fn frame_bytes(frame: &TrackedFrame) -> u64 {
+    let signals = frame.signals.iter().map(|signal| {
+        (size_of::<TrackedSignalFrame>()
+            + signal.sent.len() * size_of::<SentCount>()
+            + signal.received.len() * size_of::<ReceivedCount>()) as u64
+            + signal.instances.iter().map(instance_bytes).sum::<u64>()
+            + signal.changes.iter().map(change_bytes).sum::<u64>()
+    });
+    size_of::<TrackedFrame>() as u64 + signals.sum::<u64>()
+}
+
+fn kept_bytes(kept: &KeptInstances) -> u64 {
+    kept.instances.iter().map(instance_bytes).sum()
 }
 
 impl TrackingSave {
@@ -902,6 +938,23 @@ impl TrackingSave {
         self.frames.range(start..end)
     }
 
+    pub fn memory_limit(&self) -> u64 {
+        self.memory_limit
+    }
+
+    pub fn sent_instances(&self, tick: u64, signal: u128) -> Option<(&[TrackedInstance], u64)> {
+        let in_frame = self
+            .frames_in(tick..tick + 1)
+            .next()
+            .and_then(|frame| frame.signals.iter().find(|x| x.signal == signal))
+            .map(|signal| (signal.instances.as_slice(), signal.instances_omitted));
+        in_frame.or_else(|| {
+            self.kept
+                .get(&(signal, tick))
+                .map(|kept| (kept.instances.as_slice(), 0))
+        })
+    }
+
     pub fn intervals(&self) -> &BTreeMap<u64, TrackedInterval> {
         &self.intervals
     }
@@ -918,6 +971,71 @@ impl TrackingSave {
         name_of(&self.signals, id)
     }
 
+    fn drop_oldest(&mut self, tick: u64) {
+        let Some(frame) = self.frames.pop_front() else {
+            return;
+        };
+        self.used_bytes = self.used_bytes.saturating_sub(frame_bytes(&frame));
+        self.start_tick = self.start_tick.max(frame.tick + 1);
+        for signal in frame.signals {
+            let running: Vec<TrackedInstance> = signal
+                .instances
+                .into_iter()
+                .filter(|x| x.window.is_some_and(|window| window.1 > tick))
+                .collect();
+            if let Some(latest_end) = running.iter().filter_map(|x| x.window).map(|x| x.1).max() {
+                let kept = KeptInstances {
+                    latest_end,
+                    instances: running,
+                };
+                self.used_bytes += kept_bytes(&kept);
+                self.next_kept_end = self.next_kept_end.min(latest_end);
+                self.kept.insert((signal.signal, frame.tick), kept);
+            }
+        }
+    }
+
+    fn forget_ended_windows(&mut self, tick: u64) {
+        if tick < self.next_kept_end {
+            return;
+        }
+        let used = &mut self.used_bytes;
+        self.kept.retain(|_, kept| {
+            let running = kept.latest_end > tick;
+            if !running {
+                *used = used.saturating_sub(kept_bytes(kept));
+            }
+            running
+        });
+        self.next_kept_end = self
+            .kept
+            .values()
+            .map(|kept| kept.latest_end)
+            .min()
+            .unwrap_or(u64::MAX);
+    }
+
+    fn remove_from(&mut self, tick: u64) {
+        while let Some(frame) = self.frames.pop_back_if(|frame| frame.tick >= tick) {
+            self.used_bytes = self.used_bytes.saturating_sub(frame_bytes(&frame));
+        }
+        let used = &mut self.used_bytes;
+        self.kept.retain(|key, kept| {
+            let earlier = key.1 < tick;
+            if !earlier {
+                *used = used.saturating_sub(kept_bytes(kept));
+            }
+            earlier
+        });
+    }
+
+    fn clear_frames(&mut self) -> VecDeque<TrackedFrame> {
+        self.used_bytes = 0;
+        self.kept.clear();
+        self.next_kept_end = u64::MAX;
+        std::mem::take(&mut self.frames)
+    }
+
     pub fn push_frame(&mut self, tick: u64, frame: Option<TrackedFrame>) {
         let window = self.window_ticks;
         while self
@@ -925,9 +1043,24 @@ impl TrackingSave {
             .front()
             .is_some_and(|frame| frame.tick + window <= tick)
         {
-            self.frames.pop_front();
+            self.drop_oldest(tick);
         }
-        self.frames.extend(frame);
+        if let Some(frame) = frame {
+            self.used_bytes += frame_bytes(&frame);
+            self.frames.push_back(frame);
+        }
+
+        while self.used_bytes > self.memory_limit {
+            if self.frames.len() > 1 {
+                self.drop_oldest(tick);
+            } else if let Some((_, kept)) = self.kept.pop_first() {
+                self.used_bytes = self.used_bytes.saturating_sub(kept_bytes(&kept));
+            } else {
+                break;
+            }
+        }
+        self.forget_ended_windows(tick);
+
         self.end_tick = tick + 1;
         self.start_tick = self.start_tick.max((tick + 1).saturating_sub(window));
     }
@@ -981,6 +1114,7 @@ struct TrackerClient {
     stream: TcpStream,
     pending: Vec<u8>,
     written: usize,
+    full_left: usize,
 }
 
 impl TrackerClient {
@@ -988,7 +1122,10 @@ impl TrackerClient {
         while self.written < self.pending.len() {
             match self.stream.write(&self.pending[self.written..]) {
                 Ok(0) => return false,
-                Ok(count) => self.written += count,
+                Ok(count) => {
+                    self.written += count;
+                    self.full_left = self.full_left.saturating_sub(count);
+                }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => break,
                 Err(error) if error.kind() == ErrorKind::Interrupted => {}
                 Err(_) => return false,
@@ -997,7 +1134,7 @@ impl TrackerClient {
 
         self.pending.drain(..self.written);
         self.written = 0;
-        self.pending.len() <= MAX_PENDING_BYTES
+        self.pending.len() <= MAX_PENDING_BYTES + self.full_left
     }
 }
 
@@ -1072,6 +1209,10 @@ impl World {
                 end_tick: 0,
                 frames: VecDeque::new(),
                 intervals: BTreeMap::new(),
+                memory_limit: TRACKER_MEMORY_BYTES,
+                used_bytes: 0,
+                kept: BTreeMap::new(),
+                next_kept_end: u64::MAX,
             },
             live: Vec::new(),
             paused: false,
@@ -1090,6 +1231,16 @@ impl Tracker {
     pub fn with_window(mut self, ticks: u64) -> Self {
         assert!(ticks > 0, "the tracker window needs at least one tick");
         self.log.window_ticks = ticks;
+        self
+    }
+
+    pub fn with_memory_limit(mut self, bytes: u64) -> Self {
+        assert!(bytes > 0, "the tracker needs some memory to record in");
+        assert!(
+            bytes <= MAX_MESSAGE_BYTES as u64,
+            "the tracker can send at most {MAX_MESSAGE_BYTES} bytes to the window"
+        );
+        self.log.memory_limit = bytes;
         self
     }
 
@@ -1124,7 +1275,7 @@ impl Tracker {
     fn freeze(&mut self) {
         self.changed = true;
         let (start_tick, end_tick) = (self.log.start_tick, self.log.end_tick);
-        let frames: Vec<TrackedFrame> = self.log.frames.drain(..).collect();
+        let frames: Vec<TrackedFrame> = self.log.clear_frames().into();
         if end_tick > start_tick {
             self.log.intervals.insert(
                 start_tick,
@@ -1144,14 +1295,7 @@ impl Tracker {
             return;
         }
 
-        while self
-            .log
-            .frames
-            .back()
-            .is_some_and(|frame| frame.tick >= tick)
-        {
-            self.log.frames.pop_back();
-        }
+        self.log.remove_from(tick);
         self.log.end_tick = tick;
         self.log.start_tick = self.log.start_tick.min(tick);
         self.changed = true;
@@ -1273,9 +1417,13 @@ impl Tracker {
             frame
         };
         if let Some(update) = update {
+            let full = matches!(update, TrackerMessage::Full(_));
             let bytes = update.to_wire();
             for client in &mut net.clients {
                 client.pending.extend_from_slice(&bytes);
+                if full {
+                    client.full_left += bytes.len();
+                }
             }
         }
 
@@ -1284,9 +1432,11 @@ impl Tracker {
                 continue;
             }
             let _ = stream.set_nodelay(true);
+            let pending = TrackerMessage::Full(self.log.clone()).to_wire();
             net.clients.push(TrackerClient {
                 stream,
-                pending: TrackerMessage::Full(self.log.clone()).to_wire(),
+                full_left: pending.len(),
+                pending,
                 written: 0,
             });
         }
@@ -1332,7 +1482,7 @@ impl Tracker {
     }
 
     pub fn reset(&mut self) {
-        self.log.frames.clear();
+        self.log.clear_frames();
         self.log.intervals.clear();
         self.restart = true;
         self.changed = true;

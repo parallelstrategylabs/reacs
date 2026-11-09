@@ -3,6 +3,7 @@ mod canvas;
 mod graph;
 mod hint;
 mod palette;
+mod query;
 mod source;
 #[cfg(test)]
 mod test_support;
@@ -10,9 +11,23 @@ mod trace;
 
 use app::TrackerApp;
 use source::Source;
+use std::io::Write;
 use std::process::ExitCode;
 
 const USAGE: &str = "usage: reacs-tracker <file> | reacs-tracker --port <port> [--close-with-game]";
+
+fn run_command(result: Result<String, String>) -> ExitCode {
+    match result {
+        Ok(text) => {
+            let _ = writeln!(std::io::stdout(), "{text}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
 
 fn parse_args(args: &[String]) -> Result<(Source, bool), String> {
     let mut port = None;
@@ -40,10 +55,13 @@ fn parse_args(args: &[String]) -> Result<(Source, bool), String> {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(result) = query::command(&args) {
+        return run_command(result);
+    }
     let (source, close_with_game) = match parse_args(&args) {
         Ok(parsed) => parsed,
         Err(error) => {
-            eprintln!("{error}\n{USAGE}");
+            eprintln!("{error}\n{USAGE}\n{}", query::QUERY_USAGE);
             return ExitCode::FAILURE;
         }
     };

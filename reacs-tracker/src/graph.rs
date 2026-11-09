@@ -6,7 +6,7 @@ use reacs::tracking::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
-const OUTSIDE: u128 = 0;
+pub(crate) const OUTSIDE: u128 = 0;
 
 pub const NODE_WIDTH: f32 = 240.0;
 pub const STUB_RISE: f32 = 120.0;
@@ -435,7 +435,7 @@ fn outputs_of(save: &TrackingSave, frame: &TrackedFrame, system: u128) -> Vec<Po
         .collect()
 }
 
-fn instance_line(instance: &TrackedInstance, sent_tick: u64) -> String {
+pub(crate) fn instance_line(instance: &TrackedInstance, sent_tick: u64) -> String {
     let window = match instance.window {
         None => String::new(),
         Some((start, u64::MAX)) if start <= sent_tick => ", open-ended".to_string(),
@@ -446,22 +446,19 @@ fn instance_line(instance: &TrackedInstance, sent_tick: u64) -> String {
 }
 
 fn sent_lines(
-    signal: &TrackedSignalFrame,
+    instances: &[TrackedInstance],
+    omitted: u64,
     sender: u128,
     sent_tick: u64,
     windows_only: bool,
 ) -> Vec<String> {
-    let mut lines: Vec<String> = signal
-        .instances
+    let mut lines: Vec<String> = instances
         .iter()
         .filter(|x| x.sender == sender && (!windows_only || x.window.is_some()))
         .map(|instance| instance_line(instance, sent_tick))
         .collect();
-    if signal.instances_omitted > 0 {
-        lines.push(format!(
-            "{} more on this tick not recorded",
-            signal.instances_omitted
-        ));
+    if omitted > 0 {
+        lines.push(format!("{omitted} more on this tick not recorded"));
     }
     lines
 }
@@ -483,12 +480,12 @@ fn signal_sent_at<'a>(
     by_tick: &BTreeMap<u64, &'a TrackedFrame>,
     tick: u64,
     signal: u128,
-) -> Option<&'a TrackedSignalFrame> {
-    let frame = by_tick
+) -> Option<(&'a [TrackedInstance], u64)> {
+    let shown = by_tick
         .get(&tick)
-        .copied()
-        .or_else(|| save.frames_in(tick..tick + 1).next())?;
-    frame.signals.iter().find(|x| x.signal == signal)
+        .and_then(|frame| frame.signals.iter().find(|x| x.signal == signal))
+        .map(|sent| (sent.instances.as_slice(), sent.instances_omitted));
+    shown.or_else(|| save.sent_instances(tick, signal))
 }
 
 fn add_inputs_and_wires(
@@ -518,8 +515,8 @@ fn add_inputs_and_wires(
                     .and_then(|sent| {
                         Some((sent, signal_sent_at(save, by_tick, sent, signal.signal)?))
                     })
-                    .map_or_else(Vec::new, |(tick, sent)| {
-                        sent_lines(sent, received.sender, tick, received.windowed)
+                    .map_or_else(Vec::new, |(tick, (instances, omitted))| {
+                        sent_lines(instances, omitted, received.sender, tick, received.windowed)
                     });
                 details.extend(change_lines(signal, received.receiver, received.sender));
 
@@ -691,12 +688,15 @@ fn mark_reads_after_the_view(
                     port.external = true;
                     if !port.notes.iter().any(|note| note.starts_with('#')) {
                         let tick = received.sent_tick.unwrap_or(frame.tick);
-                        let sent = save.frames_in(tick..tick + 1).next().and_then(|sent| {
-                            sent.signals.iter().find(|x| x.signal == signal.signal)
-                        });
-                        if let Some(sent) = sent {
-                            port.notes
-                                .extend(sent_lines(sent, received.sender, tick, false));
+                        if let Some((instances, omitted)) = save.sent_instances(tick, signal.signal)
+                        {
+                            port.notes.extend(sent_lines(
+                                instances,
+                                omitted,
+                                received.sender,
+                                tick,
+                                false,
+                            ));
                         }
                     }
                     let reader = format!("to {},", sender_name(save, received.receiver));
