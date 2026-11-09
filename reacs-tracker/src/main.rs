@@ -2,6 +2,7 @@ mod app;
 mod canvas;
 mod graph;
 mod hint;
+mod palette;
 mod source;
 #[cfg(test)]
 mod test_support;

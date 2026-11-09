@@ -457,6 +457,10 @@ impl TrackingSave {
         name_of(&self.systems, id)
     }
 
+    pub fn signal_ids(&self) -> impl Iterator<Item = u128> + '_ {
+        self.signals.iter().map(|name| name.id)
+    }
+
     pub fn signal_name(&self, id: u128) -> &str {
         name_of(&self.signals, id)
     }

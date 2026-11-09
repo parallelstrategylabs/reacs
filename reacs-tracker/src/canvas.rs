@@ -5,10 +5,10 @@ use crate::graph::{
 };
 use crate::graph::{Hit, STUB_RISE, stub_at};
 use crate::hint::Hovered;
+use crate::palette::Palette;
 use eframe::egui::{
     self, Align2, Color32, Context, DragPanButtons, FontId, Galley, Id, LayerId, Mesh, Order,
     Painter, Pos2, Rect, Sense, Shape, Stroke, StrokeKind,
-    ecolor::Hsva,
     epaint::Tessellator,
     layers::ShapeIdx,
     text::{LayoutJob, TextWrapping},
@@ -23,13 +23,15 @@ const HEADER_FILL: Color32 = Color32::from_rgb(33, 33, 33);
 const NODE_BORDER: Color32 = Color32::from_rgb(20, 20, 20);
 const TEXT: Color32 = Color32::from_rgb(222, 222, 222);
 const DIM_TEXT: Color32 = Color32::from_rgb(150, 150, 150);
-const SOCKET_RADIUS: f32 = 4.5;
+const PORT_STEM: f32 = 8.0;
+const CORNER_CUT: f32 = 10.0;
+const EMPHASIS_BRIGHTNESS: f32 = 0.5;
+const EMPHASIS_TEXT_SHIFT: f32 = 0.6;
+const PORT_CAP_HALF: f32 = 6.0;
+const OUTPUTS_FILL: Color32 = Color32::from_rgb(39, 39, 39);
 const FADED_OPACITY: f32 = 0.18;
 const FOCUS_BORDER: Color32 = Color32::from_rgb(255, 196, 64);
-const WIRE_CORNER: f32 = 10.0;
-const CORNER_STEPS: usize = 6;
 const BLOCK_FILL: Color32 = Color32::from_rgb(31, 33, 38);
-const BLOCK_ROUNDING: f32 = 8.0;
 const WIRE_WIDTH: f32 = 2.0;
 const WIRE_EMPHASIS_WIDTH: f32 = 4.0;
 const WIRE_REACH: f32 = 7.0;
@@ -52,7 +54,6 @@ const GRID_FADE_RANGE: f32 = 10.0;
 const TICK_LINE_TEXT: f32 = 11.0;
 const MIN_TICK_OPACITY: f32 = 0.02;
 const MIN_MITER: f32 = 0.5;
-const MIN_DASH_STEP: f64 = 0.000001;
 const TITLE_TEXT_INSET: f32 = 14.0;
 const TICK_LINE_TEXT_INSET: f32 = 6.0;
 
@@ -60,10 +61,6 @@ const CANVAS_FILL: Color32 = Color32::from_rgb(24, 25, 28);
 const GRID_MINOR: Color32 = Color32::from_rgb(35, 37, 42);
 const GRID_MAJOR: Color32 = Color32::from_rgb(50, 53, 60);
 const GRID_MAJOR_EVERY: i64 = 5;
-
-pub fn signal_color(signal: u128) -> Color32 {
-    Hsva::new((signal % 997) as f32 / 997.0, 0.6, 0.9, 1.0).into()
-}
 
 fn visible_span(from: Pos2, to: Pos2, area: Rect) -> Option<(f32, f32)> {
     let delta = to - from;
@@ -101,6 +98,9 @@ impl Lines {
     }
 
     fn path(&mut self, points: &[Pos2], width: f32, color: impl Fn(Pos2) -> Color32) {
+        if points.len() < 2 {
+            return;
+        }
         let half = (width - self.pixel).max(0.0) / 2.0 / self.zoom;
         let feather = self.pixel / self.zoom;
         let first = self.mesh.vertices.len() as u32;
@@ -141,45 +141,53 @@ impl Lines {
     fn dashed(&mut self, points: &[Pos2], width: f32, color: impl Fn(Pos2) -> Color32) {
         let dash = f64::from(DASH_LENGTH / self.zoom);
         let period = f64::from(DASH_PERIOD / self.zoom);
+        let half = dash / 2.0;
         let area = self.visible.expand(period as f32);
         let mut piece = Vec::new();
-        let mut travelled = 0.0f64;
         for segment in points.windows(2) {
             let (from, to) = (segment[0], segment[1]);
             let length = f64::from(from.distance(to));
             let span = visible_span(from, to, area).filter(|_| length > 0.0);
             let Some((start, end)) = span else {
                 self.flush(&mut piece, width, &color);
-                travelled += length;
                 continue;
             };
             if start > 0.0 {
                 self.flush(&mut piece, width, &color);
             }
-            let along_line = (to - from) / length as f32;
+            let along = |distance: f64| from + (to - from) * (distance / length) as f32;
+            let first = f64::from(start) * length;
             let last = f64::from(end) * length;
-            let mut along = f64::from(start) * length;
-            while along < last {
-                let phase = (travelled + along).rem_euclid(period);
-                let drawn = phase < dash;
-                let step = if drawn { dash - phase } else { period - phase };
-                let boundary = along + step.max(MIN_DASH_STEP);
-                let next = boundary.min(last);
-                if drawn {
-                    if piece.is_empty() {
-                        piece.push(from + along_line * along as f32);
+            let diagonal = to.x != from.x && to.y != from.y;
+            if length <= dash || diagonal {
+                if piece.is_empty() {
+                    piece.push(along(first));
+                }
+                piece.push(along(last));
+            } else {
+                let count = (length / period).round().max(1.0);
+                let spacing = length / count;
+                let lowest = ((first - half) / spacing).ceil().max(0.0) as i64;
+                let highest = ((last + half) / spacing).floor().min(count) as i64;
+                for index in lowest..=highest {
+                    let center = index as f64 * spacing;
+                    let near = (center - half).max(first);
+                    let far = (center + half).min(last);
+                    if near >= far {
+                        continue;
                     }
-                    piece.push(from + along_line * next as f32);
+                    if piece.is_empty() {
+                        piece.push(along(near));
+                    }
+                    piece.push(along(far));
+                    if far < length {
+                        self.flush(&mut piece, width, &color);
+                    }
                 }
-                if !drawn || boundary <= last {
-                    self.flush(&mut piece, width, &color);
-                }
-                along = next;
             }
             if end < 1.0 {
                 self.flush(&mut piece, width, &color);
             }
-            travelled += length;
         }
         self.flush(&mut piece, width, &color);
     }
@@ -230,21 +238,29 @@ fn draw_grid(lines: &mut Lines) {
     }
 }
 
-fn rounded(points: &[Pos2]) -> Vec<Pos2> {
-    let mut path = vec![points[0]];
+fn without_repeats(points: &[Pos2]) -> Vec<Pos2> {
+    let mut path = Vec::with_capacity(points.len());
+    for point in points {
+        push_distinct(&mut path, *point);
+    }
+    path
+}
+
+fn with_cut_corners(points: &[Pos2]) -> Vec<Pos2> {
+    let points = without_repeats(points);
+    let mut path = Vec::with_capacity(points.len() * 2);
+    path.extend(points.first());
     for corner in points.windows(3) {
         let (before, at, after) = (corner[0], corner[1], corner[2]);
-        let radius = WIRE_CORNER
+        let cut = CORNER_CUT
             .min(before.distance(at) / 2.0)
             .min(at.distance(after) / 2.0);
-        let start = at + (before - at).normalized() * radius;
-        let end = at + (after - at).normalized() * radius;
-        for step in 0..=CORNER_STEPS {
-            let t = step as f32 / CORNER_STEPS as f32;
-            push_distinct(&mut path, start.lerp(at, t).lerp(at.lerp(end, t), t));
-        }
+        push_distinct(&mut path, at + (before - at).normalized() * cut);
+        push_distinct(&mut path, at + (after - at).normalized() * cut);
     }
-    push_distinct(&mut path, points[points.len() - 1]);
+    if let Some(last) = points.last() {
+        push_distinct(&mut path, *last);
+    }
     path
 }
 
@@ -260,7 +276,7 @@ fn draw_wire(lines: &mut Lines, color: Color32, wire: &Wire, emphasized: bool) {
     } else {
         color
     };
-    let path = rounded(&wire.route);
+    let path = with_cut_corners(&wire.route);
     let width = if emphasized {
         WIRE_EMPHASIS_WIDTH
     } else {
@@ -273,8 +289,13 @@ fn draw_wire(lines: &mut Lines, color: Color32, wire: &Wire, emphasized: bool) {
     }
 }
 
-fn draw_wire_label(base: &Painter, color: Color32, wire: &Wire, visible: Rect) {
+fn draw_wire_label(base: &Painter, color: Color32, wire: &Wire, visible: Rect, emphasized: bool) {
     let mut painter = base.clone();
+    let color = if emphasized {
+        emphasized_color(color)
+    } else {
+        color
+    };
     if wire.faded {
         painter.multiply_opacity(FADED_OPACITY);
     }
@@ -283,7 +304,14 @@ fn draw_wire_label(base: &Painter, color: Color32, wire: &Wire, visible: Rect) {
     if let Some(at) = label_position(&wire.route, wire.label_at, half_width, visible) {
         let top_left = at - vec2(half_width, 8.0 + label.size().y / 2.0);
         let plate = Rect::from_min_size(top_left, label.size()).expand2(vec2(3.0, 0.0));
-        painter.rect_filled(plate, 3.0, LABEL_PLATE);
+        painter.rect_filled(plate, 0.0, LABEL_PLATE);
+        if emphasized {
+            painter.galley(
+                top_left + vec2(EMPHASIS_TEXT_SHIFT, 0.0),
+                label.clone(),
+                color,
+            );
+        }
         painter.galley(top_left, label, color);
     }
 }
@@ -296,31 +324,67 @@ fn elided(painter: &Painter, text: &str, font: FontId, color: Color32, width: f3
 
 fn draw_edge_from_above(lines: &mut Lines, anchor: Pos2, track_x: f32, color: Color32, width: f32) {
     let corner = egui::pos2(track_x, anchor.y);
-    let path = rounded(&[anchor, corner, corner - vec2(0.0, STUB_RISE)]);
+    let path = with_cut_corners(&[anchor, corner, corner - vec2(0.0, STUB_RISE)]);
     lines.dashed(&path, width, |point| {
         let risen = ((anchor.y - point.y) / STUB_RISE).clamp(0.0, 1.0);
         color.gamma_multiply(1.0 - risen)
     });
 }
 
+fn draw_port_ends(lines: &mut Lines, graph: &TickGraph, emphasized: &[PortEnd]) {
+    for (node_index, node) in graph.nodes.iter().enumerate() {
+        for (input, ports) in [(true, &node.inputs), (false, &node.outputs)] {
+            for (index, port) in ports.iter().enumerate() {
+                let (anchor, inward) = if input {
+                    (input_anchor(node, index), PORT_STEM)
+                } else {
+                    (output_anchor(node, index), -PORT_STEM)
+                };
+                let end = anchor + vec2(inward, 0.0);
+                let cap = vec2(0.0, PORT_CAP_HALF);
+                let area = Rect::from_two_pos(anchor, end).expand(PORT_CAP_HALF);
+                if area.intersects(lines.visible) {
+                    let opacity = if port.faded { FADED_OPACITY } else { 1.0 };
+                    let color = graph.palette.color(port.signal).gamma_multiply(opacity);
+                    let width = if emphasized.contains(&(node_index, input, index)) {
+                        WIRE_EMPHASIS_WIDTH
+                    } else {
+                        WIRE_WIDTH
+                    };
+                    lines.path(&[anchor, end], width, |_| color);
+                    lines.path(&[end - cap, end + cap], width, |_| color);
+                }
+            }
+        }
+    }
+}
+
 fn draw_stubs(lines: &mut Lines, graph: &TickGraph) {
     for node in &graph.nodes {
-        let opacity = if node.faded { FADED_OPACITY } else { 1.0 };
         for (input, ports) in [(true, &node.inputs), (false, &node.outputs)] {
             for (index, port) in ports.iter().enumerate().filter(|(_, x)| x.external) {
+                let opacity = if port.faded { FADED_OPACITY } else { 1.0 };
                 let anchor = if input {
                     input_anchor(node, index)
                 } else {
                     output_anchor(node, index)
                 };
-                let color = signal_color(port.signal).gamma_multiply(opacity);
+                let color = graph.palette.color(port.signal).gamma_multiply(opacity);
                 draw_edge_from_above(lines, anchor, port.stub_x, color, WIRE_WIDTH);
             }
         }
     }
 }
 
-fn draw_ports(painter: &Painter, node: &Node, ports: &[Port], inputs: bool) {
+fn draw_port_text(
+    painter: &Painter,
+    node: &Node,
+    port: &Port,
+    index: usize,
+    inputs: bool,
+    color: Color32,
+    shift: f32,
+) {
     let (align, x) = if inputs {
         (Align2::LEFT_CENTER, node.position.x + PORT_MARGIN)
     } else {
@@ -329,30 +393,74 @@ fn draw_ports(painter: &Painter, node: &Node, ports: &[Port], inputs: bool) {
             node.position.x + node.width - PORT_MARGIN,
         )
     };
+    painter.text(
+        egui::pos2(x + shift, node.position.y + row_center(index)),
+        align,
+        port.text(),
+        FontId::proportional(PORT_TEXT_SIZE),
+        color,
+    );
+}
 
-    for (index, port) in ports.iter().enumerate() {
-        let anchor = if inputs {
-            input_anchor(node, index)
-        } else {
-            output_anchor(node, index)
-        };
-        let color = signal_color(port.signal);
-        painter.circle_filled(anchor, SOCKET_RADIUS, color);
-        painter.text(
-            egui::pos2(x, node.position.y + row_center(index)),
-            align,
-            port.text(),
-            FontId::proportional(PORT_TEXT_SIZE),
-            if port.external && !port.wired {
-                color.gamma_multiply(OFF_SCREEN_TEXT)
-            } else {
-                color
-            },
-        );
+fn port_opacity(port: &Port, node: &Node) -> f32 {
+    if port.faded && !node.faded {
+        FADED_OPACITY
+    } else {
+        1.0
     }
 }
 
-fn draw_node(base: &Painter, node: &Node, position: Pos2, focused: bool) {
+fn draw_ports(painter: &Painter, palette: &Palette, node: &Node, ports: &[Port], inputs: bool) {
+    for (index, port) in ports.iter().enumerate() {
+        let color = palette.color(port.signal);
+        let shade = if port.external && !port.wired {
+            color.gamma_multiply(OFF_SCREEN_TEXT)
+        } else {
+            color
+        };
+        let faded = shade.gamma_multiply(port_opacity(port, node));
+        draw_port_text(painter, node, port, index, inputs, faded, 0.0);
+    }
+}
+
+type PortEnd = (usize, bool, usize);
+
+fn emphasized_ports(
+    graph: &TickGraph,
+    hovered_wire: Option<usize>,
+    hovered_stub: Option<&crate::graph::StubHit>,
+) -> Vec<PortEnd> {
+    let mut ends = Vec::new();
+    for (index, wire) in graph.wires.iter().enumerate() {
+        if wire.focused || hovered_wire == Some(index) {
+            ends.push((wire.from_node, false, wire.from_port));
+            ends.push((wire.to_node, true, wire.to_port));
+        }
+    }
+    ends.extend(hovered_stub.map(|hit| (hit.node, hit.input, hit.port)));
+    ends.sort_unstable();
+    ends.dedup();
+    ends
+}
+
+fn emphasized_color(color: Color32) -> Color32 {
+    color.lerp_to_gamma(Color32::WHITE, EMPHASIS_BRIGHTNESS)
+}
+
+fn draw_emphasized_port_text(painter: &Painter, graph: &TickGraph, ends: &[PortEnd]) {
+    for &(node_index, input, index) in ends {
+        let node = &graph.nodes[node_index];
+        let ports = if input { &node.inputs } else { &node.outputs };
+        let port = &ports[index];
+        let opacity = if port.faded { FADED_OPACITY } else { 1.0 };
+        let color = emphasized_color(graph.palette.color(port.signal)).gamma_multiply(opacity);
+        for shift in [0.0, EMPHASIS_TEXT_SHIFT] {
+            draw_port_text(painter, node, port, index, input, color, shift);
+        }
+    }
+}
+
+fn draw_node(base: &Painter, palette: &Palette, node: &Node, position: Pos2, focused: bool) {
     let mut painter = base.clone();
     if node.faded {
         painter.multiply_opacity(FADED_OPACITY);
@@ -365,10 +473,34 @@ fn draw_node(base: &Painter, node: &Node, position: Pos2, focused: bool) {
     } else {
         Stroke::new(1.0, NODE_BORDER)
     };
-    painter.rect(rect, 4.0, NODE_FILL, border, StrokeKind::Inside);
+    painter.rect_filled(rect, 0.0, NODE_FILL);
+    let body_top = position.y + HEADER_HEIGHT;
+    let middle = position.x + node.divider;
+    let outputs = Rect::from_min_max(egui::pos2(middle, body_top), rect.max);
+    painter.rect_filled(outputs, 0.0, OUTPUTS_FILL);
+    painter.line_segment(
+        [
+            egui::pos2(middle, body_top),
+            egui::pos2(middle, rect.bottom()),
+        ],
+        Stroke::new(1.0, NODE_BORDER),
+    );
+    let inset = border.width / 2.0;
+    let (left, right, bottom) = (
+        rect.left() + inset,
+        rect.right() - inset,
+        rect.bottom() - inset,
+    );
+    let outline = vec![
+        egui::pos2(left, body_top),
+        egui::pos2(left, bottom),
+        egui::pos2(right, bottom),
+        egui::pos2(right, body_top),
+    ];
+    painter.add(Shape::line(outline, border));
 
     let header = Rect::from_min_size(position, vec2(node.width, HEADER_HEIGHT));
-    painter.rect_filled(header, 4.0, HEADER_FILL);
+    painter.rect_filled(header, 0.0, HEADER_FILL);
     let title_width = node.width - TITLE_MARGIN * 2.0;
     let font = FontId::proportional(TITLE_TEXT_SIZE);
     let mut title = elided(painter, &node.full_name, font.clone(), TEXT, title_width);
@@ -383,15 +515,6 @@ fn draw_node(base: &Painter, node: &Node, position: Pos2, focused: bool) {
         TEXT,
     );
 
-    let body_top = position.y + HEADER_HEIGHT;
-    let middle = position.x + node.divider;
-    painter.line_segment(
-        [
-            egui::pos2(middle, body_top),
-            egui::pos2(middle, rect.bottom()),
-        ],
-        Stroke::new(1.0, NODE_BORDER),
-    );
     let caption_y = body_top + CAPTION_HEIGHT / 2.0;
     let caption = FontId::proportional(10.0);
     painter.text(
@@ -409,8 +532,8 @@ fn draw_node(base: &Painter, node: &Node, position: Pos2, focused: bool) {
         DIM_TEXT,
     );
 
-    draw_ports(painter, node, &node.inputs, true);
-    draw_ports(painter, node, &node.outputs, false);
+    draw_ports(painter, palette, node, &node.inputs, true);
+    draw_ports(painter, palette, node, &node.outputs, false);
 }
 
 fn block_rect(tick: &TickColumn) -> Rect {
@@ -488,7 +611,7 @@ fn draw_tick_line_labels(painter: &Painter, graph: &TickGraph, visible: Rect) {
         let x = (visible.left() + TICK_LINE_TEXT_INSET).clamp(lowest, highest);
         let top_left = egui::pos2(x, y - label.size().y - 2.0);
         let plate = Rect::from_min_size(top_left, label.size()).expand2(vec2(3.0, 0.0));
-        painter.rect_filled(plate, 3.0, LABEL_PLATE.gamma_multiply(opacity));
+        painter.rect_filled(plate, 0.0, LABEL_PLATE.gamma_multiply(opacity));
         painter.galley(top_left, label, color);
     }
 }
@@ -497,7 +620,7 @@ fn draw_blocks(painter: &Painter, graph: &TickGraph) {
     for tick in &graph.ticks {
         painter.rect(
             block_rect(tick),
-            BLOCK_ROUNDING,
+            0.0,
             BLOCK_FILL,
             Stroke::new(1.0, TICK_LINE),
             StrokeKind::Inside,
@@ -513,13 +636,7 @@ fn draw_tick_titles(painter: &Painter, graph: &TickGraph) {
         } else {
             Stroke::new(1.0, TICK_LINE)
         };
-        painter.rect(
-            title,
-            BLOCK_ROUNDING,
-            HEADER_FILL,
-            border,
-            StrokeKind::Inside,
-        );
+        painter.rect(title, 0.0, HEADER_FILL, border, StrokeKind::Inside);
         let text = if tick.empty {
             format!("Tick {} (no signals)", tick.tick)
         } else {
@@ -749,7 +866,7 @@ fn static_shapes(context: &Context, graph: &TickGraph) -> Vec<Shape> {
     for (index, node) in graph.nodes.iter().enumerate() {
         let focused =
             graph.focused_nodes.contains(&index) || graph.focused_ticks.contains(&node.tick);
-        draw_node(&painter, node, node.position, focused);
+        draw_node(&painter, &graph.palette, node, node.position, focused);
     }
     context.graphics_mut(|layers| {
         let list = layers.entry(layer);
@@ -882,11 +999,13 @@ pub fn draw(
             };
             let mut lines = Lines::new(zoom, pixel, visible);
             draw_tick_lines(&mut lines, graph);
+            let emphasized = emphasized_ports(graph, hovered, hovered_stub.as_ref());
+            draw_port_ends(&mut lines, graph, &emphasized);
             draw_stubs(&mut lines, graph);
             for pass in 0..3 {
                 for (index, wire) in graph.wires.iter().enumerate() {
                     if layer(index, wire) == pass {
-                        let color = signal_color(wire.signal);
+                        let color = graph.palette.color(wire.signal);
                         draw_wire(&mut lines, color, wire, pass == 2);
                     }
                 }
@@ -897,7 +1016,7 @@ pub fn draw(
                     &mut lines,
                     anchor,
                     port.stub_x,
-                    signal_color(port.signal),
+                    graph.palette.color(port.signal),
                     WIRE_EMPHASIS_WIDTH,
                 );
             }
@@ -905,10 +1024,17 @@ pub fn draw(
             for pass in 0..3 {
                 for (index, wire) in graph.wires.iter().enumerate() {
                     if layer(index, wire) == pass {
-                        draw_wire_label(&painter, signal_color(wire.signal), wire, visible);
+                        draw_wire_label(
+                            &painter,
+                            graph.palette.color(wire.signal),
+                            wire,
+                            visible,
+                            pass == 2,
+                        );
                     }
                 }
             }
+            draw_emphasized_port_text(&painter, graph, &emphasized);
             draw_tick_line_labels(&painter, graph, visible);
             (clicked, menu, hovered_node, hovered, hovered_stub)
         });
@@ -1024,8 +1150,8 @@ mod tests {
 
     #[test]
     fn dashes_are_the_same_size_on_screen_at_any_zoom() {
-        assert_eq!(dashes(1.0, SCREEN, 140.0), 10);
-        assert_eq!(dashes(0.5, SCREEN, 280.0), 10);
+        assert_eq!(dashes(1.0, SCREEN, 140.0), 11);
+        assert_eq!(dashes(0.5, SCREEN, 280.0), 11);
     }
 
     #[test]
@@ -1035,15 +1161,118 @@ mod tests {
         assert!(dashes(1.0, SCREEN, 100_000.0) < 100);
     }
 
-    #[test]
-    fn dash_gaps_stay_in_place_when_the_start_is_off_screen() {
-        let visible = Rect::from_min_size(pos2(700.0, 0.0), vec2(1000.0, 100.0));
+    fn dash_starts(visible: Rect) -> Vec<f32> {
         let mut lines = Lines::new(1.0, 1.0, visible);
         lines.dashed(&[pos2(0.0, 50.0), pos2(2000.0, 50.0)], 2.0, |_| {
             Color32::WHITE
         });
-        let start = lines.mesh.vertices[0].pos.x;
-        assert_eq!(start.rem_euclid(14.0), 0.0);
+        lines
+            .mesh
+            .vertices
+            .chunks(8)
+            .map(|dash| dash[0].pos.x)
+            .collect()
+    }
+
+    #[test]
+    fn dashes_stay_in_place_when_the_start_is_off_screen() {
+        let whole = Rect::from_min_size(pos2(0.0, 0.0), vec2(2000.0, 100.0));
+        let part = Rect::from_min_size(pos2(700.0, 0.0), vec2(1000.0, 100.0));
+        let all = dash_starts(whole);
+        let some = dash_starts(part);
+        assert!(all.iter().any(|x| (x - some[1]).abs() < 0.01));
+    }
+
+    fn passes_through(lines: &Lines, corner: Pos2) -> bool {
+        lines.mesh.vertices.chunks(4).any(|section| {
+            let middle = section[1].pos.lerp(section[2].pos, 0.5);
+            middle.distance(corner) < 0.01
+        })
+    }
+
+    #[test]
+    fn a_dash_always_covers_a_corner() {
+        for length in [15.0, 60.0, 97.0, 503.0] {
+            for zoom in [0.2, 1.0, 2.0] {
+                let corner = pos2(100.0, 200.0);
+                let path = [
+                    corner - vec2(length, 0.0),
+                    corner,
+                    corner + vec2(0.0, length),
+                ];
+                let mut lines = Lines::new(zoom, 1.0, SCREEN);
+                lines.dashed(&path, 2.0, |_| Color32::WHITE);
+                assert!(passes_through(&lines, corner), "{length} at {zoom}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_corner_is_cut_with_a_solid_diagonal() {
+        let path = super::with_cut_corners(&[pos2(0.0, 0.0), pos2(100.0, 0.0), pos2(100.0, 100.0)]);
+        assert_eq!(
+            path,
+            [
+                pos2(0.0, 0.0),
+                pos2(90.0, 0.0),
+                pos2(100.0, 10.0),
+                pos2(100.0, 100.0)
+            ]
+        );
+
+        for zoom in [0.2, 1.0, 2.0] {
+            let mut lines = Lines::new(zoom, 1.0, SCREEN);
+            lines.dashed(&path, 2.0, |_| Color32::WHITE);
+            let sections: Vec<Pos2> = lines
+                .mesh
+                .vertices
+                .chunks(4)
+                .map(|section| section[1].pos.lerp(section[2].pos, 0.5))
+                .collect();
+            let joined = sections.windows(2).any(|pair| {
+                pair[0].distance(pos2(90.0, 0.0)) < 0.01
+                    && pair[1].distance(pos2(100.0, 10.0)) < 0.01
+            });
+            assert!(joined, "at zoom {zoom}");
+        }
+    }
+
+    #[test]
+    fn a_short_leg_gets_a_smaller_cut() {
+        let path = super::with_cut_corners(&[pos2(0.0, 0.0), pos2(8.0, 0.0), pos2(8.0, 100.0)]);
+        assert_eq!(path[1], pos2(4.0, 0.0));
+        assert_eq!(path[2], pos2(8.0, 4.0));
+    }
+
+    #[test]
+    fn hovering_or_selecting_an_edge_emphasizes_both_of_its_ports() {
+        use crate::graph::Wire;
+        let wire = |focused: bool, from: usize, to: usize, port: usize| Wire {
+            signal: 1,
+            label: String::new(),
+            windowed: false,
+            from_node: from,
+            from_port: port,
+            to_node: to,
+            to_port: port,
+            route: Vec::new(),
+            label_at: Pos2::ZERO,
+            faded: false,
+            focused,
+        };
+        let graph = TickGraph {
+            wires: vec![wire(false, 0, 1, 0), wire(true, 2, 3, 1)],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            super::emphasized_ports(&graph, None, None),
+            [(2, false, 1), (3, true, 1)]
+        );
+        assert_eq!(
+            super::emphasized_ports(&graph, Some(0), None),
+            [(0, false, 0), (1, true, 0), (2, false, 1), (3, true, 1)]
+        );
     }
 
     #[test]

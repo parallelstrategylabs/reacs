@@ -1,6 +1,7 @@
 use crate::canvas::{self, CanvasOutput, Click};
 use crate::graph::{self, Focus, Hit, NodeKey, TickGraph};
 use crate::hint::Hints;
+use crate::palette::Palette;
 use crate::source::{Event, Source};
 use crate::trace::{self, Link, NodeLinks};
 use eframe::egui::{
@@ -68,6 +69,22 @@ pub struct TrackerApp {
     back: VecDeque<ViewState>,
     forward: Vec<ViewState>,
     frame_selection: bool,
+}
+
+fn flatten_style(style: &mut egui::Style) {
+    let visuals = &mut style.visuals;
+    visuals.window_corner_radius = egui::CornerRadius::ZERO;
+    visuals.menu_corner_radius = egui::CornerRadius::ZERO;
+    let widgets = &mut visuals.widgets;
+    for state in [
+        &mut widgets.noninteractive,
+        &mut widgets.inactive,
+        &mut widgets.hovered,
+        &mut widgets.active,
+        &mut widgets.open,
+    ] {
+        state.corner_radius = egui::CornerRadius::ZERO;
+    }
 }
 
 fn view_range(save: &TrackingSave, interval: Option<u64>) -> Range<u64> {
@@ -138,13 +155,19 @@ fn menu_title(save: &TrackingSave, target: Hit) -> String {
     }
 }
 
-fn link_list(ui: &mut egui::Ui, title: &str, links: &[Link], chosen: &mut Option<NodeKey>) {
+fn link_list(
+    ui: &mut egui::Ui,
+    title: &str,
+    links: &[Link],
+    palette: &Palette,
+    chosen: &mut Option<NodeKey>,
+) {
     if links.is_empty() {
         return;
     }
     ui.weak(title);
     for link in links {
-        let color = canvas::signal_color(link.signal);
+        let color = palette.color(link.signal);
         let text = egui::RichText::new(link.text.as_str()).color(color);
         let button = egui::Button::new(text)
             .frame_when_inactive(false)
@@ -212,6 +235,7 @@ impl TrackerApp {
             Status::Waiting
         };
         let has_outside = save.as_ref().is_some_and(has_outside_sends);
+        context.all_styles_mut(flatten_style);
         Self {
             description: source.describe(),
             events: source.listen(context),
@@ -514,9 +538,11 @@ impl TrackerApp {
     }
 
     fn draw_menu(&mut self, ui: &egui::Ui) {
-        let (Some(menu), Some(save)) = (&mut self.menu, &self.save) else {
+        let (Some(menu), Some(save), Some((_, built))) = (&mut self.menu, &self.save, &self.graph)
+        else {
             return;
         };
+        let palette = &built.palette;
         let title = menu_title(save, menu.target);
         let links = &menu.links;
         let mut chosen = None;
@@ -540,11 +566,11 @@ impl TrackerApp {
                         .max_height(room.y)
                         .max_width(room.x)
                         .show(ui, |ui| {
-                            link_list(ui, "Jump to input", &links.inputs, &mut chosen);
+                            link_list(ui, "Jump to input", &links.inputs, palette, &mut chosen);
                             if !links.inputs.is_empty() && !links.outputs.is_empty() {
                                 ui.separator();
                             }
-                            link_list(ui, "Jump to output", &links.outputs, &mut chosen);
+                            link_list(ui, "Jump to output", &links.outputs, palette, &mut chosen);
                         });
                 });
             });
@@ -747,8 +773,8 @@ impl TrackerApp {
             visuals.widgets.inactive.bg_fill
         };
         ui.painter()
-            .rect_filled(track, 4.0, visuals.extreme_bg_color);
-        ui.painter().rect_filled(thumb, 4.0, fill);
+            .rect_filled(track, 0.0, visuals.extreme_bg_color);
+        ui.painter().rect_filled(thumb, 0.0, fill);
 
         let per_point = bounds.width() / track.width();
         let mut center = view.center().x;

@@ -1,3 +1,4 @@
+use crate::palette::Palette;
 use eframe::egui::{Pos2, Rect, Vec2, pos2, vec2};
 use reacs::tracking::{TrackedFrame, TrackingSave, UNKNOWN_SENDER};
 use std::collections::{BTreeMap, BTreeSet};
@@ -35,6 +36,7 @@ pub struct Port {
     pub external: bool,
     pub wired: bool,
     pub stub_x: f32,
+    pub faded: bool,
     pub notes: Vec<String>,
 }
 
@@ -167,6 +169,7 @@ pub struct TickGraph {
     pub first_tick_line: f32,
     pub tick_line_gap: f32,
     pub lowest_lane: f32,
+    pub palette: Palette,
     pub focused_nodes: Vec<usize>,
     pub focused_ticks: Vec<u64>,
 }
@@ -369,6 +372,7 @@ fn add_input(
                 external: false,
                 wired: false,
                 stub_x: 0.0,
+                faded: false,
                 notes: Vec::new(),
             });
             node.inputs.len() - 1
@@ -401,6 +405,7 @@ fn outputs_of(save: &TrackingSave, frame: &TrackedFrame, system: u128) -> Vec<Po
                     external: false,
                     wired: false,
                     stub_x: 0.0,
+                    faded: false,
                     notes: Vec::new(),
                 })
         })
@@ -535,6 +540,34 @@ fn fade(graph: &mut TickGraph, targets: &[Target]) {
     }
     for wire in &mut graph.wires {
         wire.faded = !chains.iter().any(|chain| chain.keeps_wire(wire));
+    }
+    fade_ports(graph);
+}
+
+fn fade_ports(graph: &mut TickGraph) {
+    let (mut wired, mut kept) = (BTreeSet::new(), BTreeSet::new());
+    for wire in &graph.wires {
+        for end in [
+            (wire.from_node, false, wire.from_port),
+            (wire.to_node, true, wire.to_port),
+        ] {
+            wired.insert(end);
+            if !wire.faded {
+                kept.insert(end);
+            }
+        }
+    }
+    for (index, node) in graph.nodes.iter_mut().enumerate() {
+        let faded = node.faded;
+        let mark = |input: bool, ports: &mut [Port]| {
+            for (position, port) in ports.iter_mut().enumerate() {
+                let end = (index, input, position);
+                let lost_its_edges = wired.contains(&end) && !kept.contains(&end);
+                port.faded = faded || (lost_its_edges && !port.external);
+            }
+        };
+        mark(true, &mut node.inputs);
+        mark(false, &mut node.outputs);
     }
 }
 
@@ -851,7 +884,10 @@ pub fn build(
         visible.iter().map(|frame| (frame.tick, *frame)).collect();
 
     let systems = ordered_systems(save, has_outside);
-    let mut graph = TickGraph::default();
+    let mut graph = TickGraph {
+        palette: Palette::new(save.signal_ids()),
+        ..Default::default()
+    };
     let mut indices = BTreeMap::new();
     for (tick, frame) in &by_tick {
         let active = systems_in(frame);
@@ -1156,6 +1192,7 @@ mod tests {
             external: false,
             wired: false,
             stub_x: 0.0,
+            faded: false,
             notes: Vec::new(),
         }
     }
@@ -1570,6 +1607,43 @@ mod tests {
             let kept = !first.nodes[index].faded || !second.nodes[index].faded;
             assert_eq!(!both.nodes[index].faded, kept);
         }
+    }
+
+    #[test]
+    fn a_port_fades_with_its_edges() {
+        let mut graph = TickGraph {
+            nodes: vec![
+                system(0, 1, vec![], vec![port(1), port(2)]),
+                system(1, 2, vec![port(1)], vec![]),
+                system(1, 3, vec![port(2)], vec![]),
+            ],
+            wires: vec![link(1, (0, 0), (1, 0)), link(2, (0, 1), (2, 0))],
+            ..Default::default()
+        };
+
+        fade(&mut graph, &[Target::Node(1)]);
+        assert!(!graph.nodes[0].outputs[0].faded);
+        assert!(graph.nodes[0].outputs[1].faded);
+        assert!(!graph.nodes[1].inputs[0].faded);
+        assert!(graph.nodes[2].inputs[0].faded);
+    }
+
+    #[test]
+    fn a_port_with_an_off_screen_edge_stays_while_its_node_stays() {
+        let mut outgoing = port(2);
+        outgoing.external = true;
+        let mut graph = TickGraph {
+            nodes: vec![
+                system(0, 1, vec![], vec![port(1), outgoing]),
+                system(1, 2, vec![port(1)], vec![]),
+                system(1, 3, vec![port(2)], vec![]),
+            ],
+            wires: vec![link(1, (0, 0), (1, 0)), link(2, (0, 1), (2, 0))],
+            ..Default::default()
+        };
+
+        fade(&mut graph, &[Target::Node(1)]);
+        assert!(!graph.nodes[0].outputs[1].faded);
     }
 
     #[test]
