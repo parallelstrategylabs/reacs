@@ -220,6 +220,24 @@ impl World {
         bincode::serialize(&(header, saved)).expect("failed to encode save")
     }
 
+    pub(crate) fn resource_hashes(&self) -> Vec<(u128, u64)> {
+        self.resources
+            .iter()
+            .map(|(id, cell)| {
+                let entry = get_registry_entry(*id).unwrap_or_else(|| {
+                    panic!("Can't hash resource {id:#034x}: it isn't registered, use #[resource]")
+                });
+                let resource = cell.try_borrow().unwrap_or_else(|_| {
+                    panic!(
+                        "Can't hash resource `{}` while it's borrowed for writing",
+                        entry.type_name
+                    )
+                });
+                (*id, (entry.hash)(&*resource))
+            })
+            .collect()
+    }
+
     pub fn load(&mut self, bytes: &[u8]) {
         let mut body = bytes;
         let header: SaveHeader = bincode::deserialize_from(&mut body)

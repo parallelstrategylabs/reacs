@@ -1,6 +1,6 @@
 use std::{any::Any, cell::RefCell, ptr::addr_of_mut};
 
-use crate::index_map::IndexMap;
+use crate::{index_map::IndexMap, state_hash::hash_value};
 
 #[derive(Debug)]
 pub struct RegistryEntry {
@@ -8,6 +8,7 @@ pub struct RegistryEntry {
     pub serialize: fn(&dyn Any) -> Vec<u8>,
     pub deserialize: fn(&[u8]) -> Box<dyn Any>,
     pub(crate) restore: fn(&[u8]) -> Box<RefCell<dyn Any>>,
+    pub(crate) hash: fn(&dyn Any) -> u64,
 }
 
 fn decode<T: for<'de> serde::Deserialize<'de>>(bytes: &[u8]) -> T {
@@ -42,6 +43,7 @@ where
                 serialize: |v| bincode::serialize(v.downcast_ref::<T>().unwrap()).unwrap(),
                 deserialize: |b| Box::new(decode::<T>(b)),
                 restore: |b| Box::new(RefCell::new(decode::<T>(b))),
+                hash: |v| hash_value(v.downcast_ref::<T>().unwrap()),
             },
         );
     }

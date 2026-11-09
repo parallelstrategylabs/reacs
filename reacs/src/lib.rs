@@ -14,6 +14,7 @@ pub mod replay;
 pub mod resource;
 pub mod schedule;
 pub mod signal;
+mod state_hash;
 pub mod tracking;
 mod tracking_text;
 pub mod world;

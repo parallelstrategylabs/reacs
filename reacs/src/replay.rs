@@ -4,6 +4,7 @@ use std::{
     io::{self, BufRead, BufReader, BufWriter, ErrorKind, Read, Write},
     path::Path,
     ptr::addr_of_mut,
+    rc::Rc,
 };
 
 use bincode::Options;
@@ -12,9 +13,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Tick,
     hashed::Hashed,
-    registry::registered_ids,
+    registry::{get_registry_entry, registered_ids},
     schedule::{Mut, system_graph},
     signal::{InputSignal, Signal, SignalData, SignalType, Signals},
+    state_hash::hash_bytes,
     world::World,
 };
 
@@ -105,28 +107,6 @@ pub(crate) fn init_input_signals(world: &mut World) {
     }
 }
 
-fn mix(a: u64, b: u64) -> u64 {
-    let product = (a as u128).wrapping_mul(b as u128);
-    product as u64 ^ (product >> 64) as u64
-}
-
-fn hash_bytes(bytes: &[u8]) -> u64 {
-    const FIRST: u64 = 0x9E37_79B9_7F4A_7C15;
-    const SECOND: u64 = 0xA076_1D64_78BD_642F;
-
-    let mut state = FIRST ^ bytes.len() as u64;
-    let mut chunks = bytes.chunks_exact(8);
-    for chunk in &mut chunks {
-        let word = u64::from_le_bytes(chunk.try_into().unwrap());
-        state = mix(state ^ word, SECOND);
-    }
-    let rest = chunks.remainder();
-    let mut last = [0u8; 8];
-    last[..rest.len()].copy_from_slice(rest);
-    state = mix(state ^ u64::from_le_bytes(last), SECOND);
-    mix(state, FIRST)
-}
-
 fn build_id() -> u64 {
     let mut registered = registered_ids();
     registered.sort_unstable();
@@ -163,10 +143,16 @@ struct InputBatch {
 }
 
 #[derive(Serialize, Deserialize)]
+struct HashRecord {
+    table: Option<Vec<u128>>,
+    values: Vec<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
 enum Record {
     Tick {
         gap: u64,
-        hash: Option<u64>,
+        hash: Option<HashRecord>,
         inputs: Vec<InputBatch>,
     },
     Section {
@@ -182,6 +168,7 @@ pub struct Recorder {
     last: Option<u64>,
     written: u64,
     scratch: Vec<Vec<u8>>,
+    table: Vec<u128>,
     error: Option<io::Error>,
 }
 
@@ -229,7 +216,7 @@ impl Recorder {
             }
         }
 
-        let hash = (tick % self.hash_every == 0).then(|| hash_bytes(&world.save()));
+        let hash = (tick % self.hash_every == 0).then(|| self.hash_record(world));
         if inputs.is_empty() && hash.is_none() {
             return Ok(());
         }
@@ -240,6 +227,22 @@ impl Recorder {
             .serialize_into(&mut self.out, &Record::Tick { gap, hash, inputs })
             .map_err(encode_error)?;
         self.out.flush()
+    }
+
+    fn hash_record(&mut self, world: &World) -> HashRecord {
+        let hashes = world.resource_hashes();
+        let same_table = hashes
+            .iter()
+            .map(|hash| hash.0)
+            .eq(self.table.iter().copied());
+        let table = (!same_table).then(|| {
+            self.table = hashes.iter().map(|hash| hash.0).collect();
+            self.table.clone()
+        });
+        HashRecord {
+            table,
+            values: hashes.iter().map(|hash| hash.1).collect(),
+        }
     }
 
     fn write_section(&mut self, world: &World, tick: u64) -> io::Result<()> {
@@ -291,6 +294,7 @@ impl World {
             last: None,
             written: start_tick,
             scratch: Vec::new(),
+            table: Vec::new(),
             error: None,
         })
     }
@@ -332,11 +336,17 @@ impl From<io::Error> for ReplayError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceDifference {
+    pub name: &'static str,
+    pub expected: Option<u64>,
+    pub found: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Divergence {
     pub last_match: Option<u64>,
     pub tick: u64,
-    pub expected: u64,
-    pub found: u64,
+    pub resources: Vec<ResourceDifference>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -348,10 +358,54 @@ pub struct ReplayReport {
     pub truncated: bool,
 }
 
+struct HashCheck {
+    table: Rc<[u128]>,
+    values: Vec<u64>,
+}
+
+fn resource_name(id: u128) -> &'static str {
+    get_registry_entry(id).map_or("unregistered", |entry| entry.type_name)
+}
+
+fn differences(check: &HashCheck, found: &[(u128, u64)]) -> Vec<ResourceDifference> {
+    let mut out = Vec::new();
+    let (mut expected_at, mut found_at) = (0, 0);
+    while expected_at < check.table.len() || found_at < found.len() {
+        let expected_id = check.table.get(expected_at).copied().unwrap_or(u128::MAX);
+        let found_id = found.get(found_at).map_or(u128::MAX, |hash| hash.0);
+        if expected_id == found_id {
+            if check.values[expected_at] != found[found_at].1 {
+                out.push(ResourceDifference {
+                    name: resource_name(expected_id),
+                    expected: Some(check.values[expected_at]),
+                    found: Some(found[found_at].1),
+                });
+            }
+            expected_at += 1;
+            found_at += 1;
+        } else if expected_id < found_id {
+            out.push(ResourceDifference {
+                name: resource_name(expected_id),
+                expected: Some(check.values[expected_at]),
+                found: None,
+            });
+            expected_at += 1;
+        } else {
+            out.push(ResourceDifference {
+                name: resource_name(found_id),
+                expected: None,
+                found: Some(found[found_at].1),
+            });
+            found_at += 1;
+        }
+    }
+    out
+}
+
 enum Item {
     Tick {
         tick: u64,
-        hash: Option<u64>,
+        hash: Option<HashCheck>,
         inputs: Vec<InputBatch>,
     },
     Section {
@@ -412,6 +466,7 @@ impl Replay {
     ) -> Result<(Vec<Item>, bool), ReplayError> {
         let mut items = Vec::new();
         let mut tick = start_tick;
+        let mut table: Rc<[u128]> = Rc::from(Vec::new());
         loop {
             if reader.fill_buf()?.is_empty() {
                 return Ok((items, false));
@@ -430,6 +485,21 @@ impl Replay {
             match record {
                 Record::Tick { gap, hash, inputs } => {
                     tick += gap;
+                    let hash = match hash {
+                        Some(record) => {
+                            if let Some(new_table) = record.table {
+                                table = Rc::from(new_table);
+                            }
+                            if record.values.len() != table.len() {
+                                return Err(ReplayError::Corrupted);
+                            }
+                            Some(HashCheck {
+                                table: Rc::clone(&table),
+                                values: record.values,
+                            })
+                        }
+                        None => None,
+                    };
                     items.push(Item::Tick { tick, hash, inputs });
                 }
                 Record::Section {
@@ -486,15 +556,14 @@ impl Replay {
                             report.inputs += 1;
                         }
                     }
-                    if let Some(expected) = *hash {
+                    if let Some(check) = hash {
                         report.hashes_checked += 1;
-                        let found = hash_bytes(&world.save());
-                        if found != expected {
+                        let resources = differences(check, &world.resource_hashes());
+                        if !resources.is_empty() {
                             report.divergence = Some(Divergence {
                                 last_match,
                                 tick: *tick,
-                                expected,
-                                found,
+                                resources,
                             });
                             return Ok(report);
                         }

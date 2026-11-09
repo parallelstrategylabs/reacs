@@ -232,7 +232,112 @@ fn a_local_resource_changing_gameplay_is_reported_between_two_hashes() {
     let divergence = report.divergence.unwrap();
     assert_eq!(divergence.last_match, Some(24));
     assert_eq!(divergence.tick, 32);
-    assert_ne!(divergence.expected, divergence.found);
+    let names: Vec<&str> = divergence.resources.iter().map(|x| x.name).collect();
+    assert_eq!(names.len(), 1, "{names:?}");
+    assert!(names[0].ends_with("Trace"), "{names:?}");
+    assert_ne!(
+        divergence.resources[0].expected,
+        divergence.resources[0].found
+    );
+}
+
+#[signal]
+pub struct Churn(pub u64);
+
+#[resource]
+pub struct ChurnCount(pub u64);
+
+#[system]
+fn churn(mut churns: Mut<Signal<Churn>>, mut count: Mut<Resource<ChurnCount>>) {
+    let tick = churns.tick();
+    for offset in 0..20 {
+        churns.send(Churn(offset), tick..tick + 3 + offset);
+    }
+    let received = churns.receive().count() as u64;
+    (*count).0 = (*count).0.wrapping_add(received);
+}
+
+#[test]
+fn hashes_ignore_caches_that_a_restored_world_does_not_have() {
+    let file = path("caches");
+    let mut world = World::new();
+    for _ in 0..200 {
+        world.step();
+    }
+    let mut recorder = world.to_recorder(&file).unwrap().with_hash_every(1);
+    for _ in 0..200 {
+        recorder.record(&world);
+        world.step();
+    }
+    recorder.finish().unwrap();
+
+    let report = Replay::open(&file).unwrap().verify().unwrap();
+    fs::remove_file(&file).unwrap();
+
+    assert_eq!(report.hashes_checked, 200);
+    assert_eq!(report.divergence, None);
+}
+
+#[resource]
+pub struct Extra(pub u64);
+
+#[resource]
+pub struct LateTable(pub u64);
+
+#[system]
+fn add_extra(mut world: Mut<WorldAccess>) {
+    if world
+        .get_local_resource::<Bias>()
+        .is_some_and(|bias| bias.0 == 2)
+    {
+        world.insert_resource(Extra(1));
+    }
+    if world.get_resource::<Tick>().unwrap().0 == 6 {
+        world.insert_resource(LateTable(1));
+    }
+}
+
+#[test]
+fn a_resource_only_the_original_run_has_is_named() {
+    let file = path("one-side");
+    let mut world = World::new();
+    let mut recorder = world.to_recorder(&file).unwrap().with_hash_every(4);
+    for tick in 0..16 {
+        if tick == 9 {
+            world.get_local_resource_mut::<Bias>().unwrap().0 = 2;
+        }
+        recorder.record(&world);
+        world.step();
+    }
+    recorder.finish().unwrap();
+
+    let report = Replay::open(&file).unwrap().verify().unwrap();
+    fs::remove_file(&file).unwrap();
+
+    let divergence = report.divergence.unwrap();
+    assert_eq!((divergence.last_match, divergence.tick), (Some(8), 12));
+    let extra = divergence
+        .resources
+        .iter()
+        .find(|x| x.name.ends_with("Extra"))
+        .unwrap();
+    assert!(extra.expected.is_some());
+    assert_eq!(extra.found, None);
+}
+
+#[test]
+fn a_resource_added_during_the_run_keeps_the_hashes_matching() {
+    let file = path("late-table");
+    let mut world = World::new();
+    let mut recorder = world.to_recorder(&file).unwrap().with_hash_every(2);
+    play(&mut world, &mut recorder, 0..20);
+    recorder.finish().unwrap();
+
+    let report = Replay::open(&file).unwrap().verify().unwrap();
+    fs::remove_file(&file).unwrap();
+
+    assert_eq!(report.hashes_checked, 10);
+    assert_eq!(report.divergence, None);
 }
 
 #[test]
