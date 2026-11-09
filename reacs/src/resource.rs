@@ -1,6 +1,6 @@
 use crate::{
     hashed::Hashed,
-    schedule::{Mode, Read, SystemParam, WithMode, conflict},
+    schedule::{Mode, ParamWorld, Read, SystemParam, WithMode, conflict},
     world::World,
 };
 use std::{
@@ -39,7 +39,7 @@ impl<T: 'static + Default + Hashed, M: Mode> SystemParam for Resource<'_, T, M> 
         world.init_resource::<T>();
     }
 
-    fn fetch<'w>(world: &'w World) -> Resource<'w, T, M> {
+    fn fetch<'w>(world: ParamWorld<'w>) -> Resource<'w, T, M> {
         Resource(M::fetch(world))
     }
 }
@@ -81,7 +81,7 @@ impl<T: LocalResourceType, M: Mode> SystemParam for LocalResource<'_, T, M> {
         world.init_local_resource::<T>();
     }
 
-    fn fetch<'w>(world: &'w World) -> LocalResource<'w, T, M> {
+    fn fetch<'w>(world: ParamWorld<'w>) -> LocalResource<'w, T, M> {
         LocalResource(M::fetch_local(world))
     }
 }
@@ -110,7 +110,8 @@ impl<T: 'static + Default + Hashed, M: Mode> SystemParam for ResourceCell<'_, T,
         world.init_resource::<T>();
     }
 
-    fn fetch<'w>(world: &'w World) -> ResourceCell<'w, T, M> {
+    fn fetch<'w>(world: ParamWorld<'w>) -> ResourceCell<'w, T, M> {
+        let world = world.0;
         let i = world
             .resources
             .binary_search_by_key(&T::TYPE_UUID, |resource| resource.0)

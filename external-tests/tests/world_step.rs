@@ -75,8 +75,9 @@ fn step_runs_systems_then_advances_the_tick() {
 
 #[test]
 fn step_delivers_a_one_tick_signal_once() {
-    let mut world = World::new();
-    world.signal::<Once>().emit(Once(7));
+    let mut world = World::build(|setup| {
+        setup.signal::<Once>().emit(Once(7));
+    });
 
     world.step();
     world.step();
@@ -86,8 +87,9 @@ fn step_delivers_a_one_tick_signal_once() {
 
 #[test]
 fn step_delivers_a_windowed_signal_every_tick_of_its_window() {
-    let mut world = World::new();
-    world.signal::<Windowed>().send(Windowed(9), 1..3);
+    let mut world = World::build(|setup| {
+        setup.signal::<Windowed>().send(Windowed(9), 1..3);
+    });
 
     for _ in 0..5 {
         world.step();
@@ -101,8 +103,9 @@ fn step_delivers_a_windowed_signal_every_tick_of_its_window() {
 
 #[test]
 fn system_receiving_twice_gets_a_window_once_per_tick() {
-    let mut world = World::new();
-    world.signal::<Repeated>().send(Repeated(9), 1..3);
+    let mut world = World::build(|setup| {
+        setup.signal::<Repeated>().send(Repeated(9), 1..3);
+    });
 
     for _ in 0..4 {
         world.step();

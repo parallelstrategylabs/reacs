@@ -1,6 +1,8 @@
 use crate::Tick;
+use crate::entity::{Entity, EntityManager};
 use crate::hashed::{Hashed, hash_path};
 use crate::resource::LocalResourceType;
+use crate::signal::{Signal, SignalType};
 use crate::world::World;
 
 use reacs_derive::resource;
@@ -8,7 +10,7 @@ use std::cell::{Ref, RefMut};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fmt::Write as _;
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::ptr::{addr_of, addr_of_mut};
 
 static mut SYSTEM_GRAPH: SystemGraph = SystemGraph::new();
@@ -39,8 +41,8 @@ pub struct SystemEntry {
     pub before: Vec<u128>,
     pub after: Vec<u128>,
     pub groups: Vec<u128>,
-    pub init_fn: Box<dyn Fn(&mut World)>,
-    pub run_fn: Box<dyn Fn(&mut World)>,
+    pub(crate) init_fn: Box<dyn Fn(&mut World)>,
+    pub(crate) run_fn: Box<dyn Fn(&mut World)>,
 }
 
 impl SystemEntry {
@@ -66,11 +68,11 @@ impl SystemEntry {
         self
     }
 
-    pub fn init(&self, world: &mut World) {
+    pub(crate) fn init(&self, world: &mut World) {
         (self.init_fn)(world);
     }
 
-    pub fn run(&self, world: &mut World) {
+    pub(crate) fn run(&self, world: &mut World) {
         set_current_system(world, self.uuid);
         (self.run_fn)(world);
         set_current_system(world, ANONYMOUS_SYSTEM);
@@ -311,24 +313,27 @@ impl SystemGraph {
         print!("{}", self.tree());
     }
 
-    pub fn init(&self, world: &mut World) {
+    pub(crate) fn init(&self, world: &mut World) {
         for system in self.iter() {
             system.init(world);
         }
     }
 
-    pub fn run(&self, world: &mut World) {
+    pub(crate) fn run(&self, world: &mut World) {
         for system in self.iter() {
             system.run(world);
         }
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct ParamWorld<'w>(pub(crate) &'w World);
+
 pub trait SystemParam {
     type Item<'w>;
 
     fn init(world: &mut World);
-    fn fetch<'w>(world: &'w World) -> Self::Item<'w>;
+    fn fetch<'w>(world: ParamWorld<'w>) -> Self::Item<'w>;
 }
 
 pub trait IntoSystem<P> {
@@ -364,6 +369,7 @@ macro_rules! impl_into_system_tuples {
                             f($($param),*)
                         }
 
+                        let world = ParamWorld(&*world);
                         $( let $param = $param::fetch(world); )*
                         call_inner(&self, $($param),*);
                     }),
@@ -389,18 +395,22 @@ pub struct Write;
 pub trait Mode {
     type Guard<'w, T: 'w>: Deref<Target = T>;
     type WorldGuard<'w>: Deref<Target = World>;
-    fn fetch<'w, T: 'static + Hashed>(world: &'w World) -> Self::Guard<'w, T>;
-    fn fetch_local<'w, T: LocalResourceType>(world: &'w World) -> Self::Guard<'w, T>;
+    fn fetch<'w, T: 'static + Hashed>(world: ParamWorld<'w>) -> Self::Guard<'w, T>;
+    fn fetch_local<'w, T: LocalResourceType>(world: ParamWorld<'w>) -> Self::Guard<'w, T>;
 }
 
 impl Mode for Read {
     type Guard<'w, T: 'w> = Ref<'w, T>;
     type WorldGuard<'w> = &'w World;
-    fn fetch<'w, T: 'static + Hashed>(world: &'w World) -> Ref<'w, T> {
-        world.get_resource::<T>().unwrap_or_else(|| conflict::<T>())
-    }
-    fn fetch_local<'w, T: LocalResourceType>(world: &'w World) -> Ref<'w, T> {
+    fn fetch<'w, T: 'static + Hashed>(world: ParamWorld<'w>) -> Ref<'w, T> {
         world
+            .0
+            .get_resource::<T>()
+            .unwrap_or_else(|| conflict::<T>())
+    }
+    fn fetch_local<'w, T: LocalResourceType>(world: ParamWorld<'w>) -> Ref<'w, T> {
+        world
+            .0
             .get_local_resource::<T>()
             .unwrap_or_else(|| conflict::<T>())
     }
@@ -409,13 +419,15 @@ impl Mode for Read {
 impl Mode for Write {
     type Guard<'w, T: 'w> = RefMut<'w, T>;
     type WorldGuard<'w> = &'w mut World;
-    fn fetch<'w, T: 'static + Hashed>(world: &'w World) -> RefMut<'w, T> {
+    fn fetch<'w, T: 'static + Hashed>(world: ParamWorld<'w>) -> RefMut<'w, T> {
         world
+            .0
             .get_resource_mut_silent::<T>()
             .unwrap_or_else(|| conflict::<T>())
     }
-    fn fetch_local<'w, T: LocalResourceType>(world: &'w World) -> RefMut<'w, T> {
+    fn fetch_local<'w, T: LocalResourceType>(world: ParamWorld<'w>) -> RefMut<'w, T> {
         world
+            .0
             .get_local_resource_mut::<T>()
             .unwrap_or_else(|| conflict::<T>())
     }
@@ -440,9 +452,64 @@ impl<M: Mode> Deref for WorldAccess<'_, M> {
     }
 }
 
-impl DerefMut for WorldAccess<'_, Write> {
-    fn deref_mut(&mut self) -> &mut World {
-        self.0
+impl WorldAccess<'_, Write> {
+    #[inline]
+    pub fn init_resource<R: 'static + Default + Hashed>(&mut self) {
+        self.0.init_resource::<R>();
+    }
+
+    #[inline]
+    pub fn insert_resource<R: 'static + Hashed>(&mut self, resource: R) {
+        self.0.insert_resource(resource);
+    }
+
+    #[inline]
+    pub fn remove_resource<R: 'static + Hashed>(&mut self) -> bool {
+        self.0.remove_resource::<R>()
+    }
+
+    #[inline]
+    pub fn get_resource_mut<R: 'static + Hashed>(&self) -> Option<RefMut<'_, R>> {
+        self.0.get_resource_mut::<R>()
+    }
+
+    #[inline]
+    pub fn init_component<C: 'static + Copy + Default + Hashed>(&mut self) {
+        self.0.init_component::<C>();
+    }
+
+    #[inline]
+    pub fn set_component<C: 'static + Copy + Default + Hashed>(
+        &mut self,
+        entity: Entity,
+        value: C,
+    ) {
+        self.0.set_component(entity, value);
+    }
+
+    #[inline]
+    pub fn remove_component<C: 'static + Copy + Default + Hashed>(&mut self, entity: Entity) {
+        self.0.remove_component::<C>(entity);
+    }
+
+    #[inline]
+    pub fn entity_manager(&self) -> Mut<EntityManager<'_>> {
+        self.0.entity_manager()
+    }
+
+    #[inline]
+    pub fn spawn(&self) -> Entity {
+        self.0.entity_manager().spawn()
+    }
+
+    #[inline]
+    pub fn init_signal<S: SignalType>(&mut self) {
+        self.0.init_signal::<S>();
+    }
+
+    #[inline]
+    pub fn signal<S: SignalType>(&self) -> Mut<Signal<'_, S>> {
+        self.0.signal::<S>()
     }
 }
 
@@ -451,8 +518,8 @@ impl SystemParam for WorldAccess<'_, Read> {
 
     fn init(_world: &mut World) {}
 
-    fn fetch<'w>(world: &'w World) -> WorldAccess<'w, Read> {
-        WorldAccess(world)
+    fn fetch<'w>(world: ParamWorld<'w>) -> WorldAccess<'w, Read> {
+        WorldAccess(world.0)
     }
 }
 
@@ -497,18 +564,24 @@ pub(crate) fn conflict<T>() -> ! {
 }
 
 impl World {
+    pub fn build(setup: impl FnOnce(&mut WorldAccess<'_, Write>)) -> Self {
+        let mut world = Self::new();
+        setup(&mut WorldAccess(&mut world));
+        world
+    }
+
     #[inline]
-    pub fn init_param<P: SystemParam>(&mut self) {
+    pub(crate) fn init_param<P: SystemParam>(&mut self) {
         P::init(self);
     }
 
     #[inline]
-    pub fn fetch_param<P: SystemParam>(&self) -> P::Item<'_> {
-        P::fetch(self)
+    pub(crate) fn fetch_param<P: SystemParam>(&self) -> P::Item<'_> {
+        P::fetch(ParamWorld(self))
     }
 
     #[inline]
-    pub fn run_systems(&mut self) {
+    pub(crate) fn run_systems(&mut self) {
         system_graph().run(self);
     }
 
@@ -809,7 +882,6 @@ mod tests {
         #[system]
         fn write_world(mut world: Mut<WorldAccess>) {
             world.insert_resource(IntResource(9));
-            world.init_param::<Mut<EntityManager>>();
             world.init_component::<Health>();
 
             let entity = world.entity_manager().spawn();

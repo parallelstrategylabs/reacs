@@ -1,11 +1,11 @@
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
 use syn::{
+    Fields, GenericArgument, GenericParam, Ident, Index, ItemStruct, Lifetime, Member,
+    PathArguments, Type, TypeParam, TypeParamBound,
     parse::{Parse, ParseStream},
     parse_quote,
     spanned::Spanned,
-    Fields, GenericArgument, GenericParam, Ident, Index, ItemStruct, Lifetime, Member,
-    PathArguments, Type, TypeParam, TypeParamBound,
 };
 
 #[derive(Clone, Copy, PartialEq)]
@@ -110,7 +110,11 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
         ));
     }
 
-    let type_params: Vec<Ident> = input.generics.type_params().map(|t| t.ident.clone()).collect();
+    let type_params: Vec<Ident> = input
+        .generics
+        .type_params()
+        .map(|t| t.ident.clone())
+        .collect();
 
     let user_args: Vec<TokenStream> = input
         .generics
@@ -138,11 +142,17 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
             Fields::Named(f) => &mut f.named,
             Fields::Unnamed(f) => &mut f.unnamed,
             Fields::Unit => {
-                return Err(syn::Error::new(name.span(), "#[param] needs at least one field"));
+                return Err(syn::Error::new(
+                    name.span(),
+                    "#[param] needs at least one field",
+                ));
             }
         };
         if fields.is_empty() {
-            return Err(syn::Error::new(name.span(), "#[param] needs at least one field"));
+            return Err(syn::Error::new(
+                name.span(),
+                "#[param] needs at least one field",
+            ));
         }
 
         for (i, field) in fields.iter_mut().enumerate() {
@@ -312,7 +322,7 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
                 #(#init_stmts)*
             }
 
-            fn fetch<'__w>(world: &'__w ::reacs::world::World) -> #sp_item {
+            fn fetch<'__w>(world: ::reacs::schedule::ParamWorld<'__w>) -> #sp_item {
                 #name { #(#members: #fetch_exprs),* }
             }
         }

@@ -33,7 +33,7 @@ pub mod prelude {
     pub use crate::schedule::{
         IntoSystem, Mut, SystemEntry, SystemGraph, SystemParam, WorldAccess, system_graph,
     };
-    pub use crate::signal::{Signal, SignalType};
+    pub use crate::signal::{InputSignal, Signal, SignalType};
     pub use crate::world::World;
 
     pub use reacs_derive::{

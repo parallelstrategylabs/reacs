@@ -24,39 +24,39 @@ fn record_deaths(
 }
 
 fn battle() -> (World, Entity, Entity) {
-    let mut world = World::new();
-    let (knight, goblin) = {
-        let mut em = world.entity_manager();
-        (em.spawn(), em.spawn())
-    };
-    world.set_component(knight, Health(10));
-    world.set_component(goblin, Health(5));
-    world.signal::<Regen>().send(
-        Regen {
-            target: knight,
-            amount: 1,
-        },
-        ..,
-    );
-    world.signal::<Regen>().send(
-        Regen {
+    let mut units = (Entity::default(), Entity::default());
+    let world = World::build(|setup| {
+        let (knight, goblin) = (setup.spawn(), setup.spawn());
+        setup.set_component(knight, Health(10));
+        setup.set_component(goblin, Health(5));
+        setup.signal::<Regen>().send(
+            Regen {
+                target: knight,
+                amount: 1,
+            },
+            ..,
+        );
+        setup.signal::<Regen>().send(
+            Regen {
+                target: goblin,
+                amount: 1,
+            },
+            ..,
+        );
+        setup.signal::<Damage>().emit(Damage {
             target: goblin,
-            amount: 1,
-        },
-        ..,
-    );
-    world.signal::<Damage>().emit(Damage {
-        target: goblin,
-        amount: 6,
+            amount: 6,
+        });
+        setup.signal::<Damage>().send(
+            Damage {
+                target: knight,
+                amount: 3,
+            },
+            1..3,
+        );
+        units = (knight, goblin);
     });
-    world.signal::<Damage>().send(
-        Damage {
-            target: knight,
-            amount: 3,
-        },
-        1..3,
-    );
-    (world, knight, goblin)
+    (world, units.0, units.1)
 }
 
 #[test]
@@ -116,8 +116,8 @@ fn plugins_share_signals_components_resources_and_params() {
         ]
     );
     assert_eq!(world.get_component::<Health>(knight).map(|h| h.0), Some(9));
-    assert!(world.entity_manager().is_alive(knight));
-    assert!(!world.entity_manager().is_alive(goblin));
+    assert!(world.entities().is_alive(knight));
+    assert!(!world.entities().is_alive(goblin));
 
     let obituary = world.get_resource::<Obituary>().unwrap();
     assert_eq!(obituary.dead, [goblin]);

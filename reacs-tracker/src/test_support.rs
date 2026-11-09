@@ -1,7 +1,7 @@
 use reacs::prelude::*;
 use reacs::tracking::TrackingSave;
 
-#[signal]
+#[signal(input)]
 struct FixturePing(u32);
 
 #[signal]
@@ -69,9 +69,9 @@ pub fn recorded_paused(ticks: u64, pause_after: Option<u64>) -> TrackingSave {
 }
 
 pub fn recorded_with_outside_send() -> TrackingSave {
-    let world = World::new();
+    let mut world = World::new();
     let mut tracker = world.to_tracker();
-    world.signal::<FixturePing>().emit(FixturePing(9));
+    world.input(FixturePing(9));
     tracker.step(&world);
     TrackingSave::from_bytes(&tracker.snapshot()).unwrap()
 }

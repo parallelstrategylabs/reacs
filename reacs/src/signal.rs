@@ -1076,11 +1076,11 @@ impl<'w, S: SignalType> Signal<'w, S, Write> {
     }
 }
 
-pub static mut SIGNAL_REGISTRY: Option<Vec<fn(&World)>> = None;
+pub(crate) static mut SIGNAL_REGISTRY: Option<Vec<fn(&World)>> = None;
 
-pub static mut SWEEP_REGISTRY: Option<Vec<(u128, fn(&World, u64) -> (u64, bool))>> = None;
+pub(crate) static mut SWEEP_REGISTRY: Option<Vec<(u128, fn(&World, u64) -> (u64, bool))>> = None;
 
-pub static mut SWEEP_STAMPS: Option<Vec<(TypeId, fn(&World) -> u64)>> = None;
+pub(crate) static mut SWEEP_STAMPS: Option<Vec<(TypeId, fn(&World) -> u64)>> = None;
 
 #[resource]
 pub struct SweepCursor {
@@ -1113,6 +1113,38 @@ pub fn register_signal<S: SignalType>() {
                 stamps.push((filter, S::Filter::stamp));
             }
         }
+    }
+}
+
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not an input signal",
+    note = "declare it with #[signal(input)]; other signals are sent from systems or World::build"
+)]
+pub trait InputSignal: SignalType {}
+
+static mut INPUT_REGISTRY: Option<Vec<(u128, fn(&mut World))>> = None;
+
+fn init_input_signal<S: SignalType>(world: &mut World) {
+    world.init_signal::<S>();
+}
+
+pub fn register_input_signal<S: InputSignal>() {
+    let uuid = Signals::<S>::TYPE_UUID;
+    unsafe {
+        let ptr = addr_of_mut!(INPUT_REGISTRY);
+        let inputs = (*ptr).get_or_insert_with(Vec::new);
+        let i = inputs.partition_point(|x| x.0 < uuid);
+        inputs.insert(i, (uuid, init_input_signal::<S>));
+    }
+}
+
+pub(crate) fn init_input_signals(world: &mut World) {
+    let inputs = unsafe {
+        let ptr = addr_of_mut!(INPUT_REGISTRY);
+        (*ptr).as_deref().unwrap_or(&[])
+    };
+    for (_, init) in inputs {
+        init(world);
     }
 }
 
@@ -1208,7 +1240,7 @@ fn cleanup_in_world<S: SignalType>(world: &World) {
 
 impl World {
     #[inline]
-    pub fn init_signal<S: SignalType>(&mut self) {
+    pub(crate) fn init_signal<S: SignalType>(&mut self) {
         get_registry_entry(Signals::<S>::TYPE_UUID).unwrap_or_else(|| {
             let type_name = std::any::type_name::<S>();
             panic!("Signal `{type_name}` not registered, try using #[signal] {type_name}!")
@@ -1220,17 +1252,17 @@ impl World {
     }
 
     #[inline]
-    pub fn signal<S: SignalType>(&self) -> Mut<Signal<'_, S>> {
+    pub(crate) fn signal<S: SignalType>(&self) -> Mut<Signal<'_, S>> {
         self.fetch_param::<Mut<Signal<S>>>()
     }
 
     #[inline]
-    pub fn cleanup_signal<S: SignalType>(&self) {
-        cleanup_in_world::<S>(self);
+    pub fn input<S: InputSignal>(&mut self, signal: S) {
+        self.signal::<S>().emit(signal);
     }
 
     #[inline]
-    pub fn cleanup_signals(&self) {
+    pub(crate) fn cleanup_signals(&self) {
         sweep_signals(self);
 
         for cleanup in get_registered_signals() {

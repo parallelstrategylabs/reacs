@@ -10,7 +10,7 @@ use crate::{
     registry::get_registry_entry,
     resource::LocalResourceType,
     schedule::{ANONYMOUS_SYSTEM, CurrentSystem, Mut, set_current_system, system_graph},
-    signal::SweepCursor,
+    signal::{SweepCursor, init_input_signals},
 };
 use serde::{Deserialize, Serialize};
 
@@ -35,7 +35,7 @@ fn run_on_load<R: LocalResourceType>(resource: &mut dyn Any, world: &World) {
 }
 
 pub struct World {
-    pub resources: Vec<(u128, Box<RefCell<dyn Any>>)>,
+    pub(crate) resources: Vec<(u128, Box<RefCell<dyn Any>>)>,
     local_resources: Vec<LocalEntry>,
     app_version: u32,
 }
@@ -53,20 +53,21 @@ impl World {
         world.init_resource::<Tick>();
         world.init_resource::<SweepCursor>();
         world.init_param::<Mut<EntityManager>>();
+        init_input_signals(&mut world);
         system_graph().init(&mut world);
 
         world
     }
 
     #[inline]
-    pub fn init_resource<R: 'static + Default + Hashed>(&mut self) {
+    pub(crate) fn init_resource<R: 'static + Default + Hashed>(&mut self) {
         if !self.has_resource::<R>() {
             self.insert_resource(R::default());
         }
     }
 
     #[inline]
-    pub fn insert_resource<R: 'static + Hashed>(&mut self, resource: R) {
+    pub(crate) fn insert_resource<R: 'static + Hashed>(&mut self, resource: R) {
         let id = R::TYPE_UUID;
         let search_result = self.resources.binary_search_by(|x| x.0.cmp(&id));
         let new_resource = Box::new(RefCell::new(resource));
@@ -78,7 +79,7 @@ impl World {
     }
 
     #[inline]
-    pub fn remove_resource<R: 'static + Hashed>(&mut self) -> bool {
+    pub(crate) fn remove_resource<R: 'static + Hashed>(&mut self) -> bool {
         let id = R::TYPE_UUID;
         let search_result = self.resources.binary_search_by(|x| x.0.cmp(&id));
 
@@ -104,7 +105,7 @@ impl World {
     }
 
     #[inline]
-    pub fn get_resource_mut<R: 'static + Hashed>(&self) -> Option<RefMut<'_, R>> {
+    pub(crate) fn get_resource_mut<R: 'static + Hashed>(&self) -> Option<RefMut<'_, R>> {
         self.get_resource_mut_silent::<R>()
     }
 

@@ -334,9 +334,13 @@ fn find_entity_field(input: &DeriveInput) -> syn::Result<Member> {
 #[proc_macro_attribute]
 pub fn signal(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut entity: Option<Option<Member>> = None;
+    let mut input_signal = false;
 
     let attr_parser = syn::meta::parser(|meta| {
-        if meta.path.is_ident("entity") {
+        if meta.path.is_ident("input") {
+            input_signal = true;
+            Ok(())
+        } else if meta.path.is_ident("entity") {
             entity = Some(if meta.input.peek(syn::Token![=]) {
                 Some(meta.value()?.parse()?)
             } else {
@@ -344,7 +348,9 @@ pub fn signal(attr: TokenStream, item: TokenStream) -> TokenStream {
             });
             Ok(())
         } else {
-            Err(meta.error("unsupported #[signal] argument, expected `entity` or `entity = field`"))
+            Err(meta.error(
+                "unsupported #[signal] argument, expected `input`, `entity` or `entity = field`",
+            ))
         }
     });
     parse_macro_input!(attr with attr_parser);
@@ -364,6 +370,14 @@ pub fn signal(attr: TokenStream, item: TokenStream) -> TokenStream {
     let snake_name = format_ident!("{}", name.to_string().to_lowercase());
     let ctor_fn = format_ident!("__register_signal_{}", snake_name);
     let link = linked_crates();
+    let (input_impl, input_register) = if input_signal {
+        (
+            quote! { impl ::reacs::signal::InputSignal for #name {} },
+            quote! { ::reacs::signal::register_input_signal::<#name>(); },
+        )
+    } else {
+        (quote! {}, quote! {})
+    };
     let filter = match entity {
         Some(field) => {
             let field = match field.map_or_else(|| find_entity_field(&input), Ok) {
@@ -404,6 +418,8 @@ pub fn signal(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #filter
 
+        #input_impl
+
         #[::reacs::__private::ctor::ctor]
         #[allow(non_snake_case)]
         fn #ctor_fn() {
@@ -417,6 +433,7 @@ pub fn signal(attr: TokenStream, item: TokenStream) -> TokenStream {
                 <Data as ::reacs::hashed::Hashed>::TYPE_UUID,
             );
             ::reacs::signal::register_signal::<#name>();
+            #input_register
         }
     };
 

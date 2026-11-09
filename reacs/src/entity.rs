@@ -166,8 +166,13 @@ impl EntityManager<'_, Write> {
 
 impl World {
     #[inline]
-    pub fn entity_manager(&self) -> Mut<EntityManager<'_>> {
+    pub(crate) fn entity_manager(&self) -> Mut<EntityManager<'_>> {
         self.fetch_param::<Mut<EntityManager>>()
+    }
+
+    #[inline]
+    pub fn entities(&self) -> EntityManager<'_> {
+        self.fetch_param::<EntityManager>()
     }
 }
 

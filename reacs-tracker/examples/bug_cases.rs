@@ -376,8 +376,7 @@ fn main() -> std::io::Result<()> {
         std::process::exit(1);
     };
 
-    let mut world = World::new();
-    world.insert_resource(Scenario { bug: *bug });
+    let mut world = World::build(|setup| setup.insert_resource(Scenario { bug: *bug }));
     let tracker = world.to_tracker();
     let mut tracker = if *bug == OLD_CAUSE {
         tracker.with_window(SMALL_WINDOW)

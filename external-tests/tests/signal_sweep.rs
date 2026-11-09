@@ -22,6 +22,29 @@ pub struct Attack {
 #[signal(entity = 1)]
 pub struct Heal(pub Entity, pub Entity);
 
+#[signal(input)]
+pub struct Kill(pub Entity);
+
+#[resource]
+pub struct AttackSeen {
+    pub targets: Vec<Entity>,
+}
+
+#[system(run_before(burn, attack_reader))]
+fn killer(mut kills: Mut<Signal<Kill>>, mut em: Mut<EntityManager>) {
+    for kill in kills.receive() {
+        em.despawn(kill.0);
+    }
+}
+
+#[system]
+fn attack_reader(mut attacks: Mut<Signal<Attack>>, mut seen: Mut<Resource<AttackSeen>>) {
+    seen.targets.clear();
+    for attack in attacks.receive() {
+        seen.targets.push(attack.target);
+    }
+}
+
 #[resource]
 pub struct Burned {
     pub entities: Vec<Entity>,
@@ -60,13 +83,14 @@ fn chain(
 
 #[test]
 fn dead_entitys_open_signal_is_removed_during_step() {
-    let mut world = World::new();
-    let (first, second) = {
-        let mut em = world.entity_manager();
-        (em.spawn(), em.spawn())
-    };
-    world.signal::<Burn>().send(Burn(first), ..);
-    world.signal::<Burn>().send(Burn(second), ..);
+    let mut units = (Entity::default(), Entity::default());
+    let mut world = World::build(|setup| {
+        let (first, second) = (setup.spawn(), setup.spawn());
+        setup.signal::<Burn>().send(Burn(first), ..);
+        setup.signal::<Burn>().send(Burn(second), ..);
+        units = (first, second);
+    });
+    let (first, second) = units;
 
     for _ in 0..3 {
         world.step();
@@ -84,7 +108,7 @@ fn dead_entitys_open_signal_is_removed_during_step() {
         2
     );
 
-    world.entity_manager().despawn(first);
+    world.input(Kill(first));
     world.step();
 
     assert_eq!(world.get_resource::<Burned>().unwrap().entities, [second]);
@@ -104,48 +128,49 @@ fn permanent_len<S: SignalType>(world: &World) -> usize {
 
 #[test]
 fn entity_signals_are_removed_when_their_entity_dies() {
-    let mut world = World::new();
-    world.init_signal::<Poison>();
-    world.init_signal::<Regen>();
-    world.init_signal::<Attack>();
-    world.init_signal::<Heal>();
-    let (dead, alive) = {
-        let mut em = world.entity_manager();
-        (em.spawn(), em.spawn())
-    };
+    let mut units = (Entity::default(), Entity::default());
+    let mut world = World::build(|setup| {
+        setup.init_signal::<Poison>();
+        setup.init_signal::<Regen>();
+        setup.init_signal::<Attack>();
+        setup.init_signal::<Heal>();
+        let (dead, alive) = (setup.spawn(), setup.spawn());
 
-    world.signal::<Poison>().send(Poison(dead), ..);
-    world.signal::<Poison>().send(Poison(alive), ..);
-    world.signal::<Regen>().send(
-        Regen {
-            amount: 1,
-            target: dead,
-        },
-        ..,
-    );
-    world.signal::<Regen>().send(
-        Regen {
-            amount: 1,
-            target: alive,
-        },
-        ..,
-    );
-    world.signal::<Attack>().send(
-        Attack {
-            source: alive,
-            target: dead,
-        },
-        ..,
-    );
-    world.signal::<Attack>().send(
-        Attack {
-            source: dead,
-            target: alive,
-        },
-        ..,
-    );
-    world.signal::<Heal>().send(Heal(alive, dead), ..);
-    world.signal::<Heal>().send(Heal(dead, alive), ..);
+        setup.signal::<Poison>().send(Poison(dead), ..);
+        setup.signal::<Poison>().send(Poison(alive), ..);
+        setup.signal::<Regen>().send(
+            Regen {
+                amount: 1,
+                target: dead,
+            },
+            ..,
+        );
+        setup.signal::<Regen>().send(
+            Regen {
+                amount: 1,
+                target: alive,
+            },
+            ..,
+        );
+        setup.signal::<Attack>().send(
+            Attack {
+                source: alive,
+                target: dead,
+            },
+            ..,
+        );
+        setup.signal::<Attack>().send(
+            Attack {
+                source: dead,
+                target: alive,
+            },
+            ..,
+        );
+        setup.signal::<Heal>().send(Heal(alive, dead), ..);
+        setup.signal::<Heal>().send(Heal(dead, alive), ..);
+        units = (dead, alive);
+    });
+    let (dead, alive) = units;
 
     for _ in 0..3 {
         world.step();
@@ -155,32 +180,28 @@ fn entity_signals_are_removed_when_their_entity_dies() {
     assert_eq!(permanent_len::<Attack>(&world), 2);
     assert_eq!(permanent_len::<Heal>(&world), 2);
 
-    world.entity_manager().despawn(dead);
+    world.input(Kill(dead));
     world.step();
 
     assert_eq!(permanent_len::<Poison>(&world), 1);
     assert_eq!(permanent_len::<Regen>(&world), 1);
     assert_eq!(permanent_len::<Attack>(&world), 1);
     assert_eq!(permanent_len::<Heal>(&world), 1);
-    let received: Vec<Entity> = world
-        .signal::<Attack>()
-        .receive()
-        .map(|s| s.target)
-        .collect();
-    assert_eq!(received, [alive]);
+    assert_eq!(world.get_resource::<AttackSeen>().unwrap().targets, [alive]);
 }
 
 #[test]
 fn system_with_entity_manager_and_entity_signal_runs_without_a_borrow_panic() {
-    let mut world = World::new();
-    let (first, second, third) = {
-        let mut em = world.entity_manager();
-        (em.spawn(), em.spawn(), em.spawn())
-    };
-    world.signal::<Chain>().send(Chain(first), ..);
-    world.signal::<Chain>().send(Chain(second), ..);
-    world.signal::<Chain>().send(Chain(third), ..);
-    world.get_resource_mut::<ChainTargets>().unwrap().next = vec![second];
+    let mut units = (Entity::default(), Entity::default());
+    let mut world = World::build(|setup| {
+        let (first, second, third) = (setup.spawn(), setup.spawn(), setup.spawn());
+        setup.signal::<Chain>().send(Chain(first), ..);
+        setup.signal::<Chain>().send(Chain(second), ..);
+        setup.signal::<Chain>().send(Chain(third), ..);
+        setup.get_resource_mut::<ChainTargets>().unwrap().next = vec![second];
+        units = (first, third);
+    });
+    let (first, third) = units;
 
     world.step();
 

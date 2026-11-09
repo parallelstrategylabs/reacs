@@ -6,6 +6,9 @@ pub struct Ping(pub u64);
 #[signal(entity)]
 pub struct Burn(pub Entity);
 
+#[signal(input)]
+pub struct Kill(pub Entity);
+
 #[resource]
 pub struct ForSeen {
     pub pings: Vec<(u64, u64)>,
@@ -16,6 +19,13 @@ pub struct ForSeen {
 pub struct ForEachSeen {
     pub pings: Vec<(u64, u64)>,
     pub burns: Vec<(u64, Entity)>,
+}
+
+#[system(run_before(for_receiver, for_each_receiver))]
+fn killer(mut kills: Mut<Signal<Kill>>, mut em: Mut<EntityManager>) {
+    for kill in kills.receive() {
+        em.despawn(kill.0);
+    }
 }
 
 #[system]
@@ -61,19 +71,20 @@ fn sender(mut pings: Mut<Signal<Ping>>, tick: Resource<Tick>) {
 
 #[test]
 fn for_and_for_each_receive_the_same_signals() {
-    let mut world = World::new();
-    let (first, second) = {
-        let mut em = world.entity_manager();
-        (em.spawn(), em.spawn())
-    };
-    world.signal::<Ping>().emit(Ping(1));
-    world.signal::<Ping>().send(Ping(2), ..);
-    world.signal::<Burn>().send(Burn(first), ..);
-    world.signal::<Burn>().send(Burn(second), ..);
+    let mut units = (Entity::default(), Entity::default());
+    let mut world = World::build(|setup| {
+        let (first, second) = (setup.spawn(), setup.spawn());
+        setup.signal::<Ping>().emit(Ping(1));
+        setup.signal::<Ping>().send(Ping(2), ..);
+        setup.signal::<Burn>().send(Burn(first), ..);
+        setup.signal::<Burn>().send(Burn(second), ..);
+        units = (first, second);
+    });
+    let (first, second) = units;
 
     world.step();
     world.step();
-    world.entity_manager().despawn(first);
+    world.input(Kill(first));
     for _ in 0..3 {
         world.step();
     }

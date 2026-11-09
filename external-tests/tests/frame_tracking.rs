@@ -10,7 +10,7 @@ use std::time::Duration;
 #[signal]
 struct TrackPing(u64);
 
-#[signal]
+#[signal(input)]
 struct TrackPong(u64);
 
 #[signal(entity)]
@@ -224,9 +224,7 @@ fn track_die_reader(mut dies: Mut<Signal<TrackDie>>, mut em: Mut<EntityManager>)
 }
 
 fn world_with(plan: TrackPlan) -> World {
-    let mut world = World::new();
-    world.insert_resource(plan);
-    world
+    World::build(|setup| setup.insert_resource(plan))
 }
 
 fn reading() -> TrackPlan {
@@ -316,8 +314,7 @@ fn acted_on(tracker: &Tracker, tick: u64) -> Vec<Change> {
 }
 
 fn run_plan(plan: ActPlan, ticks: u64) -> Tracker {
-    let mut world = World::new();
-    world.insert_resource(plan);
+    let mut world = World::build(|setup| setup.insert_resource(plan));
     let mut tracker = world.to_tracker();
     for _ in 0..ticks {
         step(&mut tracker, &mut world);
@@ -584,8 +581,7 @@ fn signal_id(tracker: &Tracker, name: &str) -> u128 {
 }
 
 fn tracked_with(plan: ActPlan, window: u64, ticks: u64) -> Tracker {
-    let mut world = World::new();
-    world.insert_resource(plan);
+    let mut world = World::build(|setup| setup.insert_resource(plan));
     let mut tracker = world.to_tracker().with_window(window);
     for _ in 0..ticks {
         step(&mut tracker, &mut world);
@@ -716,10 +712,8 @@ fn tracking_changes_does_not_affect_the_world() {
         at: 3,
         ..Default::default()
     };
-    let mut plain = World::new();
-    plain.insert_resource(plan());
-    let mut tracked = World::new();
-    tracked.insert_resource(plan());
+    let mut plain = World::build(|setup| setup.insert_resource(plan()));
+    let mut tracked = World::build(|setup| setup.insert_resource(plan()));
     let mut tracker = tracked.to_tracker();
     for _ in 0..6 {
         plain.step();
@@ -852,25 +846,26 @@ fn cancelled_windows_are_not_counted() {
 
 #[test]
 fn filtered_counts_follow_deaths_and_payload_changes() {
-    let mut world = World::new();
-    let (first, second, dead) = {
-        let mut em = world.entity_manager();
-        let entities = (em.spawn(), em.spawn(), em.spawn());
-        em.despawn(entities.2);
-        entities
-    };
-    world.signal::<TrackHit>().send(TrackHit(first), ..);
-    let modify_id = world
-        .signal::<TrackHit>()
-        .send(TrackHit(second), ..)
-        .unwrap();
-    world.insert_resource(HitPlan {
-        first,
-        dead,
-        emit_at: 2,
-        kill_at: 4,
-        modify_at: 5,
-        modify_id,
+    let mut world = World::build(|setup| {
+        let (first, second, dead) = {
+            let mut em = setup.entity_manager();
+            let entities = (em.spawn(), em.spawn(), em.spawn());
+            em.despawn(entities.2);
+            entities
+        };
+        setup.signal::<TrackHit>().send(TrackHit(first), ..);
+        let modify_id = setup
+            .signal::<TrackHit>()
+            .send(TrackHit(second), ..)
+            .unwrap();
+        setup.insert_resource(HitPlan {
+            first,
+            dead,
+            emit_at: 2,
+            kill_at: 4,
+            modify_at: 5,
+            modify_id,
+        });
     });
 
     let mut tracker = world.to_tracker();
@@ -902,9 +897,11 @@ fn filtered_counts_follow_deaths_and_payload_changes() {
 
 #[test]
 fn a_signal_whose_entity_dies_in_the_reading_loop_still_counts() {
-    let mut world = World::new();
-    let target = world.entity_manager().spawn();
-    world.insert_resource(DiePlan { target, at: 2 });
+    let mut target = Entity::default();
+    let mut world = World::build(|setup| {
+        target = setup.spawn();
+        setup.insert_resource(DiePlan { target, at: 2 });
+    });
 
     let mut tracker = world.to_tracker();
     step(&mut tracker, &mut world);
@@ -914,7 +911,7 @@ fn a_signal_whose_entity_dies_in_the_reading_loop_still_counts() {
         vec![row("track_die_reader", "track_die_driver", Some(1), 1)]
     );
 
-    assert!(!world.entity_manager().is_alive(target));
+    assert!(!world.entities().is_alive(target));
 }
 
 #[test]
@@ -939,8 +936,10 @@ fn a_tracked_step_saves_the_same_bytes_as_a_plain_step() {
 
 #[test]
 fn signals_sent_before_the_tracker_started_have_an_unknown_sender() {
-    let mut world = world_with(reading());
-    world.signal::<TrackPing>().send(TrackPing(1), ..);
+    let mut world = World::build(|setup| {
+        setup.insert_resource(reading());
+        setup.signal::<TrackPing>().send(TrackPing(1), ..);
+    });
     world.step();
     let mut tracker = world.to_tracker();
     step(&mut tracker, &mut world);
@@ -1008,7 +1007,7 @@ fn a_tracker_on_a_loaded_snapshot_matches_one_tracking_from_the_start() {
 fn signals_sent_from_outside_between_steps_are_credited_to_outside() {
     let mut world = World::new();
     let mut tracker = world.to_tracker();
-    world.signal::<TrackPong>().emit(TrackPong(1));
+    world.input(TrackPong(1));
     step(&mut tracker, &mut world);
 
     let frame = frame_of(tracker.log(), 0, "TrackPong").unwrap();

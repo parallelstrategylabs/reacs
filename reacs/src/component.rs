@@ -90,7 +90,7 @@ impl<C: 'static + Default + Copy + Hashed> Component<'_, C, Write> {
 
 impl World {
     #[inline]
-    pub fn init_component<C: 'static + Copy + Default + Hashed>(&mut self) {
+    pub(crate) fn init_component<C: 'static + Copy + Default + Hashed>(&mut self) {
         let id = ComponentMap::<C>::TYPE_UUID;
         get_registry_entry(id).unwrap_or_else(|| {
             let type_name = std::any::type_name::<C>();
@@ -115,7 +115,7 @@ impl World {
     }
 
     #[inline]
-    pub fn get_component_map_mut<C: 'static + Copy + Default + Hashed>(
+    pub(crate) fn get_component_map_mut<C: 'static + Copy + Default + Hashed>(
         &mut self,
     ) -> RefMut<'_, ComponentMap<C>> {
         self.get_resource_mut::<ComponentMap<C>>()
@@ -128,7 +128,7 @@ impl World {
     }
 
     #[inline]
-    pub fn set_component<C: 'static + Copy + Default + Hashed>(
+    pub(crate) fn set_component<C: 'static + Copy + Default + Hashed>(
         &mut self,
         entity: Entity,
         value: C,
@@ -137,7 +137,10 @@ impl World {
     }
 
     #[inline]
-    pub fn remove_component<C: 'static + Copy + Default + Hashed>(&mut self, entity: Entity) {
+    pub(crate) fn remove_component<C: 'static + Copy + Default + Hashed>(
+        &mut self,
+        entity: Entity,
+    ) {
         self.get_component_map_mut::<C>().remove(entity);
     }
 
