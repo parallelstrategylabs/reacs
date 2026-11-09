@@ -10,7 +10,7 @@ pub(crate) mod free_list;
 pub mod hashed;
 pub mod index_map;
 pub mod registry;
-pub mod replay;
+pub mod record;
 pub mod resource;
 pub mod schedule;
 pub mod signal;

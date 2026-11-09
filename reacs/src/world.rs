@@ -8,7 +8,7 @@ use crate::{
     entity::EntityManager,
     hashed::Hashed,
     registry::get_registry_entry,
-    replay::init_input_signals,
+    record::init_input_signals,
     resource::LocalResourceType,
     schedule::{ANONYMOUS_SYSTEM, CurrentSystem, Mut, set_current_system, system_graph},
     signal::SweepCursor,

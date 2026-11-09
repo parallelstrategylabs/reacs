@@ -1,5 +1,5 @@
 use reacs::prelude::*;
-use reacs::replay::{Recorder, Recording, RecordingError, send_recorded};
+use reacs::record::{Recorder, Recording, RecordingError, send_recorded};
 use std::fs;
 use std::path::PathBuf;
 
@@ -61,7 +61,7 @@ fn echo_order(mut orders: Mut<Signal<Order>>) {
 }
 
 fn path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("reacs-replay-{}-{name}", std::process::id()))
+    std::env::temp_dir().join(format!("reacs-recording-{}-{name}", std::process::id()))
 }
 
 fn play(world: &mut World, recorder: &mut Recorder, ticks: std::ops::Range<u64>) {
@@ -167,7 +167,7 @@ fn a_game_can_compare_two_worlds_by_their_resource_hashes() {
 }
 
 #[test]
-fn a_recording_reads_back_as_data_a_tool_can_replay() {
+fn a_recording_reads_back_as_data_a_tool_can_run_again() {
     let file = path("reader");
     let mut world = World::new();
     let mut recorder = world.to_recorder(&file).unwrap().with_hash_every(4);

@@ -373,7 +373,7 @@ pub fn signal(attr: TokenStream, item: TokenStream) -> TokenStream {
     let (input_impl, input_register) = if input_signal {
         (
             quote! { impl ::reacs::signal::InputSignal for #name {} },
-            quote! { ::reacs::replay::register_input_signal::<#name>(); },
+            quote! { ::reacs::record::register_input_signal::<#name>(); },
         )
     } else {
         (quote! {}, quote! {})

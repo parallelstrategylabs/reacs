@@ -20,8 +20,8 @@ use crate::{
     world::World,
 };
 
-const MAGIC: &[u8; 8] = b"REACSRP1";
-pub const REPLAY_HASH_EVERY: u64 = 64;
+const MAGIC: &[u8; 8] = b"REACSRC1";
+pub const RECORD_HASH_EVERY: u64 = 64;
 
 fn options() -> bincode::DefaultOptions {
     bincode::DefaultOptions::new()
@@ -297,7 +297,7 @@ impl World {
 
         Ok(Recorder {
             out,
-            hash_every: REPLAY_HASH_EVERY,
+            hash_every: RECORD_HASH_EVERY,
             first_ids: next_ids(self),
             last: None,
             written: start_tick,
