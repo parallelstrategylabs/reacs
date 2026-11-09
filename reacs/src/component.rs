@@ -1,11 +1,15 @@
-use reacs_derive::{Hashed, param};
+use reacs_derive::Hashed;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    direct_map::DirectMap, entity::Entity, prelude::*, registry::get_registry_entry,
-    schedule::Write,
+    entity::Entity,
+    prelude::*,
+    registry::get_registry_entry,
+    schedule::{Mode, ParamInit, ParamWorld, Read, SystemParam, WithMode, Write},
 };
 use std::cell::{Ref, RefMut};
+
+const EMPTY: u32 = 0;
 
 #[derive(Clone, Copy, Default, Serialize, Deserialize)]
 struct Slot<C> {
@@ -15,7 +19,7 @@ struct Slot<C> {
 
 #[derive(Default, Hashed, Serialize, Deserialize)]
 pub struct ComponentMap<C: Copy + Default> {
-    slots: DirectMap<Slot<C>>,
+    slots: Vec<Slot<C>>,
 }
 
 impl<C: Copy + Default> ComponentMap<C> {
@@ -30,17 +34,19 @@ impl<C: Copy + Default> ComponentMap<C> {
 
     #[inline]
     pub fn get(&self, entity: Entity) -> Option<&C> {
+        let generation = entity.generation();
         self.slots
             .get(entity.index() as usize)
-            .filter(|slot| slot.generation == entity.generation())
+            .filter(|slot| (slot.generation == generation) & (generation != EMPTY))
             .map(|slot| &slot.value)
     }
 
     #[inline]
     pub fn get_mut(&mut self, entity: Entity) -> Option<&mut C> {
+        let generation = entity.generation();
         self.slots
             .get_mut(entity.index() as usize)
-            .filter(|slot| slot.generation == entity.generation())
+            .filter(|slot| (slot.generation == generation) & (generation != EMPTY))
             .map(|slot| &mut slot.value)
     }
 
@@ -48,43 +54,104 @@ impl<C: Copy + Default> ComponentMap<C> {
     pub(crate) fn insert(&mut self, entity: Entity, value: C) {
         let index = entity.index() as usize;
         let generation = entity.generation();
-        if self
-            .slots
-            .get(index)
-            .is_some_and(|s| s.generation > generation)
-        {
+        if generation == EMPTY {
             return;
         }
-        self.slots.insert(index, Slot { generation, value });
+        if index >= self.slots.len() {
+            let new_size = (index + 1).next_power_of_two();
+            let mut slots = Vec::with_capacity(new_size);
+            slots.extend_from_slice(&self.slots);
+            slots.resize(new_size, Slot::default());
+            self.slots = slots;
+        }
+        let slot = &mut self.slots[index];
+        if slot.generation > generation {
+            return;
+        }
+        *slot = Slot { generation, value };
     }
 
     #[inline]
     pub(crate) fn remove(&mut self, entity: Entity) {
-        if self.has(entity) {
-            self.slots.remove(entity.index() as usize);
+        let generation = entity.generation();
+        if let Some(slot) = self.slots.get_mut(entity.index() as usize) {
+            if (slot.generation == generation) & (generation != EMPTY) {
+                slot.generation = EMPTY;
+            }
         }
     }
 }
 
-#[param]
-pub struct Component<C: Default + Copy + Hashed> {
-    map: Resource<ComponentMap<C>>,
+pub struct Component<'w, C: 'static + Copy + Default, M: Mode = Read> {
+    slots: *mut Slot<C>,
+    len: usize,
+    map: M::Guard<'w, ComponentMap<C>>,
 }
 
-impl<C: 'static + Default + Copy + Hashed> Component<'_, C, Write> {
+impl<'w, C: 'static + Copy + Default, M0: Mode, M: Mode> WithMode<M> for Component<'w, C, M0> {
+    type Out = Component<'w, C, M>;
+}
+
+impl<C: 'static + Copy + Default, M: Mode> Component<'_, C, M> {
+    #[inline]
+    fn slot(&self, entity: Entity) -> Option<*mut Slot<C>> {
+        let index = entity.index() as usize;
+        let generation = entity.generation();
+        if index >= self.len {
+            return None;
+        }
+        let slot = unsafe { self.slots.add(index) };
+        let found = unsafe { (*slot).generation } == generation;
+        (found & (generation != EMPTY)).then_some(slot)
+    }
+
+    #[inline]
+    pub fn has(&self, entity: Entity) -> bool {
+        self.slot(entity).is_some()
+    }
+
+    #[inline]
+    pub fn get(&self, entity: Entity) -> Option<C> {
+        self.slot(entity).map(|slot| unsafe { (*slot).value })
+    }
+}
+
+impl<C: 'static + Copy + Default> Component<'_, C, Write> {
     #[inline]
     pub fn get_mut(&mut self, entity: Entity) -> Option<&mut C> {
-        self.map.get_mut(entity)
+        self.slot(entity).map(|slot| unsafe { &mut (*slot).value })
     }
 
     #[inline]
     pub fn insert(&mut self, entity: Entity, value: C) {
         self.map.insert(entity, value);
+        self.slots = self.map.slots.as_mut_ptr();
+        self.len = self.map.slots.len();
     }
 
     #[inline]
     pub fn remove(&mut self, entity: Entity) {
-        self.map.remove(entity);
+        if let Some(slot) = self.slot(entity) {
+            unsafe { (*slot).generation = EMPTY };
+        }
+    }
+}
+
+impl<C: 'static + Copy + Default + Hashed, M: Mode> SystemParam for Component<'_, C, M> {
+    type Item<'w> = Component<'w, C, M>;
+
+    fn init(world: ParamInit<'_>) {
+        world.0.init_resource::<ComponentMap<C>>();
+    }
+
+    fn fetch<'w>(world: ParamWorld<'w>) -> Component<'w, C, M> {
+        let mut map = M::fetch::<ComponentMap<C>>(world);
+        let slots = match M::guard_mut(&mut map) {
+            Some(map) => map.slots.as_mut_ptr(),
+            None => map.slots.as_ptr().cast_mut(),
+        };
+        let len = map.slots.len();
+        Component { slots, len, map }
     }
 }
 
@@ -222,6 +289,23 @@ mod tests {
             .0 = 2;
 
         assert_eq!(world.get_component::<IntComponent>(entity).unwrap().0, 2);
+    }
+
+    #[test]
+    fn default_entity_never_has_components() {
+        let entity = Entity::new(0, 1);
+        let mut world = World::new();
+        world.init_component::<IntComponent>();
+        world.set_component(Entity::new(1, 1), IntComponent(1));
+        world.set_component(Entity::default(), IntComponent(2));
+
+        assert!(!world.has_component::<IntComponent>(Entity::default()));
+        assert!(!world.has_component::<IntComponent>(entity));
+
+        world.set_component(entity, IntComponent(3));
+        world.remove_component::<IntComponent>(entity);
+        assert!(!world.has_component::<IntComponent>(Entity::default()));
+        assert!(!world.has_component::<IntComponent>(entity));
     }
 
     fn world_with_reused_index() -> (World, Entity, Entity) {

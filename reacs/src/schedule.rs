@@ -406,6 +406,7 @@ pub trait Mode {
     type WorldGuard<'w>: Deref<Target = World>;
     fn fetch<'w, T: 'static + Hashed>(world: ParamWorld<'w>) -> Self::Guard<'w, T>;
     fn fetch_local<'w, T: LocalResourceType>(world: ParamWorld<'w>) -> Self::Guard<'w, T>;
+    fn guard_mut<'a, T>(guard: &'a mut Self::Guard<'_, T>) -> Option<&'a mut T>;
 }
 
 impl Mode for Read {
@@ -423,6 +424,9 @@ impl Mode for Read {
             .get_local_resource::<T>()
             .unwrap_or_else(|| conflict::<T>())
     }
+    fn guard_mut<'a, T>(_guard: &'a mut Ref<'_, T>) -> Option<&'a mut T> {
+        None
+    }
 }
 
 impl Mode for Write {
@@ -439,6 +443,9 @@ impl Mode for Write {
             .0
             .get_local_resource_mut::<T>()
             .unwrap_or_else(|| conflict::<T>())
+    }
+    fn guard_mut<'a, T>(guard: &'a mut RefMut<'_, T>) -> Option<&'a mut T> {
+        Some(&mut **guard)
     }
 }
 
