@@ -47,6 +47,15 @@ where
     }
 }
 
+pub(crate) fn registered_ids() -> Vec<u128> {
+    unsafe {
+        let ptr = addr_of_mut!(REGISTRY);
+        (*ptr)
+            .as_ref()
+            .map_or_else(Vec::new, |map| map.iter().map(|entry| entry.0).collect())
+    }
+}
+
 pub fn get_registry_entry(id: u128) -> Option<&'static RegistryEntry> {
     unsafe {
         let ptr = addr_of_mut!(REGISTRY);

@@ -8,9 +8,10 @@ use crate::{
     entity::EntityManager,
     hashed::Hashed,
     registry::get_registry_entry,
+    replay::init_input_signals,
     resource::LocalResourceType,
     schedule::{ANONYMOUS_SYSTEM, CurrentSystem, Mut, set_current_system, system_graph},
-    signal::{SweepCursor, init_signals},
+    signal::SweepCursor,
 };
 use serde::{Deserialize, Serialize};
 
@@ -53,7 +54,7 @@ impl World {
         world.init_resource::<Tick>();
         world.init_resource::<SweepCursor>();
         world.init_param::<Mut<EntityManager>>();
-        init_signals(&mut world);
+        init_input_signals(&mut world);
         system_graph().init(&mut world);
 
         world
@@ -258,6 +259,26 @@ impl World {
             .collect();
 
         self.resources = resources;
+        self.finish_load();
+    }
+
+    pub(crate) fn restore_recorded(&mut self, bytes: &[u8]) -> Option<()> {
+        let mut body = bytes;
+        let header: SaveHeader = bincode::deserialize_from(&mut body).ok()?;
+        let saved: Vec<(u128, Vec<u8>)> = bincode::deserialize(body).ok()?;
+
+        let mut resources = Vec::with_capacity(saved.len());
+        for (id, bytes) in &saved {
+            resources.push((*id, (get_registry_entry(*id)?.restore)(bytes)));
+        }
+
+        self.resources = resources;
+        self.app_version = header.app_version;
+        self.finish_load();
+        Some(())
+    }
+
+    fn finish_load(&mut self) {
         set_current_system(self, ANONYMOUS_SYSTEM);
 
         for local in &self.local_resources {

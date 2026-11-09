@@ -512,6 +512,11 @@ impl WorldAccess<'_, Write> {
     }
 
     #[inline]
+    pub fn init_signal<S: SignalType>(&mut self) {
+        self.0.init_signal::<S>();
+    }
+
+    #[inline]
     pub fn signal<S: SignalType>(&self) -> Mut<Signal<'_, S>> {
         self.0.signal::<S>()
     }

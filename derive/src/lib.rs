@@ -370,8 +370,14 @@ pub fn signal(attr: TokenStream, item: TokenStream) -> TokenStream {
     let snake_name = format_ident!("{}", name.to_string().to_lowercase());
     let ctor_fn = format_ident!("__register_signal_{}", snake_name);
     let link = linked_crates();
-    let input_impl =
-        input_signal.then(|| quote! { impl ::reacs::signal::InputSignal for #name {} });
+    let (input_impl, input_register) = if input_signal {
+        (
+            quote! { impl ::reacs::signal::InputSignal for #name {} },
+            quote! { ::reacs::replay::register_input_signal::<#name>(); },
+        )
+    } else {
+        (quote! {}, quote! {})
+    };
     let filter = match entity {
         Some(field) => {
             let field = match field.map_or_else(|| find_entity_field(&input), Ok) {
@@ -427,6 +433,7 @@ pub fn signal(attr: TokenStream, item: TokenStream) -> TokenStream {
                 <Data as ::reacs::hashed::Hashed>::TYPE_UUID,
             );
             ::reacs::signal::register_signal::<#name>();
+            #input_register
         }
     };
 
