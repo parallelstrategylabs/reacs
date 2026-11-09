@@ -35,7 +35,7 @@ const BLOCK_FILL: Color32 = Color32::from_rgb(31, 33, 38);
 const WIRE_WIDTH: f32 = 2.0;
 const WIRE_EMPHASIS_WIDTH: f32 = 4.0;
 const WIRE_REACH: f32 = 7.0;
-const MAX_STUB_NOTES: usize = 12;
+const MAX_TOOLTIP_LINES: usize = 1024;
 const DASH_LENGTH: f32 = 8.0;
 const DASH_PERIOD: f32 = 14.0;
 const OFF_SCREEN_TEXT: f32 = 0.65;
@@ -679,17 +679,30 @@ fn describe_wire(graph: &TickGraph, wire: &Wire) -> String {
         "\nfrom {} on tick {}\nto {} on tick {}",
         source.full_name, source.tick, target.full_name, target.tick
     ));
+    for line in wire.details.iter().take(MAX_TOOLTIP_LINES) {
+        text.push('\n');
+        text.push_str(line);
+    }
+    if wire.details.len() > MAX_TOOLTIP_LINES {
+        text.push_str(&format!(
+            "\nand {} more",
+            wire.details.len() - MAX_TOOLTIP_LINES
+        ));
+    }
     text
 }
 
 fn describe_stub(port: &Port) -> String {
     let mut text = format!("{}, off screen", port.label);
-    for note in port.notes.iter().take(MAX_STUB_NOTES) {
+    for note in port.notes.iter().take(MAX_TOOLTIP_LINES) {
         text.push('\n');
         text.push_str(note);
     }
-    if port.notes.len() > MAX_STUB_NOTES {
-        text.push_str(&format!("\nand {} more", port.notes.len() - MAX_STUB_NOTES));
+    if port.notes.len() > MAX_TOOLTIP_LINES {
+        text.push_str(&format!(
+            "\nand {} more",
+            port.notes.len() - MAX_TOOLTIP_LINES
+        ));
     }
     text
 }
@@ -1245,6 +1258,27 @@ mod tests {
     }
 
     #[test]
+    fn a_tooltip_lists_every_recorded_signal_up_to_its_limit() {
+        use crate::graph::Port;
+        let port = |notes: usize| Port {
+            signal: 1,
+            label: "Regen".to_string(),
+            count: 1,
+            cancelled: 0,
+            modified: 0,
+            external: true,
+            wired: false,
+            stub_x: 0.0,
+            faded: false,
+            notes: vec!["#1 Regen".to_string(); notes],
+        };
+
+        assert_eq!(super::describe_stub(&port(300)).lines().count(), 301);
+        let cut = super::describe_stub(&port(super::MAX_TOOLTIP_LINES + 5));
+        assert!(cut.ends_with("and 5 more"));
+    }
+
+    #[test]
     fn hovering_or_selecting_an_edge_emphasizes_both_of_its_ports() {
         use crate::graph::Wire;
         let wire = |focused: bool, from: usize, to: usize, port: usize| Wire {
@@ -1259,6 +1293,7 @@ mod tests {
             label_at: Pos2::ZERO,
             faded: false,
             focused,
+            details: Vec::new(),
         };
         let graph = TickGraph {
             wires: vec![wire(false, 0, 1, 0), wire(true, 2, 3, 1)],

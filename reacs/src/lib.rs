@@ -14,6 +14,7 @@ pub mod resource;
 pub mod schedule;
 pub mod signal;
 pub mod tracking;
+mod tracking_text;
 pub mod world;
 
 #[doc(hidden)]

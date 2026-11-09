@@ -1,6 +1,8 @@
 use crate::palette::Palette;
 use eframe::egui::{Pos2, Rect, Vec2, pos2, vec2};
-use reacs::tracking::{TrackedFrame, TrackingSave, UNKNOWN_SENDER};
+use reacs::tracking::{
+    TrackedFrame, TrackedInstance, TrackedSignalFrame, TrackingSave, UNKNOWN_SENDER,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
@@ -111,6 +113,7 @@ pub struct Wire {
     pub label_at: Pos2,
     pub faded: bool,
     pub focused: bool,
+    pub details: Vec<String>,
 }
 
 pub type NodeKey = (u64, u128);
@@ -432,6 +435,62 @@ fn outputs_of(save: &TrackingSave, frame: &TrackedFrame, system: u128) -> Vec<Po
         .collect()
 }
 
+fn instance_line(instance: &TrackedInstance, sent_tick: u64) -> String {
+    let window = match instance.window {
+        None => String::new(),
+        Some((start, u64::MAX)) if start <= sent_tick => ", open-ended".to_string(),
+        Some((start, u64::MAX)) => format!(", from tick {start}, open-ended"),
+        Some((start, end)) => format!(", ticks {start}..{end}"),
+    };
+    format!("#{} {}{window}", instance.id, instance.payload)
+}
+
+fn sent_lines(
+    signal: &TrackedSignalFrame,
+    sender: u128,
+    sent_tick: u64,
+    windows_only: bool,
+) -> Vec<String> {
+    let mut lines: Vec<String> = signal
+        .instances
+        .iter()
+        .filter(|x| x.sender == sender && (!windows_only || x.window.is_some()))
+        .map(|instance| instance_line(instance, sent_tick))
+        .collect();
+    if signal.instances_omitted > 0 {
+        lines.push(format!(
+            "{} more on this tick not recorded",
+            signal.instances_omitted
+        ));
+    }
+    lines
+}
+
+fn change_lines(signal: &TrackedSignalFrame, system: u128, sender: u128) -> Vec<String> {
+    signal
+        .changes
+        .iter()
+        .filter(|x| x.system == system && x.sender == sender)
+        .map(|x| match &x.payload {
+            Some(payload) => format!("#{} changed to {payload}", x.id),
+            None => format!("#{} cancelled", x.id),
+        })
+        .collect()
+}
+
+fn signal_sent_at<'a>(
+    save: &'a TrackingSave,
+    by_tick: &BTreeMap<u64, &'a TrackedFrame>,
+    tick: u64,
+    signal: u128,
+) -> Option<&'a TrackedSignalFrame> {
+    let frame = by_tick
+        .get(&tick)
+        .copied()
+        .or_else(|| save.frames_in(tick..tick + 1).next())?;
+    frame.signals.iter().find(|x| x.signal == signal)
+}
+
 fn add_inputs_and_wires(
     save: &TrackingSave,
     by_tick: &BTreeMap<u64, &TrackedFrame>,
@@ -453,6 +512,16 @@ fn add_inputs_and_wires(
                             .position(|port| port.signal == signal.signal)?;
                         Some((from_node, from_port))
                     });
+
+                let mut details = received
+                    .sent_tick
+                    .and_then(|sent| {
+                        Some((sent, signal_sent_at(save, by_tick, sent, signal.signal)?))
+                    })
+                    .map_or_else(Vec::new, |(tick, sent)| {
+                        sent_lines(sent, received.sender, tick, received.windowed)
+                    });
+                details.extend(change_lines(signal, received.receiver, received.sender));
 
                 let to_node = indices[&(*tick, received.receiver)];
                 let node = &mut graph.nodes[to_node];
@@ -478,6 +547,7 @@ fn add_inputs_and_wires(
                         label_at: Pos2::ZERO,
                         faded: false,
                         focused: false,
+                        details,
                     });
                     continue;
                 }
@@ -490,6 +560,7 @@ fn add_inputs_and_wires(
                 let port = add_input(node, signal.signal, &name, received.count, Some(note));
                 node.inputs[port].cancelled += received.cancelled;
                 node.inputs[port].modified += received.modified;
+                node.inputs[port].notes.extend(details);
             }
         }
     }
@@ -618,6 +689,16 @@ fn mark_reads_after_the_view(
                 let outputs = &mut graph.nodes[*node].outputs;
                 if let Some(port) = outputs.iter_mut().find(|x| x.signal == signal.signal) {
                     port.external = true;
+                    if !port.notes.iter().any(|note| note.starts_with('#')) {
+                        let tick = received.sent_tick.unwrap_or(frame.tick);
+                        let sent = save.frames_in(tick..tick + 1).next().and_then(|sent| {
+                            sent.signals.iter().find(|x| x.signal == signal.signal)
+                        });
+                        if let Some(sent) = sent {
+                            port.notes
+                                .extend(sent_lines(sent, received.sender, tick, false));
+                        }
+                    }
                     let reader = format!("to {},", sender_name(save, received.receiver));
                     if !port.notes.iter().any(|note| note.starts_with(&reader)) {
                         port.notes.push(format!("{reader} tick {}", frame.tick));
@@ -1257,6 +1338,7 @@ mod tests {
             label_at: Pos2::ZERO,
             faded: false,
             focused: false,
+            details: Vec::new(),
         }
     }
 
@@ -1789,7 +1871,14 @@ mod tests {
         let save = recorded(4);
         let incoming = one_row(&save, 1..2, None);
         let early = &incoming.nodes[node(&incoming, 1, "fixture_early")];
-        assert_eq!(early.inputs[0].notes, ["from fixture_emit, tick 0"]);
+        assert_eq!(
+            early.inputs[0].notes,
+            [
+                "from fixture_emit, tick 0",
+                "#0 FixturePing { _: 1 }",
+                "#1 FixturePing { _: 2 }"
+            ]
+        );
 
         let outgoing = one_row(&save, 0..1, None);
         let emit = &outgoing.nodes[node(&outgoing, 0, "fixture_emit")];
@@ -1798,7 +1887,50 @@ mod tests {
             .iter()
             .find(|x| x.label == "FixturePing")
             .unwrap();
-        assert_eq!(ping.notes, ["to fixture_early, tick 1"]);
+        assert_eq!(
+            ping.notes,
+            [
+                "#0 FixturePing { _: 1 }",
+                "#1 FixturePing { _: 2 }",
+                "to fixture_early, tick 1"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_wire_lists_the_signals_it_carries() {
+        let save = recorded(4);
+        let graph = one_row(&save, 0..2, None);
+        let wire = graph
+            .wires
+            .iter()
+            .find(|wire| wire.label.starts_with("FixturePing"))
+            .unwrap();
+        assert_eq!(wire.details[0], "#0 FixturePing { _: 1 }");
+    }
+
+    #[test]
+    fn a_window_line_shows_its_ticks() {
+        let instance = |window| reacs::tracking::TrackedInstance {
+            id: 7,
+            sender: 1,
+            window,
+            entities: Vec::new(),
+            payload: "Burn(1)".to_string(),
+        };
+        assert_eq!(super::instance_line(&instance(None), 3), "#7 Burn(1)");
+        assert_eq!(
+            super::instance_line(&instance(Some((3, 9))), 3),
+            "#7 Burn(1), ticks 3..9"
+        );
+        assert_eq!(
+            super::instance_line(&instance(Some((0, u64::MAX))), 3),
+            "#7 Burn(1), open-ended"
+        );
+        assert_eq!(
+            super::instance_line(&instance(Some((8, u64::MAX))), 3),
+            "#7 Burn(1), from tick 8, open-ended"
+        );
     }
 
     #[test]

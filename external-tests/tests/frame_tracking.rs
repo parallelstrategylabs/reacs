@@ -105,6 +105,12 @@ struct Acted(u64);
 #[signal]
 struct Untouched(u64);
 
+#[signal]
+struct Aimed {
+    target: Entity,
+    amount: u32,
+}
+
 #[system]
 fn untouched_sender(mut signals: Mut<Signal<Untouched>>, plan: Resource<ActPlan>) {
     if plan.kind == UNTOUCHED && signals.tick() == 0 {
@@ -125,6 +131,7 @@ const EMIT: u64 = 1;
 const WINDOW: u64 = 2;
 const OPEN: u64 = 3;
 const UNTOUCHED: u64 = 4;
+const AIMED: u64 = 5;
 const CANCEL: u64 = 1;
 const MODIFY: u64 = 2;
 
@@ -139,6 +146,16 @@ fn act_sender(mut signals: Mut<Signal<Acted>>, mut plan: Mut<Resource<ActPlan>>)
         WINDOW => plan.id = signals.send(Acted(1), tick..tick + 8).unwrap(),
         OPEN => plan.id = signals.send(Acted(1), ..).unwrap(),
         _ => {}
+    }
+}
+
+#[system(run_after(act_sender))]
+fn act_aimer(mut signals: Mut<Signal<Aimed>>, plan: Resource<ActPlan>) {
+    if plan.kind == AIMED && signals.tick() == 0 {
+        signals.emit(Aimed {
+            target: Entity::default(),
+            amount: 5,
+        });
     }
 }
 
@@ -443,6 +460,120 @@ fn reading_and_cancelling_a_running_window_counts_the_read() {
         5,
     );
     assert_eq!(acted_on(&tracker, 3), [change(Some(0), true, 1, 1, 0)]);
+}
+
+fn recorded_details(tracker: &Tracker, name: &str, tick: u64) -> TrackedSignalFrame {
+    frame_of(tracker.log(), tick, name).unwrap()
+}
+
+fn sender_of(tracker: &Tracker, id: u128) -> String {
+    short(tracker.log().system_name(id))
+}
+
+#[test]
+fn each_sent_signal_records_its_id_sender_and_payload() {
+    let tracker = run_plan(
+        ActPlan {
+            kind: EMIT,
+            ..Default::default()
+        },
+        1,
+    );
+    let frame = recorded_details(&tracker, "Acted", 0);
+    assert_eq!(frame.instances.len(), 1);
+    let instance = &frame.instances[0];
+    assert_eq!(instance.payload, "Acted { _: 1 }");
+    assert_eq!(sender_of(&tracker, instance.sender), "act_sender");
+    assert_eq!(instance.window, None);
+    assert_eq!(frame.instances_omitted, 0);
+}
+
+#[test]
+fn a_window_records_its_ticks() {
+    for (kind, window) in [(WINDOW, (0, 8)), (OPEN, (0, u64::MAX))] {
+        let tracker = run_plan(
+            ActPlan {
+                kind,
+                ..Default::default()
+            },
+            1,
+        );
+        let frame = recorded_details(&tracker, "Acted", 0);
+        assert_eq!(frame.instances[0].window, Some(window));
+    }
+}
+
+#[test]
+fn entities_in_a_payload_are_recorded() {
+    let tracker = run_plan(
+        ActPlan {
+            kind: AIMED,
+            ..Default::default()
+        },
+        1,
+    );
+    let instance = &recorded_details(&tracker, "Aimed", 0).instances[0];
+    assert_eq!(instance.payload, "Aimed { target: Entity(0v0), amount: 5 }");
+    assert_eq!(instance.entities, [Entity::default().to_bits()]);
+}
+
+#[test]
+fn details_stop_at_the_limit_and_the_rest_is_counted() {
+    let mut world = world_with(TrackPlan {
+        emits_a: 10,
+        ..Default::default()
+    });
+    let mut tracker = world.to_tracker().with_payload_limit(3);
+    step(&mut tracker, &mut world);
+    let frame = recorded_details(&tracker, "TrackPing", 0);
+    assert_eq!(frame.instances.len(), 3);
+    assert_eq!(frame.instances_omitted, 7);
+    assert_eq!(frame.sent[0].count, 10);
+}
+
+#[test]
+fn a_limit_of_zero_records_counts_only() {
+    let mut world = world_with(TrackPlan {
+        emits_a: 4,
+        ..Default::default()
+    });
+    let mut tracker = world.to_tracker().with_payload_limit(0);
+    step(&mut tracker, &mut world);
+    let frame = recorded_details(&tracker, "TrackPing", 0);
+    assert!(frame.instances.is_empty());
+    assert_eq!(frame.instances_omitted, 4);
+}
+
+#[test]
+fn changes_record_which_signal_and_its_new_payload() {
+    let modified = run_plan(
+        ActPlan {
+            kind: EMIT,
+            action: MODIFY,
+            at: 1,
+            ..Default::default()
+        },
+        1,
+    );
+    let frame = recorded_details(&modified, "Acted", 0);
+    assert_eq!(frame.changes.len(), 1);
+    assert_eq!(frame.changes[0].id, frame.instances[0].id);
+    assert!(!frame.changes[0].cancelled);
+    assert_eq!(frame.changes[0].payload.as_deref(), Some("Acted { _: 2 }"));
+    assert_eq!(sender_of(&modified, frame.changes[0].system), "act_meddler");
+
+    let cancelled = run_plan(
+        ActPlan {
+            kind: EMIT,
+            action: CANCEL,
+            at: 1,
+            ..Default::default()
+        },
+        1,
+    );
+    let frame = recorded_details(&cancelled, "Acted", 0);
+    assert!(frame.changes[0].cancelled);
+    assert_eq!(frame.changes[0].payload, None);
 }
 
 #[test]

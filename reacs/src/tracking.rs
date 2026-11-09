@@ -14,13 +14,15 @@ use crate::{
     registry::get_registry_entry,
     schedule::{ANONYMOUS_SYSTEM, system_graph},
     signal::{SignalData, SignalFilter, SignalInstance, SignalType, Signals, WindowEntry},
+    tracking_text::describe,
     world::World,
 };
 
 pub const UNKNOWN_SENDER: u128 = u128::MAX;
 pub const TRACKER_WINDOW_TICKS: u64 = 4096;
+pub const TRACKER_PAYLOADS_PER_TICK: u64 = 64;
 const MIN_TRIM_RUNS: usize = 64;
-const SNAPSHOT_MAGIC: [u8; 8] = *b"REACSTR2";
+const SNAPSHOT_MAGIC: [u8; 8] = *b"REACSTR3";
 const HASH_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const HASH_PRIME: u64 = 0x0000_0100_0000_01b3;
 const MAX_MESSAGE_BYTES: usize = 1 << 30;
@@ -50,10 +52,31 @@ pub struct TrackedName {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackedInstance {
+    pub id: u64,
+    pub sender: u128,
+    pub window: Option<(u64, u64)>,
+    pub entities: Vec<u64>,
+    pub payload: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackedChange {
+    pub system: u128,
+    pub sender: u128,
+    pub id: u64,
+    pub cancelled: bool,
+    pub payload: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrackedSignalFrame {
     pub signal: u128,
     pub sent: Vec<SentCount>,
     pub received: Vec<ReceivedCount>,
+    pub instances: Vec<TrackedInstance>,
+    pub instances_omitted: u64,
+    pub changes: Vec<TrackedChange>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +101,10 @@ struct LiveSignal {
     runs: Vec<SenderRun>,
     sent: Vec<SentCount>,
     received: Vec<ReceivedCount>,
+    instances: Vec<TrackedInstance>,
+    instances_omitted: u64,
+    changes: Vec<TrackedChange>,
+    detail_limit: u64,
     born: Vec<(u64, u64)>,
     suspects: Vec<u64>,
     states: Vec<Option<SignalState>>,
@@ -183,12 +210,12 @@ fn entry_in<S: Copy>(list: &[WindowEntry<S>], id: u64) -> Option<&WindowEntry<S>
         .map(|i| &list[i])
 }
 
-fn locate<S: SignalType>(signals: &Signals<S>, id: u64) -> Option<SignalState> {
+fn locate<S: SignalType>(signals: &Signals<S>, id: u64) -> Option<(SignalState, S)> {
     let one_tick_copy = [&signals.transient, &signals.transient_buffer]
         .into_iter()
         .find_map(|list| {
             let i = list.binary_search_by_key(&id, |x| x.id).ok()?;
-            Some(payload_hash(&list[i].payload))
+            Some(list[i].payload)
         });
 
     let permanent = |range: Range<usize>| {
@@ -199,14 +226,15 @@ fn locate<S: SignalType>(signals: &Signals<S>, id: u64) -> Option<SignalState> {
     let found = permanent(0..signals.permanent_write)
         .or_else(|| permanent(signals.permanent_read..signals.permanent.len()));
     if let Some((position, instance)) = found {
-        return Some(SignalState {
+        let state = SignalState {
             payload: payload_hash(&instance.payload),
             cancelled: signals.permanent_cancelled > 0
                 && signals.permanent_cancelled_bits.get(position),
             windowed: true,
             one_tick: false,
             running: true,
-        });
+        };
+        return Some((state, instance.payload));
     }
 
     let lists = [
@@ -228,23 +256,74 @@ fn locate<S: SignalType>(signals: &Signals<S>, id: u64) -> Option<SignalState> {
     );
     for (list, running) in lists {
         if let Some(entry) = entry_in(list, id) {
-            return Some(SignalState {
+            let state = SignalState {
                 payload: payload_hash(&entry.1.payload),
                 cancelled: entry.0.is_cancelled(),
                 windowed: true,
                 one_tick: one_tick_copy.is_some(),
                 running,
-            });
+            };
+            return Some((state, entry.1.payload));
         }
     }
 
-    one_tick_copy.map(|payload| SignalState {
-        payload,
-        cancelled: false,
-        windowed: false,
-        one_tick: true,
-        running: false,
+    one_tick_copy.map(|payload| {
+        let state = SignalState {
+            payload: payload_hash(&payload),
+            cancelled: false,
+            windowed: false,
+            one_tick: true,
+            running: false,
+        };
+        (state, payload)
     })
+}
+
+fn capture_details<S: SignalType>(
+    signals: &Signals<S>,
+    start: u64,
+    next: u64,
+    sender: u128,
+    live: &mut LiveSignal,
+) {
+    let buffer = &signals.transient_buffer;
+    let buffer = &buffer[buffer.partition_point(|x| x.id < start)..];
+    let pending = &signals.transitory_pending;
+    let pending = &pending[pending.partition_point(|x| x.1.id < start)..];
+    let room = live
+        .detail_limit
+        .saturating_sub(live.instances.len() as u64);
+
+    let (mut in_buffer, mut in_pending, mut captured) = (0, 0, 0);
+    while captured < room {
+        let (one_tick, window) = (buffer.get(in_buffer), pending.get(in_pending));
+        let id = match (one_tick, window) {
+            (None, None) => break,
+            (Some(x), None) => x.id,
+            (None, Some(x)) => x.1.id,
+            (Some(x), Some(y)) => x.id.min(y.1.id),
+        };
+        let one_tick = one_tick.filter(|x| x.id == id);
+        let window = window.filter(|x| x.1.id == id);
+        in_buffer += usize::from(one_tick.is_some());
+        in_pending += usize::from(window.is_some());
+        if window.is_some_and(|x| x.0.is_cancelled()) {
+            continue;
+        }
+        let Some(payload) = window.map(|x| x.1.payload).or(one_tick.map(|x| x.payload)) else {
+            continue;
+        };
+        let text = describe(&payload);
+        live.instances.push(TrackedInstance {
+            id,
+            sender,
+            window: window.map(|x| (x.0.start, x.0.end)),
+            entities: text.entities,
+            payload: text.text,
+        });
+        captured += 1;
+    }
+    live.instances_omitted += next - start - captured;
 }
 
 fn same_prefix<T: Serialize>(
@@ -401,7 +480,10 @@ fn find_suspects<S: SignalType>(world: &World, copy: &World, live: &mut LiveSign
 fn begin_attribution<S: SignalType>(copy: &World, live: &mut LiveSignal) {
     live.states.clear();
     if let Some(signals) = copy.get_resource::<Signals<S>>() {
-        let located = live.suspects.iter().map(|id| locate(&signals, *id));
+        let located = live
+            .suspects
+            .iter()
+            .map(|id| locate(&signals, *id).map(|found| found.0));
         live.states.extend(located);
     }
 }
@@ -432,7 +514,8 @@ fn attribute<S: SignalType>(
 
     for index in 0..live.suspects.len() {
         let id = live.suspects[index];
-        let now = locate(&signals, id);
+        let found = locate(&signals, id);
+        let now = found.map(|found| found.0);
         let was = std::mem::replace(&mut live.states[index], now);
         let Some(was) = was.filter(|was| !was.cancelled) else {
             continue;
@@ -447,12 +530,23 @@ fn attribute<S: SignalType>(
         let row = live.row(system, sender, sent_tick, was.windowed);
         if modified {
             row.modified += 1;
-            continue;
+        } else {
+            row.cancelled += 1;
+            let delivered = was.running || (was.one_tick && (from..to).contains(&id));
+            if read_now && delivered && !counted_before_running {
+                row.count += 1;
+            }
         }
-        row.cancelled += 1;
-        let delivered = was.running || (was.one_tick && (from..to).contains(&id));
-        if read_now && delivered && !counted_before_running {
-            row.count += 1;
+        if (live.changes.len() as u64) < live.detail_limit {
+            live.changes.push(TrackedChange {
+                system,
+                sender,
+                id,
+                cancelled,
+                payload: found
+                    .filter(|_| modified)
+                    .map(|found| describe(&found.1).text),
+            });
         }
     }
 }
@@ -656,6 +750,7 @@ fn after_system<S: SignalType>(
     record_sent(&signals, data.next, system, tick, live);
     if data.next > before.next {
         capture_born(&signals, before.next, live);
+        capture_details(&signals, before.next, data.next, system, live);
     }
 
     let Some((to, windows_tick)) = cursor_of(&data, system) else {
@@ -690,12 +785,17 @@ fn record_outside<S: SignalType>(world: &World, tick: u64, live: &mut LiveSignal
         if data.next < live.synced {
             *live = LiveSignal {
                 synced: data.next,
+                detail_limit: live.detail_limit,
                 ..Default::default()
             };
             return;
         }
+        let start = live.synced;
         record_sent(&signals, data.next, ANONYMOUS_SYSTEM, tick, live);
         live.born.clear();
+        if data.next > start {
+            capture_details(&signals, start, data.next, ANONYMOUS_SYSTEM, live);
+        }
     }
 }
 
@@ -914,6 +1014,7 @@ pub struct Tracker {
     copy: Option<World>,
     net: Option<TrackerNet>,
     changed: bool,
+    payload_limit: u64,
 }
 
 fn copy_world(from: &World, to: &mut World) {
@@ -978,6 +1079,7 @@ impl World {
             copy: None,
             net: None,
             changed: false,
+            payload_limit: TRACKER_PAYLOADS_PER_TICK,
         };
         tracker.begin(self);
         tracker
@@ -991,11 +1093,20 @@ impl Tracker {
         self
     }
 
+    pub fn with_payload_limit(mut self, per_tick: u64) -> Self {
+        self.payload_limit = per_tick;
+        for live in &mut self.live {
+            live.detail_limit = per_tick;
+        }
+        self
+    }
+
     fn rebaseline(&mut self, world: &World) {
         self.live = probes()
             .iter()
             .map(|probe| LiveSignal {
                 synced: (probe.baseline)(world),
+                detail_limit: self.payload_limit,
                 ..Default::default()
             })
             .collect();
@@ -1132,6 +1243,9 @@ impl Tracker {
                 signal: probe.id,
                 sent: std::mem::take(&mut live.sent),
                 received: std::mem::take(&mut live.received),
+                instances: std::mem::take(&mut live.instances),
+                instances_omitted: std::mem::take(&mut live.instances_omitted),
+                changes: std::mem::take(&mut live.changes),
             })
             .collect();
         let frame = (!signals.is_empty()).then_some(TrackedFrame { tick, signals });

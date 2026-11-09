@@ -147,37 +147,48 @@ impl Hints {
 
         let text = open.text.as_str();
         let id = open.text_id();
+        let screen = context.content_rect().size();
         let area = egui::Area::new(egui::Id::unique("hint"))
             .order(Order::Tooltip)
             .fixed_pos(open.at)
             .constrain(true)
+            .default_size(screen)
+            .sizing_pass(open.rect.is_none())
             .show(context, |ui| {
-                Frame::popup(ui.style()).show(ui, |ui| {
+                let frame = Frame::popup(ui.style());
+                let room = screen - frame.total_margin().sum();
+                frame.show(ui, |ui| {
+                    ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
                     let strong = ui.visuals().strong_text_color();
                     let normal = ui.visuals().text_color();
                     let width = ui
                         .fonts_mut(|fonts| fonts.layout_job(hint_job(text, strong, normal)))
                         .size()
                         .x;
-                    let mut layouter = |ui: &egui::Ui, buffer: &dyn TextBuffer, _: f32| {
-                        let job = hint_job(buffer.as_str(), strong, normal);
-                        ui.fonts_mut(|fonts| fonts.layout_job(job))
-                    };
-                    let mut shown = text;
-                    let mut output = TextEdit::multiline(&mut shown)
-                        .id(id)
-                        .frame(Frame::NONE)
-                        .margin(Margin::ZERO)
-                        .desired_width(width + 2.0)
-                        .desired_rows(1)
-                        .clip_text(false)
-                        .layouter(&mut layouter)
-                        .show(ui);
-                    if output.response.triple_clicked() {
-                        let everything = CCursorRange::select_all(&output.galley);
-                        output.state.cursor.set_char_range(Some(everything));
-                        output.state.store(ui.ctx(), id);
-                    }
+                    egui::ScrollArea::new([width + 2.0 > room.x, true])
+                        .max_width(room.x)
+                        .max_height(room.y)
+                        .show(ui, |ui| {
+                            let mut layouter = |ui: &egui::Ui, buffer: &dyn TextBuffer, _: f32| {
+                                let job = hint_job(buffer.as_str(), strong, normal);
+                                ui.fonts_mut(|fonts| fonts.layout_job(job))
+                            };
+                            let mut shown = text;
+                            let mut output = TextEdit::multiline(&mut shown)
+                                .id(id)
+                                .frame(Frame::NONE)
+                                .margin(Margin::ZERO)
+                                .desired_width(width + 2.0)
+                                .desired_rows(1)
+                                .clip_text(false)
+                                .layouter(&mut layouter)
+                                .show(ui);
+                            if output.response.triple_clicked() {
+                                let everything = CCursorRange::select_all(&output.galley);
+                                output.state.cursor.set_char_range(Some(everything));
+                                output.state.store(ui.ctx(), id);
+                            }
+                        });
                 });
             });
         open.rect = Some(area.response.rect);
@@ -226,6 +237,70 @@ mod tests {
         hints.open.as_mut().unwrap().rect =
             Some(Rect::from_min_size(pos2(100.0, 100.0), vec2(50.0, 50.0)));
         hints
+    }
+
+    fn shown_height(lines: usize) -> f32 {
+        let context = eframe::egui::Context::default();
+        let text = (0..lines)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut hints = Hints::default();
+        let hovered = || {
+            Some(Hovered {
+                target: Hit::Node((1, 0)),
+                text: text.clone(),
+            })
+        };
+        hints.update(0.0, POINTER, false, hovered());
+        hints.update(OPEN_DELAY, POINTER, false, hovered());
+        for _ in 0..4 {
+            let input = eframe::egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 900.0))),
+                ..Default::default()
+            };
+            let mut output = context.run_ui(input, |ui| hints.show(ui.ctx()));
+            output.textures_delta.clear();
+        }
+        hints.rect().unwrap().height()
+    }
+
+    #[test]
+    fn a_hint_taller_than_the_screen_stays_on_it() {
+        let height = shown_height(600);
+        assert!(height <= 900.5, "{height}");
+        assert!(height > 700.0, "{height}");
+    }
+
+    #[test]
+    fn a_long_line_stays_on_one_line() {
+        let context = eframe::egui::Context::default();
+        let line = "#1 Regen(Entity(3v1)), open-ended, from spawner, tick 1 ".repeat(6);
+        let mut hints = Hints::default();
+        let hovered = || {
+            Some(Hovered {
+                target: Hit::Node((1, 0)),
+                text: line.clone(),
+            })
+        };
+        hints.update(0.0, POINTER, false, hovered());
+        hints.update(OPEN_DELAY, POINTER, false, hovered());
+        for _ in 0..4 {
+            let input = eframe::egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(2400.0, 900.0))),
+                ..Default::default()
+            };
+            let mut output = context.run_ui(input, |ui| hints.show(ui.ctx()));
+            output.textures_delta.clear();
+        }
+        let rect = hints.rect().unwrap();
+        assert!(rect.width() > 1400.0, "{}", rect.width());
+        assert!(rect.height() < 60.0, "{}", rect.height());
+    }
+
+    #[test]
+    fn a_short_hint_is_as_tall_as_its_text() {
+        assert!(shown_height(3) < 100.0);
     }
 
     #[test]
