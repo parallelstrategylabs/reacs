@@ -117,7 +117,7 @@ fn ticks_with_nothing_to_record_take_no_space() {
         size
     };
 
-    assert_eq!(size(3), size(300));
+    assert_eq!(size(3), size(250));
 }
 
 #[test]
@@ -184,6 +184,8 @@ fn a_recording_reads_back_as_data_a_tool_can_run_again() {
     assert!(!recording.truncated);
     let starts: Vec<u64> = recording.sections.iter().map(|x| x.tick).collect();
     assert_eq!(starts, [0, 10]);
+    let ends: Vec<u64> = recording.sections.iter().map(|x| x.end).collect();
+    assert_eq!(ends, [12, 14]);
     let ticks: Vec<u64> = recording.sections[0].ticks.iter().map(|x| x.tick).collect();
     assert_eq!(ticks, [0, 3, 4, 6, 7, 8, 9]);
 
@@ -204,6 +206,65 @@ fn a_recording_reads_back_as_data_a_tool_can_run_again() {
     }
     assert!(!send_recorded(&mut copy, 12345, &[1]));
     assert!(copy.restore(b"not a save").is_none());
+}
+
+fn record_session(name: &str) -> (PathBuf, World) {
+    let file = path(name);
+    let mut world = World::new();
+    let mut recorder = world.to_recorder(&file).unwrap().with_hash_every(4);
+    play(&mut world, &mut recorder, 0..10);
+    let save = world.save();
+    play(&mut world, &mut recorder, 10..12);
+    world.load(&save);
+    play(&mut world, &mut recorder, 10..14);
+    recorder.finish().unwrap();
+    (file, world)
+}
+
+#[test]
+fn a_playback_replays_a_session_with_a_load_into_the_same_world() {
+    let (file, original) = record_session("playback");
+
+    let mut world = World::new();
+    let mut playback = world.to_playback(&file).unwrap();
+    fs::remove_file(&file).unwrap();
+    let mut steps = 0;
+    while !playback.finished() {
+        world.replay(&mut playback).step();
+        steps += 1;
+    }
+
+    assert_eq!(playback.diverged(), None);
+    assert_eq!(steps, 12 + 4);
+    assert_eq!(world.get_resource::<Tick>().unwrap().0, 14);
+    assert_eq!(world.resource_hashes(), original.resource_hashes());
+    assert_eq!(world.save(), original.save());
+}
+
+#[test]
+fn a_playback_reports_where_a_different_world_diverges() {
+    let (file, _) = record_session("diverging");
+
+    let mut world = World::new();
+    let mut playback = world.to_playback(&file).unwrap();
+    fs::remove_file(&file).unwrap();
+    world.insert_local_resource(Bias(1));
+    while !playback.finished() {
+        world.replay(&mut playback).step();
+    }
+
+    let divergence = playback.diverged().unwrap();
+    assert_eq!(divergence.tick, 4);
+    let names: Vec<&str> = divergence
+        .resources
+        .iter()
+        .map(|id| reacs::registry::get_registry_entry(*id).unwrap().type_name)
+        .collect();
+    assert!(
+        names.iter().any(|name| name.ends_with("Trace")),
+        "{names:?}"
+    );
+    assert!(!names.iter().any(|name| name.ends_with("Rng")), "{names:?}");
 }
 
 #[test]

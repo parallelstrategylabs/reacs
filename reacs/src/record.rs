@@ -18,7 +18,7 @@ use crate::{
     world::World,
 };
 
-const MAGIC: &[u8; 8] = b"REACSRC1";
+const MAGIC: &[u8; 8] = b"REACSRC2";
 pub const RECORD_HASH_EVERY: u64 = 64;
 
 fn options() -> bincode::DefaultOptions {
@@ -136,6 +136,10 @@ enum Record {
     Section {
         tick: u64,
         state_len: u64,
+        ended: Option<u64>,
+    },
+    End {
+        tick: u64,
     },
 }
 
@@ -170,7 +174,13 @@ impl Recorder {
     }
 
     pub fn finish(mut self) -> io::Result<()> {
-        self.error.take().map_or_else(|| self.out.flush(), Err)
+        if let Some(error) = self.error.take() {
+            return Err(error);
+        }
+        if let Some(tick) = self.last {
+            write(&mut self.out, &Record::End { tick }, &[])?;
+        }
+        self.out.flush()
     }
 
     fn write_tick(&mut self, world: &World) -> io::Result<()> {
@@ -181,7 +191,13 @@ impl Recorder {
         if tick != self.last.map_or(self.written, |last| last + 1) {
             let state = world.save();
             let state_len = state.len() as u64;
-            write(&mut self.out, &Record::Section { tick, state_len }, &state)?;
+            let ended = self.last;
+            let record = Record::Section {
+                tick,
+                state_len,
+                ended,
+            };
+            write(&mut self.out, &record, &state)?;
             self.written = tick;
             self.first_ids = next_ids(world);
         }
@@ -266,9 +282,12 @@ pub struct RecordedTick {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedSection {
     pub tick: u64,
+    pub end: u64,
     pub state: Vec<u8>,
     pub ticks: Vec<RecordedTick>,
 }
+
+const UNKNOWN_END: u64 = u64::MAX;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recording {
@@ -285,6 +304,7 @@ fn read_section(
     let read = reader.take(len).read_to_end(&mut state)?;
     Ok((read as u64 == len).then_some(RecordedSection {
         tick,
+        end: UNKNOWN_END,
         state,
         ticks: Vec::new(),
     }))
@@ -310,6 +330,10 @@ impl Recording {
             truncated: false,
         };
         recording.truncated = recording.read_records(&mut reader)?;
+        let last = recording.sections.last_mut().unwrap();
+        if last.end == UNKNOWN_END {
+            last.end = last.ticks.last().map_or(last.tick, |x| x.tick + 1);
+        }
         Ok(recording)
     }
 
@@ -359,16 +383,159 @@ impl Recording {
                 Record::Section {
                     tick: start,
                     state_len,
+                    ended,
                 } => {
+                    let previous = self.sections.last_mut().unwrap();
+                    let end = match ended {
+                        Some(last) => last.checked_add(1).ok_or_else(corrupted)?,
+                        None => previous.tick,
+                    };
+                    if end < previous.tick || previous.ticks.last().is_some_and(|x| x.tick >= end) {
+                        return Err(corrupted());
+                    }
+                    previous.end = end;
                     let Some(section) = read_section(&mut *reader, start, state_len)? else {
                         return Ok(true);
                     };
                     tick = start;
                     self.sections.push(section);
                 }
+                Record::End { tick: last } => {
+                    let section = self.sections.last_mut().unwrap();
+                    let end = last.checked_add(1).ok_or_else(corrupted)?;
+                    if end < section.tick || section.ticks.last().is_some_and(|x| x.tick >= end) {
+                        return Err(corrupted());
+                    }
+                    section.end = end;
+                }
             }
         }
         Ok(false)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Divergence {
+    pub tick: u64,
+    pub resources: Vec<u128>,
+}
+
+pub struct Playback {
+    recording: Recording,
+    section: usize,
+    next: usize,
+    at: u64,
+    divergence: Option<Divergence>,
+}
+
+fn differing(recorded: &[(u128, u64)], current: &[(u128, u64)]) -> Vec<u128> {
+    let mut out = Vec::new();
+    let (mut a, mut b) = (recorded.iter().peekable(), current.iter().peekable());
+    loop {
+        match (a.peek(), b.peek()) {
+            (Some(x), Some(y)) if x.0 == y.0 => {
+                if x.1 != y.1 {
+                    out.push(x.0);
+                }
+                a.next();
+                b.next();
+            }
+            (Some(x), Some(y)) if x.0 < y.0 => {
+                out.push(x.0);
+                a.next();
+            }
+            (Some(_), Some(y)) => {
+                out.push(y.0);
+                b.next();
+            }
+            (Some(x), None) => {
+                out.push(x.0);
+                a.next();
+            }
+            (None, Some(y)) => {
+                out.push(y.0);
+                b.next();
+            }
+            (None, None) => return out,
+        }
+    }
+}
+
+impl Playback {
+    pub fn recording(&self) -> &Recording {
+        &self.recording
+    }
+
+    pub fn finished(&self) -> bool {
+        let sections = &self.recording.sections;
+        self.section + 1 == sections.len() && self.at >= sections[self.section].end
+    }
+
+    pub fn diverged(&self) -> Option<&Divergence> {
+        self.divergence.as_ref()
+    }
+
+    fn apply(&mut self, world: &mut World) {
+        if self.finished() {
+            return;
+        }
+        while self.section + 1 < self.recording.sections.len()
+            && current_tick(world) >= self.recording.sections[self.section].end
+        {
+            self.section += 1;
+            self.next = 0;
+            let state = &self.recording.sections[self.section].state;
+            world
+                .restore(state)
+                .unwrap_or_else(|| panic!("this recording is corrupted"));
+        }
+
+        let tick = current_tick(world);
+        let ticks = &self.recording.sections[self.section].ticks;
+        while self.next < ticks.len() && ticks[self.next].tick < tick {
+            self.next += 1;
+        }
+        if let Some(recorded) = ticks.get(self.next).filter(|x| x.tick == tick) {
+            for inputs in &recorded.inputs {
+                for payload in &inputs.payloads {
+                    send_recorded(world, inputs.signal, payload);
+                }
+            }
+            if let Some(hashes) = &recorded.hashes
+                && self.divergence.is_none()
+            {
+                let resources = differing(hashes, &world.resource_hashes());
+                if !resources.is_empty() {
+                    self.divergence = Some(Divergence { tick, resources });
+                }
+            }
+            self.next += 1;
+        }
+        self.at = tick + 1;
+    }
+}
+
+impl World {
+    pub fn to_playback(&mut self, path: impl AsRef<Path>) -> io::Result<Playback> {
+        let recording = Recording::open(path)?;
+        let start = &recording.sections[0];
+        if self.restore(&start.state).is_none() {
+            return Err(corrupted());
+        }
+        let at = start.tick;
+        Ok(Playback {
+            recording,
+            section: 0,
+            next: 0,
+            at,
+            divergence: None,
+        })
+    }
+
+    #[must_use = "call .step() on the returned world"]
+    pub fn replay(&mut self, playback: &mut Playback) -> &mut Self {
+        playback.apply(self);
+        self
     }
 }
 
@@ -551,11 +718,12 @@ mod tests {
         let _ = world.record(&mut recorder);
         let records = raw_records(&finish(&file, recorder)).1;
 
-        assert_eq!(records.len(), 1);
+        assert_eq!(records.len(), 2);
         let Record::Tick { gap, inputs, .. } = &records[0] else {
             panic!("expected a tick record");
         };
         assert_eq!((*gap, inputs.len(), inputs[0].1.len()), (0, 1, 1));
+        assert!(matches!(records[1], Record::End { tick: 0 }));
     }
 
     #[test]
@@ -588,12 +756,119 @@ mod tests {
     }
 
     #[test]
+    fn sections_know_the_tick_the_original_run_reached() {
+        let file = path("ends");
+        let mut world = World::new();
+        let mut recorder = world.to_recorder(&file).unwrap().with_hash_every(u64::MAX);
+        recorder.record(&world);
+        advance(&mut world);
+        advance(&mut world);
+        let jumped = world.save();
+        recorder.record(&world);
+        advance(&mut world);
+        recorder.record(&world);
+        advance(&mut world);
+        world.load(&jumped);
+        recorder.record(&world);
+        let recording = open("ends-read", &finish(&file, recorder)).unwrap();
+
+        let sections: Vec<(u64, u64)> =
+            recording.sections.iter().map(|x| (x.tick, x.end)).collect();
+        assert_eq!(sections, [(0, 1), (2, 4), (2, 3)]);
+    }
+
+    #[test]
+    fn a_recording_without_finish_ends_after_its_last_tick() {
+        let file = path("unfinished");
+        let mut world = World::new();
+        let mut recorder = world.to_recorder(&file).unwrap().with_hash_every(u64::MAX);
+        for tick in 0..4 {
+            if tick < 3 {
+                world.input(Press(tick));
+            }
+            recorder.record(&world);
+            advance(&mut world);
+        }
+        drop(recorder);
+        let bytes = fs::read(&file).unwrap();
+        fs::remove_file(&file).unwrap();
+
+        let recording = open("unfinished-read", &bytes).unwrap();
+        assert_eq!(recording.sections[0].end, 3);
+
+        let file = path("empty");
+        let recorder = World::new().to_recorder(&file).unwrap();
+        let recording = open("empty-read", &finish(&file, recorder)).unwrap();
+        assert_eq!(
+            (recording.sections[0].tick, recording.sections[0].end),
+            (0, 0)
+        );
+    }
+
+    fn replay_file(name: &str, bytes: &[u8], world: &mut World) -> Playback {
+        let file = path(name);
+        fs::write(&file, bytes).unwrap();
+        let playback = world.to_playback(&file);
+        fs::remove_file(&file).unwrap();
+        let mut playback = playback.unwrap();
+        while !playback.finished() {
+            let world = world.replay(&mut playback);
+            advance(world);
+        }
+        playback
+    }
+
+    #[test]
+    fn a_playback_runs_the_recording_again() {
+        let mut world = World::new();
+        let playback = replay_file("playback", &short_run("playback-run"), &mut world);
+
+        assert_eq!(playback.diverged(), None);
+        assert_eq!(current_tick(&world), 6);
+        assert_eq!(playback.recording().sections[0].ticks.len(), 6);
+    }
+
+    #[test]
+    fn a_playback_reports_the_first_tick_that_differs() {
+        let mut world = World::new();
+        world.insert_resource(Score(1));
+        let file = path("diverge");
+        fs::write(&file, short_run("diverge-run")).unwrap();
+        let mut playback = world.to_playback(&file).unwrap();
+        fs::remove_file(&file).unwrap();
+        world.insert_resource(Score(2));
+        while !playback.finished() {
+            let world = world.replay(&mut playback);
+            advance(world);
+        }
+
+        let divergence = playback.diverged().unwrap();
+        assert_eq!(divergence.tick, 0);
+        assert_eq!(divergence.resources, [Score::TYPE_UUID]);
+    }
+
+    #[test]
+    fn a_corrupted_start_state_is_refused() {
+        let mut bytes = short_run("bad-start");
+        let at = MAGIC.len() + options().serialized_size(&raw_records(&bytes).0).unwrap() as usize;
+        bytes[at..at + 8].fill(0xFF);
+        let file = path("bad-start-read");
+        fs::write(&file, &bytes).unwrap();
+        let result = World::new().to_playback(&file);
+        fs::remove_file(&file).unwrap();
+
+        assert_eq!(result.err().unwrap().kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
     fn a_file_cut_anywhere_reads_up_to_the_cut() {
         let bytes = short_run("cut");
         let full = open("cut-full", &bytes).unwrap();
         assert!(!full.truncated);
         let (header, records) = raw_records(&bytes);
-        assert_eq!(records.len(), full.sections[0].ticks.len());
+        assert_eq!(records.len(), full.sections[0].ticks.len() + 1);
+        assert!(matches!(records.last(), Some(Record::End { tick: 5 })));
+        assert_eq!(full.sections[0].end, 6);
         let start = bytes.len() - records.iter().map(|x| encoded_len(x)).sum::<usize>();
         assert!(start > header.state_len as usize);
 
