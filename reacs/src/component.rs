@@ -2,16 +2,16 @@ use reacs_derive::Hashed;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    entity::Entity,
+    entity::{Entity, NO_GENERATION},
     prelude::*,
     registry::get_registry_entry,
     schedule::{Mode, ParamInit, ParamWorld, Read, SystemParam, WithMode, Write},
 };
 use std::cell::{Ref, RefMut};
 
-const EMPTY: u32 = 0;
+const EMPTY: u32 = NO_GENERATION;
 
-#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 struct Slot<C> {
     generation: u32,
     value: C,
@@ -37,7 +37,7 @@ impl<C: Copy + Default> ComponentMap<C> {
         let generation = entity.generation();
         self.slots
             .get(entity.index() as usize)
-            .filter(|slot| (slot.generation == generation) & (generation != EMPTY))
+            .filter(|slot| slot.generation == generation)
             .map(|slot| &slot.value)
     }
 
@@ -46,7 +46,7 @@ impl<C: Copy + Default> ComponentMap<C> {
         let generation = entity.generation();
         self.slots
             .get_mut(entity.index() as usize)
-            .filter(|slot| (slot.generation == generation) & (generation != EMPTY))
+            .filter(|slot| slot.generation == generation)
             .map(|slot| &mut slot.value)
     }
 
@@ -54,18 +54,22 @@ impl<C: Copy + Default> ComponentMap<C> {
     pub(crate) fn insert(&mut self, entity: Entity, value: C) {
         let index = entity.index() as usize;
         let generation = entity.generation();
-        if generation == EMPTY {
+        if generation == EMPTY || generation == 0 {
             return;
         }
         if index >= self.slots.len() {
             let new_size = (index + 1).next_power_of_two();
             let mut slots = Vec::with_capacity(new_size);
             slots.extend_from_slice(&self.slots);
-            slots.resize(new_size, Slot::default());
+            let empty = Slot {
+                generation: EMPTY,
+                value: C::default(),
+            };
+            slots.resize(new_size, empty);
             self.slots = slots;
         }
         let slot = &mut self.slots[index];
-        if slot.generation > generation {
+        if slot.generation != EMPTY && slot.generation.wrapping_sub(generation) as i32 > 0 {
             return;
         }
         *slot = Slot { generation, value };
@@ -75,7 +79,7 @@ impl<C: Copy + Default> ComponentMap<C> {
     pub(crate) fn remove(&mut self, entity: Entity) {
         let generation = entity.generation();
         if let Some(slot) = self.slots.get_mut(entity.index() as usize) {
-            if (slot.generation == generation) & (generation != EMPTY) {
+            if slot.generation == generation {
                 slot.generation = EMPTY;
             }
         }
@@ -101,8 +105,7 @@ impl<C: 'static + Copy + Default, M: Mode> Component<'_, C, M> {
             return None;
         }
         let slot = unsafe { self.slots.add(index) };
-        let found = unsafe { (*slot).generation } == generation;
-        (found & (generation != EMPTY)).then_some(slot)
+        (unsafe { (*slot).generation } == generation).then_some(slot)
     }
 
     #[inline]

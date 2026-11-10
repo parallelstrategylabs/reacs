@@ -60,6 +60,7 @@ impl DerefMut for EntityFreeList {
 }
 
 const FIRST_GENERATION: u32 = 1;
+pub(crate) const NO_GENERATION: u32 = u32::MAX;
 
 #[resource]
 pub(crate) struct EntityGenerations(pub DirectMap<u32>);
@@ -158,7 +159,11 @@ impl EntityManager<'_, Write> {
         let index = entity.index() as usize;
         let current = self.generations.read().current(index);
         if current == entity.generation() {
-            self.generations.write().insert(index, current + 1);
+            let next = match current + 1 {
+                NO_GENERATION => FIRST_GENERATION,
+                next => next,
+            };
+            self.generations.write().insert(index, next);
             self.free_list.free(index);
         }
     }
@@ -281,6 +286,27 @@ mod tests {
         let entity = em.spawn();
         assert_eq!(entity.index(), 25);
         assert_eq!(entity.generation(), 2);
+    }
+
+    #[test]
+    fn despawn_skips_the_empty_generation() {
+        let mut world = world_with_components();
+        world
+            .get_resource_mut::<super::EntityGenerations>()
+            .unwrap()
+            .insert(0, super::NO_GENERATION - 1);
+        let last = world.entity_manager().spawn();
+        assert_eq!(last.generation(), super::NO_GENERATION - 1);
+        world.set_component(last, Health(1));
+
+        world.entity_manager().despawn(last);
+        let next = world.entity_manager().spawn();
+
+        assert_eq!(next.index(), last.index());
+        assert_eq!(next.generation(), super::FIRST_GENERATION);
+        assert!(!world.has_component::<Health>(next));
+        world.set_component(next, Health(2));
+        assert_eq!(world.get_component::<Health>(next).unwrap().0, 2);
     }
 
     #[test]
