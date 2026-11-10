@@ -88,7 +88,9 @@ fn step_delivers_a_one_tick_signal_once() {
 #[test]
 fn step_delivers_a_windowed_signal_every_tick_of_its_window() {
     let mut world = World::build(|setup| {
-        setup.signal::<Windowed>().send(Windowed(9), 1..3);
+        setup
+            .signal::<Windowed>()
+            .send(Windowed(9), (In(1), For(2)));
     });
 
     for _ in 0..5 {
@@ -104,7 +106,9 @@ fn step_delivers_a_windowed_signal_every_tick_of_its_window() {
 #[test]
 fn system_receiving_twice_gets_a_window_once_per_tick() {
     let mut world = World::build(|setup| {
-        setup.signal::<Repeated>().send(Repeated(9), 1..3);
+        setup
+            .signal::<Repeated>()
+            .send(Repeated(9), (In(1), For(2)));
     });
 
     for _ in 0..4 {

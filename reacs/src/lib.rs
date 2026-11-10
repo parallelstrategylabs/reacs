@@ -9,8 +9,8 @@ pub mod entity;
 pub(crate) mod free_list;
 pub mod hashed;
 pub mod index_map;
-pub mod registry;
 pub mod record;
+pub mod registry;
 pub mod resource;
 pub mod schedule;
 pub mod signal;
@@ -33,7 +33,7 @@ pub mod prelude {
     pub use crate::schedule::{
         IntoSystem, Mut, SystemEntry, SystemGraph, SystemParam, WorldAccess, system_graph,
     };
-    pub use crate::signal::{InputSignal, Signal, SignalType};
+    pub use crate::signal::{At, For, In, InputSignal, IntoWindow, Signal, SignalType, To};
     pub use crate::world::World;
 
     pub use reacs_derive::{

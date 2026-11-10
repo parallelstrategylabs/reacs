@@ -52,7 +52,7 @@ fn battle() -> (World, Entity, Entity) {
                 target: knight,
                 amount: 3,
             },
-            1..3,
+            (In(1), For(2)),
         );
         units = (knight, goblin);
     });

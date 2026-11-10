@@ -47,7 +47,7 @@ fn spawner(
     (*living).0.push(entity);
     (*ages).0.insert(entity, 0);
     spawned.emit(Spawned(entity));
-    burn.send(Burn(entity), tick + 1..tick + 4);
+    burn.send(Burn(entity), (In(1), For(3)));
     late.emit(Late(tick));
 
     if tick % 3 == 2 {

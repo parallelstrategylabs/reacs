@@ -65,7 +65,7 @@ fn sender(mut pings: Mut<Signal<Ping>>, tick: Resource<Tick>) {
     let tick = (*tick).0;
     pings.emit(Ping(tick * 10));
     if tick == 1 {
-        pings.send(Ping(100), 1..4);
+        pings.send(Ping(100), For(3));
     }
 }
 

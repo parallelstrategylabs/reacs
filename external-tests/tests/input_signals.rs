@@ -64,9 +64,8 @@ fn burn_control(
     mut burns: Mut<Signal<Burn>>,
     mut id: Mut<Resource<OpenBurnId>>,
 ) {
-    let tick = open.tick();
     for request in open.receive() {
-        (*id).0 = burns.send(Burn(request.0), tick..);
+        (*id).0 = burns.send(Burn(request.0), ..);
     }
     if close.receive().next().is_some() {
         if let Some(open) = (*id).0.take() {

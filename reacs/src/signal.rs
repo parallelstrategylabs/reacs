@@ -1,9 +1,4 @@
-use std::{
-    any::TypeId,
-    marker::PhantomData,
-    ops::{Bound, RangeBounds},
-    ptr::addr_of_mut,
-};
+use std::{any::TypeId, marker::PhantomData, ops::RangeFull, ptr::addr_of_mut};
 
 use reacs_derive::{param, resource};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -59,23 +54,116 @@ pub struct SignalWindow {
     pub end: u64,
 }
 
-impl SignalWindow {
-    pub fn from_bounds(window: impl RangeBounds<u64>) -> Self {
-        let start = match window.start_bound() {
-            Bound::Included(&x) => x,
-            Bound::Excluded(&x) => x.saturating_add(1),
-            Bound::Unbounded => 0,
-        };
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct In(pub u64);
 
-        let end = match window.end_bound() {
-            Bound::Included(&x) => x.saturating_add(1),
-            Bound::Excluded(&x) => x,
-            Bound::Unbounded => u64::MAX,
-        };
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct At(pub u64);
 
-        Self { start, end }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct For(pub u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct To(pub u64);
+
+impl In {
+    #[inline]
+    fn tick(self, now: u64) -> u64 {
+        now.saturating_add(self.0)
     }
+}
 
+impl At {
+    #[inline]
+    fn tick(self, _now: u64) -> u64 {
+        self.0
+    }
+}
+
+impl For {
+    #[inline]
+    fn end(self, start: u64) -> u64 {
+        start.saturating_add(self.0)
+    }
+}
+
+impl To {
+    #[inline]
+    fn end(self, _start: u64) -> u64 {
+        self.0.saturating_add(1)
+    }
+}
+
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a signal window",
+    label = "a window is a start (`In(n)`, `At(tick)`), an end (`For(n)`, `To(tick)`), or a (start, end) pair",
+    note = "for example `In(2)` (one tick, 2 from now), `For(5)`, `(In(2), For(3))`, `(At(40), To(50))`, `(In(2), ..)` or `..`"
+)]
+pub trait IntoWindow {
+    fn into_window(self, now: u64) -> SignalWindow;
+}
+
+macro_rules! window_start {
+    ($($start:ident),*) => {$(
+        impl IntoWindow for $start {
+            #[inline]
+            fn into_window(self, now: u64) -> SignalWindow {
+                let start = self.tick(now);
+                SignalWindow { start, end: start.saturating_add(1) }
+            }
+        }
+
+        impl IntoWindow for ($start, For) {
+            #[inline]
+            fn into_window(self, now: u64) -> SignalWindow {
+                let start = self.0.tick(now);
+                SignalWindow { start, end: self.1.end(start) }
+            }
+        }
+
+        impl IntoWindow for ($start, To) {
+            #[inline]
+            fn into_window(self, now: u64) -> SignalWindow {
+                let start = self.0.tick(now);
+                SignalWindow { start, end: self.1.end(start) }
+            }
+        }
+
+        impl IntoWindow for ($start, RangeFull) {
+            #[inline]
+            fn into_window(self, now: u64) -> SignalWindow {
+                SignalWindow { start: self.0.tick(now), end: u64::MAX }
+            }
+        }
+    )*};
+}
+
+window_start!(In, At);
+
+macro_rules! window_end {
+    ($($end:ident),*) => {$(
+        impl IntoWindow for $end {
+            #[inline]
+            fn into_window(self, now: u64) -> SignalWindow {
+                SignalWindow { start: now, end: self.end(now) }
+            }
+        }
+    )*};
+}
+
+window_end!(For, To);
+
+impl IntoWindow for RangeFull {
+    #[inline]
+    fn into_window(self, now: u64) -> SignalWindow {
+        SignalWindow {
+            start: now,
+            end: u64::MAX,
+        }
+    }
+}
+
+impl SignalWindow {
     #[inline]
     pub fn contains(&self, tick: u64) -> bool {
         self.start <= tick && tick < self.end
@@ -1033,14 +1121,10 @@ pub struct Signal<S: SignalType> {
 
 impl<'w, S: SignalType> Signal<'w, S, Write> {
     #[inline]
-    pub fn send(&mut self, signal: S, window: impl RangeBounds<u64>) -> Option<u64> {
+    pub fn send(&mut self, signal: S, window: impl IntoWindow) -> Option<u64> {
         let tick = self.tick();
-        self.signals.send(
-            &mut self.data,
-            tick,
-            signal,
-            SignalWindow::from_bounds(window),
-        )
+        self.signals
+            .send(&mut self.data, tick, signal, window.into_window(tick))
     }
 
     #[inline]
@@ -1244,7 +1328,7 @@ impl World {
 
 #[cfg(test)]
 mod tests {
-    use super::{SWEEP_BUDGET, SignalData, Signals, SweepCursor};
+    use super::{IntoWindow, SWEEP_BUDGET, SignalData, Signals, SweepCursor};
     use crate::{
         Tick, entity::Entity, prelude::*, registry::get_registry_entry, schedule::CurrentSystem,
     };
@@ -1351,14 +1435,16 @@ mod tests {
         let world = world();
         let mut s = world.signal::<NumSignal>();
         assert_eq!(s.emit(NumSignal(0)), 0);
-        assert_eq!(s.send(NumSignal(0), 0..5), Some(1));
-        assert_eq!(s.send(NumSignal(0), 3..5), Some(2));
+        assert_eq!(s.send(NumSignal(0), (At(0), To(4))), Some(1));
+        assert_eq!(s.send(NumSignal(0), (At(3), To(4))), Some(2));
     }
 
     #[test]
     fn future_window_is_delivered_exactly_inside_window() {
         let world = world();
-        world.signal::<NumSignal>().send(NumSignal(9), 2..4);
+        world
+            .signal::<NumSignal>()
+            .send(NumSignal(9), (At(2), To(3)));
 
         assert_eq!(
             run_ticks(&world, 6),
@@ -1369,7 +1455,9 @@ mod tests {
     #[test]
     fn window_starting_now_is_delivered_once_per_tick() {
         let world = world();
-        world.signal::<NumSignal>().send(NumSignal(5), 0..3);
+        world
+            .signal::<NumSignal>()
+            .send(NumSignal(5), (At(0), To(2)));
 
         assert_eq!(
             run_ticks(&world, 4),
@@ -1380,15 +1468,99 @@ mod tests {
     #[test]
     fn inclusive_window() {
         let world = world();
-        world.signal::<NumSignal>().send(NumSignal(5), 1..=2);
+        world
+            .signal::<NumSignal>()
+            .send(NumSignal(5), (At(1), To(2)));
 
         assert_eq!(run_ticks(&world, 4), vec![vec![], vec![5], vec![5], vec![]]);
     }
 
     #[test]
+    fn windows_resolve_against_the_current_tick() {
+        fn window(window: impl IntoWindow) -> (u64, u64) {
+            let w = window.into_window(10);
+            (w.start, w.end)
+        }
+        const MAX: u64 = u64::MAX;
+
+        assert_eq!(window(In(0)), (10, 11));
+        assert_eq!(window(In(2)), (12, 13));
+        assert_eq!(window(At(4)), (4, 5));
+        assert_eq!(window(For(5)), (10, 15));
+        assert_eq!(window(To(12)), (10, 13));
+        assert_eq!(window((In(2), For(3))), (12, 15));
+        assert_eq!(window((In(2), To(20))), (12, 21));
+        assert_eq!(window((At(40), For(10))), (40, 50));
+        assert_eq!(window((At(40), To(50))), (40, 51));
+        assert_eq!(window((In(2), ..)), (12, MAX));
+        assert_eq!(window((At(40), ..)), (40, MAX));
+        assert_eq!(window(..), (10, MAX));
+        assert_eq!(window(For(MAX)), window(..));
+        assert_eq!(window((In(2), For(MAX))), window((In(2), ..)));
+        assert_eq!(window(To(MAX)), window(..));
+        assert_eq!(window(In(MAX)), (MAX, MAX));
+        assert_eq!(window((At(MAX), ..)), (MAX, MAX));
+    }
+
+    #[test]
+    fn windows_are_delivered_relative_to_the_send_tick() {
+        let world = world();
+        run_ticks(&world, 3);
+        {
+            let mut s = world.signal::<NumSignal>();
+            s.send(NumSignal(1), For(2));
+            s.send(NumSignal(2), (In(2), For(2)));
+            s.send(NumSignal(3), ..);
+            s.send(NumSignal(4), At(4));
+            s.send(NumSignal(5), (In(5), ..));
+            s.send(NumSignal(6), In(0));
+            s.send(NumSignal(7), In(3));
+            s.send(NumSignal(8), To(4));
+            s.send(NumSignal(9), (At(7), To(8)));
+            s.send(NumSignal(10), For(u64::MAX));
+        }
+
+        let mut ticks = run_ticks(&world, 7);
+        ticks.iter_mut().for_each(|t| t.sort_unstable());
+        assert_eq!(
+            ticks,
+            vec![
+                vec![1, 3, 6, 8, 10],
+                vec![1, 3, 4, 8, 10],
+                vec![2, 3, 10],
+                vec![2, 3, 7, 10],
+                vec![3, 9, 10],
+                vec![3, 5, 9, 10],
+                vec![3, 5, 10],
+            ]
+        );
+    }
+
+    #[test]
+    fn ended_or_empty_windows_are_rejected() {
+        let world = world();
+        run_ticks(&world, 3);
+
+        let mut s = world.signal::<NumSignal>();
+        assert_eq!(s.send(NumSignal(0), For(0)), None);
+        assert_eq!(s.send(NumSignal(0), (In(2), For(0))), None);
+        assert_eq!(s.send(NumSignal(0), To(2)), None);
+        assert_eq!(s.send(NumSignal(0), At(2)), None);
+        assert_eq!(s.send(NumSignal(0), (At(1), To(2))), None);
+        assert_eq!(s.send(NumSignal(0), (At(1), For(2))), None);
+        assert_eq!(s.send(NumSignal(0), (In(5), To(6))), None);
+        assert_eq!(s.send(NumSignal(0), In(u64::MAX)), None);
+        assert_eq!(s.send(NumSignal(0), At(u64::MAX)), None);
+        assert_eq!(s.send(NumSignal(0), (In(u64::MAX), ..)), None);
+        assert_eq!(s.send(NumSignal(0), (At(u64::MAX), To(u64::MAX))), None);
+        assert_eq!(s.send(NumSignal(0), (At(u64::MAX), For(5))), None);
+        assert_eq!(s.send(NumSignal(0), At(3)), Some(0));
+    }
+
+    #[test]
     fn unbounded_window_never_expires() {
         let world = world();
-        world.signal::<NumSignal>().send(NumSignal(5), 2..);
+        world.signal::<NumSignal>().send(NumSignal(5), (At(2), ..));
 
         let ticks = run_ticks(&world, 50);
         assert!(ticks[..2].iter().all(|t| t.is_empty()));
@@ -1402,10 +1574,10 @@ mod tests {
 
         let mut s = world.signal::<NumSignal>();
         assert_eq!(s.tick(), 5);
-        assert_eq!(s.send(NumSignal(0), 0..5), None);
-        assert_eq!(s.send(NumSignal(0), 7..7), None);
-        assert_eq!(s.send(NumSignal(0), 8..7), None);
-        assert_eq!(s.send(NumSignal(0), 0..6), Some(0));
+        assert_eq!(s.send(NumSignal(0), (At(0), To(4))), None);
+        assert_eq!(s.send(NumSignal(0), (At(7), To(6))), None);
+        assert_eq!(s.send(NumSignal(0), (At(8), To(6))), None);
+        assert_eq!(s.send(NumSignal(0), (At(0), To(5))), Some(0));
     }
 
     #[test]
@@ -1413,7 +1585,7 @@ mod tests {
         let world = world();
         let id = world
             .signal::<NumSignal>()
-            .send(NumSignal(1), 1..3)
+            .send(NumSignal(1), (At(1), To(2)))
             .unwrap();
 
         assert!(world.signal::<NumSignal>().modify(id, NumSignal(2)));
@@ -1433,10 +1605,10 @@ mod tests {
         let world = world();
         {
             let mut s = world.signal::<NumSignal>();
-            s.send(NumSignal(0), 1..10);
-            s.send(NumSignal(1), 3..10);
-            s.send(NumSignal(2), 1..2);
-            s.send(NumSignal(3), 2..10);
+            s.send(NumSignal(0), (At(1), To(9)));
+            s.send(NumSignal(1), (At(3), To(9)));
+            s.send(NumSignal(2), (At(1), To(1)));
+            s.send(NumSignal(3), (At(2), To(9)));
         }
 
         for _ in 0..4 {
@@ -1444,7 +1616,7 @@ mod tests {
             {
                 let mut s = world.signal::<NumSignal>();
                 let tick = s.tick();
-                s.send(NumSignal(100 + tick), tick + 1..tick + 3);
+                s.send(NumSignal(100 + tick), (In(1), For(2)));
             }
 
             let signals = world.get_resource::<Signals<NumSignal>>().unwrap();
@@ -1535,9 +1707,9 @@ mod tests {
                 };
                 payloads += 1;
                 let id = if end == u64::MAX {
-                    s.send(NumSignal(payloads), start..)
+                    s.send(NumSignal(payloads), (At(start), ..))
                 } else {
-                    s.send(NumSignal(payloads), start..end)
+                    s.send(NumSignal(payloads), (At(start), To(end - 1)))
                 };
                 model.push(Sent {
                     id: id.unwrap(),
@@ -1732,7 +1904,9 @@ mod tests {
     #[test]
     fn second_receive_in_a_tick_only_gets_new_signals() {
         let world = world();
-        world.signal::<NumSignal>().send(NumSignal(1), 0..3);
+        world
+            .signal::<NumSignal>()
+            .send(NumSignal(1), (At(0), To(2)));
         world.signal::<NumSignal>().send(NumSignal(2), ..);
 
         let mut first = Vec::new();
@@ -1744,7 +1918,7 @@ mod tests {
             world.signal::<NumSignal>().emit(NumSignal(100 + tick));
             world
                 .signal::<NumSignal>()
-                .send(NumSignal(200 + tick), tick..tick + 2);
+                .send(NumSignal(200 + tick), For(2));
             second.push(receive(&world));
             end_tick(&world);
         }
@@ -1787,7 +1961,9 @@ mod tests {
         let (a, b) = receivers(&mut world);
 
         a.run(&mut world);
-        world.signal::<NumSignal>().send(NumSignal(5), 0..3);
+        world
+            .signal::<NumSignal>()
+            .send(NumSignal(5), (At(0), To(2)));
         b.run(&mut world);
 
         let mut late = vec![take_a(&world)];
@@ -1814,8 +1990,8 @@ mod tests {
             let mut s = world.signal::<NumSignal>();
             s.emit(NumSignal(5));
             s.emit(NumSignal(5));
-            s.send(NumSignal(5), 0..2);
-            s.send(NumSignal(5), 0..2);
+            s.send(NumSignal(5), (At(0), To(1)));
+            s.send(NumSignal(5), (At(0), To(1)));
         }
         end_tick(&world);
 
@@ -1826,7 +2002,7 @@ mod tests {
     #[test]
     fn dedup_only_skips_signals_in_both_lists() {
         let world = world();
-        world.signal::<NumSignal>().send(NumSignal(10), 0..);
+        world.signal::<NumSignal>().send(NumSignal(10), (At(0), ..));
         receive(&world);
         end_tick(&world);
 
@@ -1834,7 +2010,7 @@ mod tests {
         {
             let mut s = world.signal::<NumSignal>();
             s.emit(NumSignal(1));
-            s.send(NumSignal(2), 1..4);
+            s.send(NumSignal(2), (At(1), To(3)));
             s.emit(NumSignal(3));
         }
         end_tick(&world);
@@ -1848,7 +2024,7 @@ mod tests {
         receive(&world);
         let id = world
             .signal::<NumSignal>()
-            .send(NumSignal(1), 0..3)
+            .send(NumSignal(1), (At(0), To(2)))
             .unwrap();
         end_tick(&world);
 
@@ -1861,7 +2037,7 @@ mod tests {
         let world = world();
         let id = world
             .signal::<NumSignal>()
-            .send(NumSignal(1), 0..3)
+            .send(NumSignal(1), (At(0), To(2)))
             .unwrap();
 
         assert!(world.signal::<NumSignal>().modify(id, NumSignal(2)));
@@ -1901,7 +2077,7 @@ mod tests {
     fn send(world: &World, payload: u64, window: std::ops::Range<u64>) -> u64 {
         world
             .signal::<NumSignal>()
-            .send(NumSignal(payload), window)
+            .send(NumSignal(payload), (At(window.start), To(window.end - 1)))
             .unwrap()
     }
 
@@ -2178,7 +2354,7 @@ mod tests {
     #[test]
     fn future_open_signal_starts_on_time_and_moves_to_permanent() {
         let world = world();
-        world.signal::<NumSignal>().send(NumSignal(1), 2..);
+        world.signal::<NumSignal>().send(NumSignal(1), (At(2), ..));
 
         assert_eq!(
             run_ticks(&world, 5),
@@ -2190,7 +2366,10 @@ mod tests {
     #[test]
     fn late_joining_signal_keeps_permanent_sorted_by_id() {
         let world = world();
-        let late = world.signal::<NumSignal>().send(NumSignal(1), 3..).unwrap();
+        let late = world
+            .signal::<NumSignal>()
+            .send(NumSignal(1), (At(3), ..))
+            .unwrap();
         let early = send_open(&world, 2);
 
         assert_eq!(
@@ -2394,7 +2573,7 @@ mod tests {
         for &entity in &entities[..4] {
             world.signal::<Kept>().send(Kept(entity), ..);
         }
-        world.signal::<Kept>().send(Kept(entities[4]), 3..);
+        world.signal::<Kept>().send(Kept(entities[4]), (At(3), ..));
         world.signal::<Kept>().send(Kept(entities[5]), ..);
         end_tick(&world);
         end_tick(&world);
@@ -2417,9 +2596,15 @@ mod tests {
     #[test]
     fn late_signals_and_new_signals_joining_together_stay_sorted() {
         let world = world();
-        let late_a = world.signal::<NumSignal>().send(NumSignal(1), 2..).unwrap();
+        let late_a = world
+            .signal::<NumSignal>()
+            .send(NumSignal(1), (At(2), ..))
+            .unwrap();
         send_open(&world, 2);
-        let late_b = world.signal::<NumSignal>().send(NumSignal(3), 2..).unwrap();
+        let late_b = world
+            .signal::<NumSignal>()
+            .send(NumSignal(3), (At(2), ..))
+            .unwrap();
         send_open(&world, 4);
         run_ticks(&world, 1);
         let newest = send_open(&world, 5);
@@ -2441,7 +2626,7 @@ mod tests {
     fn late_join_with_pending_cancels_keeps_the_right_signals_cancelled() {
         let world = kept_world();
         let entities = spawn_all(&world, 4);
-        world.signal::<Kept>().send(Kept(entities[0]), 3..);
+        world.signal::<Kept>().send(Kept(entities[0]), (At(3), ..));
         for &entity in &entities[1..] {
             world.signal::<Kept>().send(Kept(entity), ..);
         }
@@ -2478,7 +2663,10 @@ mod tests {
     #[test]
     fn late_join_drops_cancelled_permanent_signals() {
         let world = world();
-        let late = world.signal::<NumSignal>().send(NumSignal(9), 3..).unwrap();
+        let late = world
+            .signal::<NumSignal>()
+            .send(NumSignal(9), (At(3), ..))
+            .unwrap();
         for payload in 1..=3 {
             send_open(&world, payload);
         }
@@ -2570,7 +2758,7 @@ mod tests {
     fn late_signal_behind_the_sweep_waits_in_active_until_the_lap_ends() {
         let world = kept_world();
         let entities = spawn_all(&world, 5);
-        world.signal::<Kept>().send(Kept(entities[0]), 3..);
+        world.signal::<Kept>().send(Kept(entities[0]), (At(3), ..));
         for &entity in &entities[1..] {
             world.signal::<Kept>().send(Kept(entity), ..);
         }
@@ -3024,7 +3212,9 @@ mod tests {
     #[test]
     fn signal_storage_roundtrips_through_registry() {
         let world = world();
-        world.signal::<NumSignal>().send(NumSignal(42), 1..3);
+        world
+            .signal::<NumSignal>()
+            .send(NumSignal(42), (At(1), To(2)));
 
         let entry = get_registry_entry(Signals::<NumSignal>::TYPE_UUID).unwrap();
         let signals = world.get_resource::<Signals<NumSignal>>().unwrap();
