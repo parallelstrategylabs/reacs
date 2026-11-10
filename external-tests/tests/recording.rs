@@ -267,6 +267,77 @@ fn a_playback_reports_where_a_different_world_diverges() {
     assert!(!names.iter().any(|name| name.ends_with("Rng")), "{names:?}");
 }
 
+fn tick(world: &World) -> u64 {
+    world.get_resource::<Tick>().unwrap().0
+}
+
+#[test]
+fn a_game_can_pause_and_change_speed_while_replaying() {
+    let (file, original) = record_session("viewer");
+
+    let mut world = World::new();
+    let mut playback = world.to_playback(&file).unwrap();
+    fs::remove_file(&file).unwrap();
+    let speeds = [1, 0, 0, 2, 4, 0, 1, 3];
+    let mut frame = 0;
+    let mut seen = Vec::new();
+    while !playback.finished() {
+        for _ in 0..speeds[frame % speeds.len()] {
+            if playback.finished() {
+                break;
+            }
+            world.replay(&mut playback).step();
+        }
+        seen.push(world.get_resource::<Trace>().unwrap().0);
+        frame += 1;
+    }
+
+    assert_eq!(playback.diverged(), None);
+    assert!(frame > 10);
+    assert!(seen.windows(2).any(|pair| pair[0] == pair[1]));
+    assert_eq!(world.save(), original.save());
+}
+
+#[test]
+fn a_replay_can_stop_at_a_tick_and_go_on_as_a_new_recording() {
+    for stop in [6, 12, 13] {
+        let (file, _) = record_session(&format!("branch-source-{stop}"));
+        let branch = path(&format!("branch-{stop}"));
+
+        let mut world = World::new();
+        let mut playback = world.to_playback(&file).unwrap();
+        fs::remove_file(&file).unwrap();
+        while !playback.finished() && tick(&world) < stop {
+            world.replay(&mut playback).step();
+        }
+        drop(playback);
+        assert_eq!(tick(&world), stop);
+
+        let mut recorder = world.to_recorder(&branch).unwrap().with_hash_every(4);
+        for t in stop..stop + 8 {
+            if t % 2 == 0 {
+                world.input(Order(t * 10));
+            }
+            world.record(&mut recorder).step();
+        }
+        recorder.finish().unwrap();
+
+        let recording = Recording::open(&branch).unwrap();
+        assert_eq!(recording.sections.len(), 1);
+        assert_eq!(recording.sections[0].tick, stop);
+
+        let mut copy = World::new();
+        let mut playback = copy.to_playback(&branch).unwrap();
+        fs::remove_file(&branch).unwrap();
+        while !playback.finished() {
+            copy.replay(&mut playback).step();
+        }
+        assert_eq!(playback.diverged(), None, "stop at {stop}");
+        assert_eq!(tick(&copy), stop + 8);
+        assert_eq!(copy.save(), world.save(), "stop at {stop}");
+    }
+}
+
 #[test]
 fn a_file_that_is_not_a_recording_is_rejected() {
     let file = path("junk");
