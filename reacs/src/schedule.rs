@@ -602,6 +602,7 @@ impl World {
     }
 
     pub fn step(&mut self) {
+        self.steps += 1;
         self.run_systems();
         self.cleanup_signals();
         self.get_resource_mut::<Tick>()

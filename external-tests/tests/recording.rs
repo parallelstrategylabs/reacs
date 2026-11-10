@@ -1,5 +1,5 @@
 use reacs::prelude::*;
-use reacs::record::{Recorder, Recording, send_recorded};
+use reacs::record::{Playback, Recorder, Recording, send_recorded};
 use std::fs;
 use std::path::PathBuf;
 
@@ -336,6 +336,202 @@ fn a_replay_can_stop_at_a_tick_and_go_on_as_a_new_recording() {
         assert_eq!(tick(&copy), stop + 8);
         assert_eq!(copy.save(), world.save(), "stop at {stop}");
     }
+}
+
+fn replay_to(world: &mut World, playback: &mut Playback, stop: u64) {
+    while !playback.finished() && tick(world) < stop {
+        world.replay(playback).step();
+    }
+    assert_eq!(tick(world), stop);
+}
+
+fn play_branch(world: &mut World, recorder: &mut Recorder, ticks: std::ops::Range<u64>) {
+    for t in ticks {
+        if t % 2 == 0 {
+            world.input(Order(t * 10));
+        }
+        world.record(recorder).step();
+    }
+}
+
+fn replay_whole(file: &PathBuf) -> (World, Recording) {
+    let recording = Recording::open(file).unwrap();
+    let mut world = World::new();
+    let mut playback = world.to_playback(file).unwrap();
+    while !playback.finished() {
+        world.replay(&mut playback).step();
+    }
+    assert_eq!(playback.diverged(), None);
+    (world, recording)
+}
+
+#[test]
+fn a_branch_keeps_the_history_and_replays_from_the_start() {
+    for (stop, sections) in [(0, 1), (6, 1), (12, 1), (13, 2)] {
+        let (file, _) = record_session(&format!("history-source-{stop}"));
+        let branch = path(&format!("history-{stop}"));
+
+        let mut world = World::new();
+        let mut playback = world.to_playback(&file).unwrap();
+        fs::remove_file(&file).unwrap();
+        replay_to(&mut world, &mut playback, stop);
+        let mut recorder = playback.to_recorder(&world, &branch).unwrap();
+        play_branch(&mut world, &mut recorder, stop..stop + 8);
+        recorder.finish().unwrap();
+
+        let (copy, recording) = replay_whole(&branch);
+        fs::remove_file(&branch).unwrap();
+        assert_eq!(recording.sections[0].tick, 0, "stop at {stop}");
+        assert_eq!(recording.sections.len(), sections, "stop at {stop}");
+        assert_eq!(tick(&copy), stop + 8);
+        assert_eq!(copy.save(), world.save(), "stop at {stop}");
+    }
+}
+
+#[test]
+fn a_branch_can_replace_the_file_it_replays() {
+    let (file, _) = record_session("replace");
+
+    let mut world = World::new();
+    let mut playback = world.to_playback(&file).unwrap();
+    replay_to(&mut world, &mut playback, 7);
+    let mut recorder = playback.to_recorder(&world, &file).unwrap();
+    play_branch(&mut world, &mut recorder, 7..15);
+    recorder.finish().unwrap();
+
+    let (copy, recording) = replay_whole(&file);
+    fs::remove_file(&file).unwrap();
+    assert_eq!(recording.sections.len(), 1);
+    assert_eq!(copy.save(), world.save());
+}
+
+#[test]
+fn a_branch_of_a_branch_keeps_both_histories() {
+    let (file, _) = record_session("nested");
+
+    let mut world = World::new();
+    let mut playback = world.to_playback(&file).unwrap();
+    replay_to(&mut world, &mut playback, 6);
+    let mut recorder = playback.to_recorder(&world, &file).unwrap();
+    play_branch(&mut world, &mut recorder, 6..14);
+    recorder.finish().unwrap();
+
+    let mut world = World::new();
+    let mut playback = world.to_playback(&file).unwrap();
+    replay_to(&mut world, &mut playback, 10);
+    let mut recorder = playback.to_recorder(&world, &file).unwrap();
+    for t in 10..15 {
+        world.input(Pause(t as u8));
+        world.record(&mut recorder).step();
+    }
+    recorder.finish().unwrap();
+
+    let (copy, _) = replay_whole(&file);
+    fs::remove_file(&file).unwrap();
+    assert_eq!(tick(&copy), 15);
+    assert_eq!(copy.save(), world.save());
+}
+
+#[test]
+fn inputs_on_the_branch_tick_are_recorded_once() {
+    for replayed_first in [false, true] {
+        let (file, _) = record_session(&format!("boundary-source-{replayed_first}"));
+        let branch = path(&format!("boundary-{replayed_first}"));
+
+        let mut world = World::new();
+        let mut playback = world.to_playback(&file).unwrap();
+        fs::remove_file(&file).unwrap();
+        replay_to(&mut world, &mut playback, 9);
+        if replayed_first {
+            let _ = world.replay(&mut playback);
+        }
+        world.input(Order(999));
+        let mut recorder = playback.to_recorder(&world, &branch).unwrap();
+        world.record(&mut recorder).step();
+        play_branch(&mut world, &mut recorder, 10..14);
+        recorder.finish().unwrap();
+
+        let (copy, recording) = replay_whole(&branch);
+        fs::remove_file(&branch).unwrap();
+        let at_nine = recording.sections[0]
+            .ticks
+            .iter()
+            .find(|x| x.tick == 9)
+            .unwrap();
+        let orders = at_nine
+            .inputs
+            .iter()
+            .map(|x| x.payloads.len())
+            .sum::<usize>();
+        assert_eq!(
+            orders,
+            if replayed_first { 2 } else { 1 },
+            "{replayed_first}"
+        );
+        assert_eq!(copy.save(), world.save(), "{replayed_first}");
+    }
+}
+
+#[test]
+fn a_branch_refuses_a_world_the_playback_did_not_bring_there() {
+    let (file, _) = record_session("refused");
+    let mut world = World::new();
+    let mut playback = world.to_playback(&file).unwrap();
+    fs::remove_file(&file).unwrap();
+    replay_to(&mut world, &mut playback, 5);
+    world.step();
+    world.step();
+
+    let error = playback
+        .to_recorder(&world, path("refused-branch"))
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn a_load_to_the_next_tick_is_replayed() {
+    let mut other = World::new();
+    for t in 0..8 {
+        other.input(Order(t * 100 + 1));
+        other.step();
+    }
+    let other_game = other.save();
+
+    let file = path("next-tick-load");
+    let mut world = World::new();
+    let mut recorder = world.to_recorder(&file).unwrap().with_hash_every(4);
+    play(&mut world, &mut recorder, 0..8);
+    assert_eq!(tick(&world), 8);
+    world.load(&other_game);
+    assert_eq!(tick(&world), 8);
+    play(&mut world, &mut recorder, 8..12);
+    recorder.finish().unwrap();
+
+    let (copy, recording) = replay_whole(&file);
+    fs::remove_file(&file).unwrap();
+    assert_eq!(recording.sections.len(), 2);
+    assert_eq!(copy.save(), world.save());
+}
+
+#[test]
+fn a_load_between_recording_and_stepping_a_tick_is_replayed() {
+    let file = path("mid-frame-load");
+    let mut world = World::new();
+    let mut recorder = world.to_recorder(&file).unwrap().with_hash_every(4);
+    play(&mut world, &mut recorder, 0..6);
+    let quick = world.save();
+    world.input(Order(77));
+    recorder.record(&world);
+    world.load(&quick);
+    play(&mut world, &mut recorder, 6..10);
+    recorder.finish().unwrap();
+
+    let (copy, recording) = replay_whole(&file);
+    fs::remove_file(&file).unwrap();
+    assert_eq!(recording.sections.len(), 2);
+    assert_eq!(recording.sections[0].end, 6);
+    assert_eq!(copy.save(), world.save());
 }
 
 #[test]

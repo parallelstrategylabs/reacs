@@ -39,6 +39,8 @@ pub struct World {
     pub(crate) resources: Vec<(u128, Box<RefCell<dyn Any>>)>,
     local_resources: Vec<LocalEntry>,
     app_version: u32,
+    pub(crate) loads: u64,
+    pub(crate) steps: u64,
 }
 
 impl World {
@@ -48,6 +50,8 @@ impl World {
             resources: Vec::new(),
             local_resources: Vec::new(),
             app_version: 0,
+            loads: 0,
+            steps: 0,
         };
 
         world.init_resource::<CurrentSystem>();
@@ -297,6 +301,7 @@ impl World {
     }
 
     fn finish_load(&mut self) {
+        self.loads += 1;
         set_current_system(self, ANONYMOUS_SYSTEM);
 
         for local in &self.local_resources {

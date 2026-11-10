@@ -1,7 +1,7 @@
 use std::{
-    fs::File,
+    fs::{File, OpenOptions},
     io::{self, BufRead, BufReader, BufWriter, ErrorKind, Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     ptr::addr_of_mut,
 };
 
@@ -157,6 +157,9 @@ pub struct Recorder {
     last: Option<u64>,
     written: u64,
     table: Vec<u128>,
+    loads: u64,
+    steps: u64,
+    section_start: u64,
     error: Option<io::Error>,
 }
 
@@ -185,13 +188,16 @@ impl Recorder {
 
     fn write_tick(&mut self, world: &World) -> io::Result<()> {
         let tick = current_tick(world);
-        if self.last == Some(tick) {
+        let loaded = world.loads != self.loads;
+        if self.last == Some(tick) && !loaded {
             return Ok(());
         }
-        if tick != self.last.map_or(self.written, |last| last + 1) {
+        if loaded || tick != self.last.map_or(self.written, |last| last + 1) {
             let state = world.save();
             let state_len = state.len() as u64;
-            let ended = self.last;
+            let ran = world.steps.saturating_sub(self.steps);
+            let reached = self.last.map_or(self.section_start, |last| last + ran);
+            let ended = (reached > self.section_start).then(|| reached - 1);
             let record = Record::Section {
                 tick,
                 state_len,
@@ -199,8 +205,11 @@ impl Recorder {
             };
             write(&mut self.out, &record, &state)?;
             self.written = tick;
+            self.section_start = tick;
             self.first_ids = next_ids(world);
         }
+        self.loads = world.loads;
+        self.steps = world.steps;
         self.last = Some(tick);
 
         let mut inputs = Vec::new();
@@ -255,6 +264,9 @@ impl World {
             last: None,
             written: start_tick,
             table: Vec::new(),
+            loads: self.loads,
+            steps: self.steps,
+            section_start: start_tick,
             error: None,
         })
     }
@@ -390,7 +402,7 @@ impl Recording {
                         Some(last) => last.checked_add(1).ok_or_else(corrupted)?,
                         None => previous.tick,
                     };
-                    if end < previous.tick || previous.ticks.last().is_some_and(|x| x.tick >= end) {
+                    if end < previous.tick || previous.ticks.last().is_some_and(|x| x.tick > end) {
                         return Err(corrupted());
                     }
                     previous.end = end;
@@ -425,6 +437,7 @@ pub struct Playback {
     section: usize,
     next: usize,
     at: u64,
+    section_ids: Vec<u64>,
     divergence: Option<Divergence>,
 }
 
@@ -488,6 +501,7 @@ impl Playback {
             world
                 .restore(state)
                 .unwrap_or_else(|| panic!("this recording is corrupted"));
+            self.section_ids = next_ids(world);
         }
 
         let tick = current_tick(world);
@@ -513,6 +527,100 @@ impl Playback {
         }
         self.at = tick + 1;
     }
+
+    pub fn to_recorder(self, world: &World, path: impl AsRef<Path>) -> io::Result<Recorder> {
+        let tick = current_tick(world);
+        let sections = &self.recording.sections[..=self.section];
+        let current = &sections[self.section];
+        if tick < current.tick || (tick != self.at && tick + 1 != self.at) {
+            let message = "the world isn't where the playback left it";
+            return Err(io::Error::new(ErrorKind::InvalidInput, message));
+        }
+
+        let path = path.as_ref();
+        let mut temp = path.as_os_str().to_owned();
+        temp.push(".reacs-tmp");
+        let temp = PathBuf::from(temp);
+        let history = self.write_history(&temp, tick);
+        let (written, table) = match history.and_then(|x| std::fs::rename(&temp, path).map(|_| x)) {
+            Ok(history) => history,
+            Err(error) => {
+                let _ = std::fs::remove_file(&temp);
+                return Err(error);
+            }
+        };
+
+        let first_ids = if tick == current.tick {
+            self.section_ids
+        } else {
+            vec![0; input_signals().len()]
+        };
+        Ok(Recorder {
+            out: BufWriter::new(OpenOptions::new().append(true).open(path)?),
+            hash_every: RECORD_HASH_EVERY,
+            first_ids,
+            last: (tick > current.tick).then(|| tick - 1),
+            written,
+            table,
+            loads: world.loads,
+            steps: world.steps,
+            section_start: current.tick,
+            error: None,
+        })
+    }
+
+    fn write_history(&self, temp: &Path, tick: u64) -> io::Result<(u64, Vec<u128>)> {
+        let sections = &self.recording.sections[..=self.section];
+        let mut out = BufWriter::new(File::create(temp)?);
+        let start = &sections[0];
+        let header = Header {
+            build_id: build_id(),
+            start_tick: start.tick,
+            state_len: start.state.len() as u64,
+        };
+        out.write_all(MAGIC)?;
+        write(&mut out, &header, &start.state)?;
+
+        let mut written = start.tick;
+        let mut table = Vec::new();
+        for (i, section) in sections.iter().enumerate() {
+            if i > 0 {
+                let previous = &sections[i - 1];
+                let record = Record::Section {
+                    tick: section.tick,
+                    state_len: section.state.len() as u64,
+                    ended: (previous.end > previous.tick).then(|| previous.end - 1),
+                };
+                write(&mut out, &record, &section.state)?;
+                written = section.tick;
+            }
+            let last = i == self.section;
+            for recorded in section.ticks.iter().take_while(|x| !last || x.tick < tick) {
+                let hashes = recorded.hashes.as_ref().map(|hashes| {
+                    let (ids, values): (Vec<u128>, Vec<u64>) = hashes.iter().copied().unzip();
+                    let changed = (ids != table).then(|| {
+                        table.clone_from(&ids);
+                        ids
+                    });
+                    (changed, values)
+                });
+                let inputs = recorded.inputs.iter().map(|inputs| {
+                    let found = input_signals().binary_search_by_key(&inputs.signal, |x| x.uuid);
+                    let kind = found.map_err(|_| corrupted())?;
+                    Ok((kind as u32, inputs.payloads.clone()))
+                });
+                let record = Record::Tick {
+                    gap: recorded.tick - written,
+                    hashes,
+                    inputs: inputs.collect::<io::Result<_>>()?,
+                };
+                write(&mut out, &record, &[])?;
+                written = recorded.tick;
+            }
+        }
+        out.flush()?;
+        Ok((written, table))
+    }
 }
 
 impl World {
@@ -528,6 +636,7 @@ impl World {
             section: 0,
             next: 0,
             at,
+            section_ids: next_ids(self),
             divergence: None,
         })
     }
@@ -559,6 +668,7 @@ mod tests {
     }
 
     fn advance(world: &mut World) {
+        world.steps += 1;
         world.cleanup_signals();
         world.get_resource_mut::<Tick>().unwrap().0 += 1;
     }
@@ -774,7 +884,7 @@ mod tests {
 
         let sections: Vec<(u64, u64)> =
             recording.sections.iter().map(|x| (x.tick, x.end)).collect();
-        assert_eq!(sections, [(0, 1), (2, 4), (2, 3)]);
+        assert_eq!(sections, [(0, 2), (2, 4), (2, 3)]);
     }
 
     #[test]
