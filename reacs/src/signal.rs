@@ -761,19 +761,21 @@ impl<S: SignalType> Signals<S> {
     }
 
     pub(crate) fn pending(&self, data: &SignalData<S>, system: u128, tick: u64) -> bool {
+        let running = !self.transitory_active.is_empty()
+            || !self.permanent_joining.is_empty()
+            || self.permanent_write > 0
+            || self.permanent_read < self.permanent.len();
+        if !running && self.transient_buffer.is_empty() && self.transient.is_empty() {
+            return false;
+        }
+
         let (cursor, windows) = match data.cursors.binary_search_by_key(&system, |x| x.system) {
             Ok(i) => (data.cursors[i].next, data.cursors[i].windows_tick != tick),
             Err(_) => (0, true),
         };
         let unread = |list: &[SignalInstance<S>]| list.last().is_some_and(|x| x.id >= cursor);
 
-        unread(&self.transient_buffer)
-            || unread(&self.transient)
-            || windows
-                && (!self.transitory_active.is_empty()
-                    || !self.permanent_joining.is_empty()
-                    || self.permanent_write > 0
-                    || self.permanent_read < self.permanent.len())
+        unread(&self.transient_buffer) || unread(&self.transient) || windows && running
     }
 
     #[inline(always)]
