@@ -297,6 +297,8 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
     let mut init_stmts: Vec<TokenStream> = Vec::new();
     let mut fetch_exprs: Vec<TokenStream> = Vec::new();
     let mut members: Vec<&Member> = Vec::new();
+    let mut field_tys: Vec<Type> = Vec::new();
+    let static_lt = lt("'static");
 
     for info in &infos {
         let mode = mode_of(info.pin, &sp_mode);
@@ -309,6 +311,7 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
         fetch_exprs.push(quote!(
             <#fetch_ty as ::reacs::schedule::SystemParam>::fetch(world)
         ));
+        field_tys.push(rewrite_path(&info.ty, &static_lt, &mode)?);
     }
 
     let sp_header = ty_with(&infer, &sp_mode);
@@ -317,6 +320,8 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
     let system_param = quote! {
         impl #sp_impl ::reacs::schedule::SystemParam for #sp_header #sp_where {
             type Item<'__w> = #sp_item;
+            const WAKE: ::reacs::schedule::Wake = ::reacs::schedule::Wake::Neutral
+                #(.or(<#field_tys as ::reacs::schedule::SystemParam>::WAKE))*;
 
             #[allow(unused_mut, unused_variables)]
             fn init(mut world: ::reacs::schedule::ParamInit<'_>) {
@@ -325,6 +330,15 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
 
             fn fetch<'__w>(world: ::reacs::schedule::ParamWorld<'__w>) -> #sp_item {
                 #name { #(#members: #fetch_exprs),* }
+            }
+
+            #[inline]
+            fn pending(world: ::reacs::schedule::ParamWorld<'_>, system: u128, tick: u64) -> bool {
+                false #(|| <#field_tys as ::reacs::schedule::SystemParam>::pending(world, system, tick))*
+            }
+
+            fn wakes_on(names: &mut ::std::vec::Vec<&'static str>) {
+                #(<#field_tys as ::reacs::schedule::SystemParam>::wakes_on(names);)*
             }
         }
     };

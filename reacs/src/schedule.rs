@@ -41,8 +41,10 @@ pub struct SystemEntry {
     pub before: Vec<u128>,
     pub after: Vec<u128>,
     pub groups: Vec<u128>,
+    pub wakes_on: Vec<&'static str>,
     pub(crate) init_fn: Box<dyn Fn(&mut World)>,
     pub(crate) run_fn: Box<dyn Fn(&mut World)>,
+    pub(crate) wake_fn: Option<fn(ParamWorld<'_>, u128, u64) -> bool>,
 }
 
 impl SystemEntry {
@@ -296,7 +298,7 @@ impl SystemGraph {
                 ""
             };
 
-            writeln!(
+            write!(
                 tree,
                 "{:>width$} {branch}{}::{}",
                 i + 1,
@@ -304,6 +306,10 @@ impl SystemGraph {
                 system.name
             )
             .unwrap();
+            if system.wake_fn.is_some() {
+                write!(tree, " (wakes on {})", system.wakes_on.join(", ")).unwrap();
+            }
+            tree.push('\n');
         }
 
         tree
@@ -320,7 +326,16 @@ impl SystemGraph {
     }
 
     pub(crate) fn run(&self, world: &mut World) {
+        let tick = world
+            .get_resource::<Tick>()
+            .unwrap_or_else(|| conflict::<Tick>())
+            .0;
         for system in self.iter() {
+            if let Some(wake) = system.wake_fn {
+                if !wake(ParamWorld(world), system.uuid, tick) {
+                    continue;
+                }
+            }
             system.run(world);
         }
     }
@@ -338,11 +353,41 @@ impl ParamInit<'_> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wake {
+    Neutral,
+    Gate,
+    Always,
+}
+
+impl Wake {
+    pub const fn or(self, other: Wake) -> Wake {
+        match (self, other) {
+            (Wake::Always, _) | (_, Wake::Always) => Wake::Always,
+            (Wake::Gate, _) | (_, Wake::Gate) => Wake::Gate,
+            _ => Wake::Neutral,
+        }
+    }
+}
+
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a system parameter",
+    label = "not a system parameter",
+    note = "signal params only exist with `Mut`: `Mut<Receiver<S>>`, `Mut<Sender<S>>` or `Mut<Signal<S>>`, since receiving moves a saved cursor"
+)]
 pub trait SystemParam {
     type Item<'w>;
+    const WAKE: Wake = Wake::Neutral;
 
     fn init(world: ParamInit<'_>);
     fn fetch<'w>(world: ParamWorld<'w>) -> Self::Item<'w>;
+
+    #[inline]
+    fn pending(_world: ParamWorld<'_>, _system: u128, _tick: u64) -> bool {
+        false
+    }
+
+    fn wakes_on(_names: &mut Vec<&'static str>) {}
 }
 
 pub trait IntoSystem<P> {
@@ -357,8 +402,17 @@ macro_rules! impl_into_system_tuples {
             F: for<'w> Fn($($param::Item<'w>),*),
             $($param: SystemParam),*
         {
-            #[allow(nonstandard_style, unused_variables)]
+            #[allow(nonstandard_style, unused_variables, unused_mut)]
             fn into_system(self) -> SystemEntry {
+                let wake = Wake::Neutral $(.or($param::WAKE))*;
+                let mut wakes_on = Vec::new();
+                let wake_fn: Option<fn(ParamWorld<'_>, u128, u64) -> bool> = if wake == Wake::Gate {
+                    $( $param::wakes_on(&mut wakes_on); )*
+                    Some(|world, system, tick| false $(|| $param::pending(world, system, tick))*)
+                } else {
+                    None
+                };
+
                 SystemEntry {
                     uuid: ANONYMOUS_SYSTEM,
                     module: "",
@@ -366,6 +420,8 @@ macro_rules! impl_into_system_tuples {
                     before: Vec::new(),
                     after: Vec::new(),
                     groups: Vec::new(),
+                    wakes_on,
+                    wake_fn,
                     init_fn: Box::new(move |world: &mut World| {
                         $( $param::init(ParamInit(&mut *world)); )*
                     }),
@@ -565,6 +621,8 @@ where
             before: Vec::new(),
             after: Vec::new(),
             groups: Vec::new(),
+            wakes_on: Vec::new(),
+            wake_fn: None,
             init_fn: Box::new(|_world: &mut World| {}),
             run_fn: Box::new(move |world: &mut World| self(WorldAccess(world))),
         }

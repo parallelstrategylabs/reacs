@@ -9,7 +9,10 @@ use crate::{
     hashed::Hashed,
     registry::get_registry_entry,
     resource::Resource,
-    schedule::{CurrentSystem, Mut, WorldAccess, Write},
+    schedule::{
+        CurrentSystem, Mode, Mut, ParamInit, ParamWorld, Read, SystemParam, Wake, WorldAccess,
+        Write,
+    },
     world::World,
 };
 
@@ -757,6 +760,22 @@ impl<S: SignalType> Signals<S> {
         found
     }
 
+    pub(crate) fn pending(&self, data: &SignalData<S>, system: u128, tick: u64) -> bool {
+        let (cursor, windows) = match data.cursors.binary_search_by_key(&system, |x| x.system) {
+            Ok(i) => (data.cursors[i].next, data.cursors[i].windows_tick != tick),
+            Err(_) => (0, true),
+        };
+        let unread = |list: &[SignalInstance<S>]| list.last().is_some_and(|x| x.id >= cursor);
+
+        unread(&self.transient_buffer)
+            || unread(&self.transient)
+            || windows
+                && (!self.transitory_active.is_empty()
+                    || !self.permanent_joining.is_empty()
+                    || self.permanent_write > 0
+                    || self.permanent_read < self.permanent.len())
+    }
+
     #[inline(always)]
     pub fn receive<'a, K: Fn(&S) -> bool>(
         &'a self,
@@ -1107,6 +1126,46 @@ impl<S: SignalType> Signals<S> {
     }
 }
 
+pub(crate) struct SignalWake<'w, S, M: Mode = Read>(PhantomData<(&'w (), S, M)>);
+
+impl<S: SignalType, M: Mode> SystemParam for SignalWake<'_, S, M> {
+    type Item<'w> = SignalWake<'w, S, M>;
+    const WAKE: Wake = Wake::Gate;
+
+    fn init(_world: ParamInit<'_>) {}
+
+    #[inline]
+    fn fetch<'w>(_world: ParamWorld<'w>) -> SignalWake<'w, S, M> {
+        SignalWake(PhantomData)
+    }
+
+    #[inline]
+    fn pending(world: ParamWorld<'_>, system: u128, tick: u64) -> bool {
+        let signals = Read::fetch::<Signals<S>>(world);
+        let data = Read::fetch::<SignalData<S>>(world);
+        signals.pending(&data, system, tick)
+    }
+
+    fn wakes_on(names: &mut Vec<&'static str>) {
+        let name = std::any::type_name::<S>();
+        names.push(name.rsplit("::").next().unwrap_or(name));
+    }
+}
+
+pub(crate) struct EveryTick<'w, M: Mode = Read>(PhantomData<(&'w (), M)>);
+
+impl<M: Mode> SystemParam for EveryTick<'_, M> {
+    type Item<'w> = EveryTick<'w, M>;
+    const WAKE: Wake = Wake::Always;
+
+    fn init(_world: ParamInit<'_>) {}
+
+    #[inline]
+    fn fetch<'w>(_world: ParamWorld<'w>) -> EveryTick<'w, M> {
+        EveryTick(PhantomData)
+    }
+}
+
 #[param(write)]
 pub struct Signal<S: SignalType> {
     pub signals: Resource<Signals<S>>,
@@ -1117,6 +1176,31 @@ pub struct Signal<S: SignalType> {
     pub current: Resource<CurrentSystem>,
     #[read]
     pub world: WorldAccess,
+    #[read]
+    _every_tick: EveryTick,
+}
+
+#[param(write)]
+pub struct Receiver<S: SignalType> {
+    #[read]
+    pub signals: Resource<Signals<S>>,
+    pub data: Resource<SignalData<S>>,
+    #[read]
+    pub tick: Resource<Tick>,
+    #[read]
+    pub current: Resource<CurrentSystem>,
+    #[read]
+    pub world: WorldAccess,
+    #[read]
+    _wake: SignalWake<S>,
+}
+
+#[param(write)]
+pub struct Sender<S: SignalType> {
+    pub signals: Resource<Signals<S>>,
+    pub data: Resource<SignalData<S>>,
+    #[read]
+    pub tick: Resource<Tick>,
 }
 
 impl<'w, S: SignalType> Signal<'w, S, Write> {
@@ -1151,6 +1235,53 @@ impl<'w, S: SignalType> Signal<'w, S, Write> {
             (*self.tick).0,
             move |signal| S::Filter::keep(&context, signal),
         )
+    }
+
+    #[inline]
+    pub fn tick(&self) -> u64 {
+        (*self.tick).0
+    }
+}
+
+impl<'w, S: SignalType> Receiver<'w, S, Write> {
+    #[inline]
+    pub fn receive(&mut self) -> impl Iterator<Item = &S> {
+        let context = S::Filter::fetch(&self.world);
+        self.signals.receive(
+            &mut self.data,
+            (*self.current).0,
+            (*self.tick).0,
+            move |signal| S::Filter::keep(&context, signal),
+        )
+    }
+
+    #[inline]
+    pub fn tick(&self) -> u64 {
+        (*self.tick).0
+    }
+}
+
+impl<'w, S: SignalType> Sender<'w, S, Write> {
+    #[inline]
+    pub fn send(&mut self, signal: S, window: impl IntoWindow) -> Option<u64> {
+        let tick = self.tick();
+        self.signals
+            .send(&mut self.data, tick, signal, window.into_window(tick))
+    }
+
+    #[inline]
+    pub fn emit(&mut self, signal: S) -> u64 {
+        self.signals.emit(&mut self.data, signal)
+    }
+
+    #[inline]
+    pub fn modify(&mut self, id: u64, payload: S) -> bool {
+        self.signals.modify(id, |current| *current = payload)
+    }
+
+    #[inline]
+    pub fn cancel(&mut self, id: u64) -> bool {
+        self.signals.cancel(id)
     }
 
     #[inline]
@@ -1645,6 +1776,105 @@ mod tests {
     #[test]
     fn same_length_windows_expire_by_head_and_match_a_simple_model() {
         assert!(windows_model_run(true) > 0);
+    }
+
+    #[test]
+    fn pending_is_never_false_when_receive_would_deliver() {
+        for seed in [
+            0x2545F4914F6CDD1Du64,
+            0x9E3779B97F4A7C15,
+            0xD1B54A32D192ED03,
+        ] {
+            let run = pending_model_run(seed);
+            println!("seed {seed:x}: {run:?}");
+            assert!(run.idle > 1_000 && run.delivered > 1_000, "{run:?}");
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct PendingRun {
+        checks: u64,
+        idle: u64,
+        delivered: u64,
+        over_wakes: u64,
+    }
+
+    fn pending_model_run(seed: u64) -> PendingRun {
+        let world = world();
+        let mut rng = seed;
+        let mut random = move |below: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % below
+        };
+        let mut ids: Vec<u64> = Vec::new();
+        let mut run = PendingRun::default();
+
+        for tick in 0..3_000u64 {
+            let phase = tick % 200;
+            if phase == 100 {
+                let mut s = world.signal::<NumSignal>();
+                for id in ids.drain(..) {
+                    s.cancel(id);
+                }
+            }
+            for receiver in [1, 2, 3, 2, 4u128] {
+                let sends = if phase < 100 {
+                    random(3)
+                } else if random(40) == 0 {
+                    1
+                } else {
+                    0
+                };
+                for _ in 0..sends {
+                    let mut s = world.signal::<NumSignal>();
+                    let payload = NumSignal(random(100));
+                    let kind = if phase < 100 { random(12) } else { 0 };
+                    let id = match kind {
+                        0..=3 => Some(s.emit(payload)),
+                        4 => s.send(payload, In(random(30))),
+                        5 => s.send(payload, For(1 + random(30))),
+                        6 => s.send(payload, (In(random(30)), For(1 + random(30)))),
+                        7 => s.send(payload, ..),
+                        8 => s.send(payload, (In(random(30)), ..)),
+                        9 => {
+                            let now = s.tick();
+                            s.send(payload, (At(now + random(20)), To(now + random(40))))
+                        }
+                        _ => {
+                            if !ids.is_empty() {
+                                let id = ids[random(ids.len() as u64) as usize];
+                                s.cancel(id);
+                            }
+                            None
+                        }
+                    };
+                    if phase < 100 {
+                        ids.extend(id);
+                    }
+                }
+
+                if random(4) == 0 {
+                    continue;
+                }
+                let now = world.get_resource::<Tick>().unwrap().0;
+                let signals = world.get_resource::<Signals<NumSignal>>().unwrap();
+                let mut data = world.get_resource_mut::<SignalData<NumSignal>>().unwrap();
+                let pending = signals.pending(&data, receiver, now);
+                let delivered = signals.receive(&mut data, receiver, now, |_| true).count();
+                assert!(
+                    pending || delivered == 0,
+                    "receiver {receiver} would skip {delivered} signals at tick {now}"
+                );
+                run.checks += 1;
+                run.idle += (!pending) as u64;
+                run.delivered += (delivered > 0) as u64;
+                run.over_wakes += (pending && delivered == 0) as u64;
+            }
+            end_tick(&world);
+        }
+        run
     }
 
     fn windows_model_run(same_length: bool) -> usize {
