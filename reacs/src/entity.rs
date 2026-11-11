@@ -26,10 +26,6 @@ impl Entity {
         }
     }
 
-    pub(crate) fn from_bits(bits: u64) -> Self {
-        Self { bits }
-    }
-
     pub fn to_bits(&self) -> u64 {
         self.bits
     }
@@ -311,7 +307,7 @@ mod tests {
 
     #[test]
     fn default_entity_is_never_alive() {
-        let mut world = world_with_components();
+        let world = world_with_components();
         let default = Entity::default();
         assert!(!world.entity_manager().is_alive(default));
 

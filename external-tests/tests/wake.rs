@@ -141,10 +141,6 @@ fn step(world: &mut World) {
     world.step();
 }
 
-fn ticks_of(runs: &[(u64, Vec<u64>)]) -> Vec<u64> {
-    runs.iter().map(|r| r.0).collect()
-}
-
 #[test]
 fn gated_systems_run_only_when_they_have_something_to_receive() {
     let mut world = new_world();
