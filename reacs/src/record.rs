@@ -197,7 +197,7 @@ impl Recorder {
             let state = world.save();
             let state_len = state.len() as u64;
             let ran = world.steps.saturating_sub(self.steps);
-            let reached = self.last.map_or(self.section_start, |last| last + ran);
+            let reached = self.last.map_or(self.section_start + ran, |last| last + ran);
             let ended = (reached > self.section_start).then(|| reached - 1);
             let record = Record::Section {
                 tick,
@@ -564,7 +564,7 @@ impl Playback {
             written,
             table,
             loads: world.loads,
-            steps: world.steps,
+            steps: world.steps - (tick > current.tick) as u64,
             section_start: current.tick,
             error: None,
         })

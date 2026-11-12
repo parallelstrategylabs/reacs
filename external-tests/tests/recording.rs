@@ -535,6 +535,58 @@ fn a_load_between_recording_and_stepping_a_tick_is_replayed() {
 }
 
 #[test]
+fn a_load_right_after_branching_keeps_the_ticks_replayed_before_it() {
+    let file = path("branch-then-load");
+    let mut world = World::new();
+    let fresh = world.save();
+    let mut recorder = world.to_recorder(&file).unwrap().with_hash_every(4);
+    play(&mut world, &mut recorder, 0..10);
+    recorder.finish().unwrap();
+
+    let mut world = World::new();
+    let mut playback = world.to_playback(&file).unwrap();
+    replay_to(&mut world, &mut playback, 7);
+    let mut recorder = playback.to_recorder(&world, &file).unwrap();
+    world.load(&fresh);
+    play_branch(&mut world, &mut recorder, 0..4);
+    recorder.finish().unwrap();
+
+    let (copy, recording) = replay_whole(&file);
+    fs::remove_file(&file).unwrap();
+    let sections: Vec<(u64, u64)> = recording.sections.iter().map(|s| (s.tick, s.end)).collect();
+    assert_eq!(sections, [(0, 7), (0, 4)]);
+    assert_eq!(copy.save(), world.save());
+}
+
+#[test]
+fn steps_before_the_first_record_count_as_run() {
+    let file = path("unrecorded-first");
+    let mut world = World::new();
+    let mut recorder = world.to_recorder(&file).unwrap().with_hash_every(1);
+    world.input(Order(42));
+    world.step();
+    world.step();
+    play(&mut world, &mut recorder, 2..6);
+    recorder.finish().unwrap();
+
+    let recording = Recording::open(&file).unwrap();
+    let sections: Vec<(u64, u64)> = recording.sections.iter().map(|s| (s.tick, s.end)).collect();
+    assert_eq!(sections, [(0, 2), (2, 6)]);
+
+    let mut copy = World::new();
+    let mut playback = copy.to_playback(&file).unwrap();
+    fs::remove_file(&file).unwrap();
+    let mut steps = 0;
+    while !playback.finished() {
+        copy.replay(&mut playback).step();
+        steps += 1;
+    }
+    assert_eq!(steps, 6);
+    assert_eq!(playback.diverged(), None);
+    assert_eq!(copy.save(), world.save());
+}
+
+#[test]
 fn a_file_that_is_not_a_recording_is_rejected() {
     let file = path("junk");
     fs::write(&file, b"definitely not a recording").unwrap();
@@ -542,4 +594,170 @@ fn a_file_that_is_not_a_recording_is_rejected() {
     fs::remove_file(&file).unwrap();
 
     assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+}
+
+struct Dice(u64);
+
+impl Dice {
+    fn below(&mut self, n: u64) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0 % n
+    }
+}
+
+fn random_inputs(world: &mut World, dice: &mut Dice) {
+    for _ in 0..dice.below(3) {
+        if dice.below(2) == 0 {
+            world.input(Order(dice.below(1000)));
+        } else {
+            world.input(Pause(dice.below(200) as u8));
+        }
+    }
+}
+
+fn recorded_step(
+    world: &mut World,
+    recorder: &mut Recorder,
+    dice: &mut Dice,
+    expected: &mut Vec<Option<Vec<u8>>>,
+) {
+    random_inputs(world, dice);
+    if dice.below(2) == 0 {
+        world.record(recorder).step();
+    } else {
+        recorder.record(world);
+        world.step();
+    }
+    expected.push(Some(world.save()));
+}
+
+fn random_session(
+    world: &mut World,
+    recorder: &mut Recorder,
+    dice: &mut Dice,
+    steps: usize,
+    saves: &mut Vec<Vec<u8>>,
+    expected: &mut Vec<Option<Vec<u8>>>,
+) {
+    for _ in 0..steps {
+        let save = dice.below(saves.len() as u64) as usize;
+        match dice.below(100) {
+            0..=79 => {
+                recorded_step(world, recorder, dice, expected);
+                if dice.below(8) == 0 {
+                    saves.push(world.save());
+                }
+            }
+            80..=87 => world.load(&saves[save]),
+            88..=91 => {
+                random_inputs(world, dice);
+                recorder.record(world);
+                world.load(&saves[save]);
+            }
+            _ => {
+                random_inputs(world, dice);
+                world.step();
+                expected.push(None);
+            }
+        }
+    }
+    recorded_step(world, recorder, dice, expected);
+}
+
+fn replay_step_by_step(file: &PathBuf, expected: &[Option<Vec<u8>>], what: &str) {
+    let mut world = World::new();
+    let mut playback = world.to_playback(file).unwrap();
+    let mut replayed = 0;
+    while !playback.finished() {
+        world.replay(&mut playback).step();
+        assert!(
+            replayed < expected.len(),
+            "{what}: replay ran past the session"
+        );
+        assert!(
+            expected[replayed]
+                .as_ref()
+                .is_none_or(|save| world.save() == *save),
+            "{what}: replay step {replayed} of {}",
+            expected.len()
+        );
+        replayed += 1;
+    }
+    assert_eq!(replayed, expected.len(), "{what}");
+    assert_eq!(playback.diverged(), None, "{what}");
+}
+
+#[test]
+fn random_sessions_replay_step_by_step_and_branch() {
+    let (sessions, steps) = if cfg!(miri) { (2, 30) } else { (8, 300) };
+    let mut foreign = World::new();
+    let mut foreign_saves = Vec::new();
+    for t in 0..20 {
+        foreign.input(Order(t * 7 + 3));
+        foreign.step();
+        if t % 5 == 4 {
+            foreign_saves.push(foreign.save());
+        }
+    }
+
+    for seed in 1..=sessions {
+        let mut dice = Dice(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(seed));
+        let file = path(&format!("random-{seed}"));
+        let mut world = World::new();
+        let mut saves = foreign_saves.clone();
+        saves.push(world.save());
+        let hash_every = [1, 3, 64][dice.below(3) as usize];
+        let mut recorder = world
+            .to_recorder(&file)
+            .unwrap()
+            .with_hash_every(hash_every);
+        let mut expected = Vec::new();
+        random_session(
+            &mut world,
+            &mut recorder,
+            &mut dice,
+            steps,
+            &mut saves,
+            &mut expected,
+        );
+        recorder.finish().unwrap();
+        let sections = Recording::open(&file).unwrap().sections.len();
+        replay_step_by_step(&file, &expected, &format!("seed {seed}"));
+
+        let branch_at = dice.below(expected.len() as u64 + 1) as usize;
+        let mut copy = World::new();
+        let mut playback = copy.to_playback(&file).unwrap();
+        for _ in 0..branch_at {
+            copy.replay(&mut playback).step();
+        }
+        let branch = match dice.below(2) {
+            0 => file.clone(),
+            _ => path(&format!("random-branch-{seed}")),
+        };
+        let mut recorder = playback.to_recorder(&copy, &branch).unwrap();
+        let mut branch_expected = expected[..branch_at].to_vec();
+        random_session(
+            &mut copy,
+            &mut recorder,
+            &mut dice,
+            steps / 3,
+            &mut saves,
+            &mut branch_expected,
+        );
+        recorder.finish().unwrap();
+        let what = format!("seed {seed}, branch at step {branch_at}, {sections} sections");
+        replay_step_by_step(&branch, &branch_expected, &what);
+
+        fs::remove_file(&branch).unwrap();
+        if branch != file {
+            fs::remove_file(&file).unwrap();
+        }
+        println!(
+            "{what}: {} steps, branch {}",
+            expected.len(),
+            branch_expected.len()
+        );
+    }
 }
