@@ -149,7 +149,15 @@ fn write<T: Serialize>(out: &mut impl Write, value: &T, state: &[u8]) -> io::Res
     out.flush()
 }
 
+fn same_world(expected: u64, world: &World, made_by: &str, calls: &str) {
+    assert!(
+        world.instance == expected,
+        "{calls} got a different World than the one passed to {made_by}"
+    );
+}
+
 pub struct Recorder {
+    world: u64,
     out: BufWriter<File>,
     hash_every: u64,
     first_ids: Vec<u64>,
@@ -170,6 +178,7 @@ impl Recorder {
     }
 
     pub fn record(&mut self, world: &World) {
+        same_world(self.world, world, "to_recorder", "Recorder::record");
         if self.error.is_none() {
             self.error = self.write_tick(world).err();
         }
@@ -180,6 +189,7 @@ impl Recorder {
     }
 
     pub fn finish(mut self, world: &World) -> io::Result<()> {
+        same_world(self.world, world, "to_recorder", "Recorder::finish");
         if let Some(error) = self.error.take() {
             return Err(error);
         }
@@ -271,6 +281,7 @@ impl World {
         write(&mut out, &header, &state)?;
 
         Ok(Recorder {
+            world: self.instance,
             out,
             hash_every: RECORD_HASH_EVERY,
             first_ids: next_ids(self),
@@ -449,6 +460,7 @@ pub struct Divergence {
 }
 
 pub struct Playback {
+    world: u64,
     recording: Recording,
     section: usize,
     next_record: usize,
@@ -511,6 +523,7 @@ impl Playback {
     }
 
     fn apply(&mut self, world: &mut World) {
+        same_world(self.world, world, "to_playback", "World::replay");
         if self.finished() {
             return;
         }
@@ -552,6 +565,7 @@ impl Playback {
     }
 
     pub fn to_recorder(self, world: &World, path: impl AsRef<Path>) -> io::Result<Recorder> {
+        same_world(self.world, world, "to_playback", "Playback::to_recorder");
         let tick = current_tick(world);
         let sections = &self.recording.sections[..=self.section];
         let current = &sections[self.section];
@@ -579,6 +593,7 @@ impl Playback {
             vec![0; input_signals().len()]
         };
         Ok(Recorder {
+            world: world.instance,
             out: BufWriter::new(OpenOptions::new().append(true).open(path)?),
             hash_every: RECORD_HASH_EVERY,
             first_ids,
@@ -655,6 +670,7 @@ impl World {
         }
         let next_tick = start.tick;
         Ok(Playback {
+            world: self.instance,
             recording,
             section: 0,
             next_record: 0,
@@ -1001,6 +1017,7 @@ mod tests {
         let mut world = World::new();
         world.restore(&recording.sections[0].state).unwrap();
         let mut playback = Playback {
+            world: world.instance,
             section_ids: next_ids(&world),
             recording,
             section: 0,
@@ -1021,6 +1038,59 @@ mod tests {
         assert_eq!(kind, Some(ErrorKind::InvalidData));
         assert_eq!(steps, 4);
         assert_eq!(current_tick(&world), 4);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "Recorder::record got a different World than the one passed to to_recorder"
+    )]
+    fn recording_another_world_panics() {
+        let file = path("other-world-record");
+        let world = World::new();
+        let mut recorder = world.to_recorder(&file).unwrap();
+        fs::remove_file(&file).unwrap();
+        recorder.record(&World::new());
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "Recorder::finish got a different World than the one passed to to_recorder"
+    )]
+    fn finishing_with_another_world_panics() {
+        let file = path("other-world-finish");
+        let world = World::new();
+        let recorder = world.to_recorder(&file).unwrap();
+        fs::remove_file(&file).unwrap();
+        let _ = recorder.finish(&World::new());
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "World::replay got a different World than the one passed to to_playback"
+    )]
+    fn replaying_into_another_world_panics() {
+        let file = path("other-world-replay");
+        fs::write(&file, short_run("other-world-replay-run")).unwrap();
+        let mut world = World::new();
+        let playback = world.to_playback(&file);
+        fs::remove_file(&file).unwrap();
+        let mut playback = playback.unwrap();
+        let _ = World::new().replay(&mut playback);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "Playback::to_recorder got a different World than the one passed to to_playback"
+    )]
+    fn branching_from_another_world_panics() {
+        let file = path("other-world-branch");
+        fs::write(&file, short_run("other-world-branch-run")).unwrap();
+        let mut world = World::new();
+        let playback = world.to_playback(&file);
+        fs::remove_file(&file).unwrap();
+        let _ = playback
+            .unwrap()
+            .to_recorder(&World::new(), path("other-world-branch-out"));
     }
 
     #[test]

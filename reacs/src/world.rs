@@ -1,6 +1,7 @@
 use std::{
     any::{Any, TypeId},
     cell::{Ref, RefCell, RefMut},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use crate::{
@@ -41,7 +42,10 @@ pub struct World {
     app_version: u32,
     pub(crate) loads: u64,
     pub(crate) steps: u64,
+    pub(crate) instance: u64,
 }
+
+static WORLDS: AtomicU64 = AtomicU64::new(0);
 
 impl World {
     #[inline]
@@ -52,6 +56,7 @@ impl World {
             app_version: 0,
             loads: 0,
             steps: 0,
+            instance: WORLDS.fetch_add(1, Ordering::Relaxed),
         };
 
         world.init_resource::<CurrentSystem>();
