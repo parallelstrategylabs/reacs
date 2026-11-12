@@ -11,10 +11,7 @@ use crate::{
     hashed::Hashed,
     registry::get_registry_entry,
     resource::Resource,
-    schedule::{
-        CurrentSystem, Mode, Mut, ParamInit, ParamWorld, Read, SystemParam, Wake, WorldAccess,
-        Write,
-    },
+    schedule::{CurrentSystem, Mode, Mut, ParamInit, ParamWorld, Read, WorldAccess, Write},
     world::World,
 };
 
@@ -1266,47 +1263,26 @@ impl<S: SignalType> Signals<S> {
     }
 }
 
-pub(crate) struct SignalWake<'w, S, M: Mode = Read>(PhantomData<(&'w (), S, M)>);
-
-impl<S: SignalType, M: Mode> SystemParam for SignalWake<'_, S, M> {
-    type Item<'w> = SignalWake<'w, S, M>;
-    const WAKE: Wake = Wake::Gate;
-
-    fn init(_world: ParamInit<'_>) {}
-
-    #[inline]
-    fn fetch<'w>(_world: ParamWorld<'w>) -> SignalWake<'w, S, M> {
-        SignalWake(PhantomData)
-    }
-
-    #[inline]
-    fn pending(world: ParamWorld<'_>, system: u128, tick: u64) -> bool {
-        let signals = Read::fetch::<Signals<S>>(world);
-        let data = Read::fetch::<SignalData<S>>(world);
-        signals.pending(&data, system, tick)
-    }
-
-    fn wakes_on(names: &mut Vec<&'static str>) {
-        let name = std::any::type_name::<S>();
-        names.push(name.rsplit("::").next().unwrap_or(name));
-    }
+#[doc(hidden)]
+pub fn wake_init<S: SignalType>(world: ParamInit<'_>) {
+    world.0.init_signal::<S>();
 }
 
-pub(crate) struct EveryTick<'w, M: Mode = Read>(PhantomData<(&'w (), M)>);
-
-impl<M: Mode> SystemParam for EveryTick<'_, M> {
-    type Item<'w> = EveryTick<'w, M>;
-    const WAKE: Wake = Wake::Always;
-
-    fn init(_world: ParamInit<'_>) {}
-
-    #[inline]
-    fn fetch<'w>(_world: ParamWorld<'w>) -> EveryTick<'w, M> {
-        EveryTick(PhantomData)
-    }
+#[doc(hidden)]
+#[inline]
+pub fn wake_pending<S: SignalType>(world: ParamWorld<'_>, system: u128, tick: u64) -> bool {
+    let signals = Read::fetch::<Signals<S>>(world);
+    let data = Read::fetch::<SignalData<S>>(world);
+    signals.pending(&data, system, tick)
 }
 
-#[param(write)]
+#[doc(hidden)]
+pub fn wake_name<S: SignalType>(names: &mut Vec<&'static str>) {
+    let name = std::any::type_name::<S>();
+    names.push(name.rsplit("::").next().unwrap_or(name));
+}
+
+#[param(write, wake = always)]
 pub struct Signal<S: SignalType> {
     pub signals: Resource<Signals<S>>,
     pub data: Resource<SignalData<S>>,
@@ -1316,11 +1292,9 @@ pub struct Signal<S: SignalType> {
     pub current: Resource<CurrentSystem>,
     #[read]
     pub world: WorldAccess,
-    #[read]
-    _every_tick: EveryTick,
 }
 
-#[param(write)]
+#[param(write, wake = __gate(S))]
 pub struct Receiver<S: SignalType> {
     #[read]
     pub signals: Resource<Signals<S>>,
@@ -1331,8 +1305,6 @@ pub struct Receiver<S: SignalType> {
     pub current: Resource<CurrentSystem>,
     #[read]
     pub world: WorldAccess,
-    #[read]
-    _wake: SignalWake<S>,
 }
 
 #[param(write)]

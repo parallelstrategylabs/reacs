@@ -359,6 +359,7 @@ impl ParamInit<'_> {
     }
 }
 
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wake {
     Neutral,
@@ -383,16 +384,19 @@ impl Wake {
 )]
 pub trait SystemParam {
     type Item<'w>;
+    #[doc(hidden)]
     const WAKE: Wake = Wake::Neutral;
 
     fn init(world: ParamInit<'_>);
     fn fetch<'w>(world: ParamWorld<'w>) -> Self::Item<'w>;
 
+    #[doc(hidden)]
     #[inline]
     fn pending(_world: ParamWorld<'_>, _system: u128, _tick: u64) -> bool {
         false
     }
 
+    #[doc(hidden)]
     fn wakes_on(_names: &mut Vec<&'static str>) {}
 }
 

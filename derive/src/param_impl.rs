@@ -15,17 +15,56 @@ enum Modes {
     Write,
 }
 
-impl Parse for Modes {
+enum WakeArg {
+    Always,
+    Gate(Type),
+}
+
+struct ParamArgs {
+    modes: Modes,
+    wake: Option<WakeArg>,
+}
+
+const PARAM_ARGS: &str = "expected `read`, `write` or `wake = always`";
+
+impl Parse for ParamArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        if input.is_empty() {
-            return Ok(Modes::Both);
+        let mut modes = None;
+        let mut wake = None;
+        while !input.is_empty() {
+            let id: Ident = input.parse()?;
+            match id.to_string().as_str() {
+                "read" | "write" if modes.is_some() => {
+                    return Err(syn::Error::new(id.span(), "the mode is given twice"));
+                }
+                "read" => modes = Some(Modes::Read),
+                "write" => modes = Some(Modes::Write),
+                "wake" if wake.is_some() => {
+                    return Err(syn::Error::new(id.span(), "`wake` is given twice"));
+                }
+                "wake" => {
+                    input.parse::<syn::Token![=]>()?;
+                    let kind: Ident = input.parse()?;
+                    wake = Some(match kind.to_string().as_str() {
+                        "always" => WakeArg::Always,
+                        "__gate" => {
+                            let content;
+                            syn::parenthesized!(content in input);
+                            WakeArg::Gate(content.parse()?)
+                        }
+                        _ => return Err(syn::Error::new(kind.span(), PARAM_ARGS)),
+                    });
+                }
+                _ => return Err(syn::Error::new(id.span(), PARAM_ARGS)),
+            }
+            if !input.is_empty() {
+                input.parse::<syn::Token![,]>()?;
+            }
         }
-        let id: Ident = input.parse()?;
-        match id.to_string().as_str() {
-            "read" => Ok(Modes::Read),
-            "write" => Ok(Modes::Write),
-            _ => Err(syn::Error::new(id.span(), "expected `read` or `write`")),
-        }
+        Ok(Self {
+            modes: modes.unwrap_or(Modes::Both),
+            wake,
+        })
     }
 }
 
@@ -93,7 +132,7 @@ fn rewrite_path(ty: &Type, lt: &Lifetime, mode: &Type) -> syn::Result<Type> {
 }
 
 pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> {
-    let modes: Modes = syn::parse2(attr)?;
+    let ParamArgs { modes, wake } = syn::parse2(attr)?;
     let mut input: ItemStruct = syn::parse2(item)?;
     let name = input.ident.clone();
 
@@ -317,15 +356,33 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
     let sp_header = ty_with(&infer, &sp_mode);
     let sp_item = ty_with(&fetch_lt, &sp_mode);
 
+    let (wake_kind, wake_init, wake_pending, wake_name) = match &wake {
+        None => (quote!(), quote!(), quote!(), quote!()),
+        Some(WakeArg::Always) => (
+            quote!(.or(::reacs::schedule::Wake::Always)),
+            quote!(),
+            quote!(),
+            quote!(),
+        ),
+        Some(WakeArg::Gate(ty)) => (
+            quote!(.or(::reacs::schedule::Wake::Gate)),
+            quote!(::reacs::__private::wake_init::<#ty>(world.reborrow());),
+            quote!(|| ::reacs::__private::wake_pending::<#ty>(world, system, tick)),
+            quote!(::reacs::__private::wake_name::<#ty>(names);),
+        ),
+    };
+
     let system_param = quote! {
         impl #sp_impl ::reacs::schedule::SystemParam for #sp_header #sp_where {
             type Item<'__w> = #sp_item;
             const WAKE: ::reacs::schedule::Wake = ::reacs::schedule::Wake::Neutral
-                #(.or(<#field_tys as ::reacs::schedule::SystemParam>::WAKE))*;
+                #(.or(<#field_tys as ::reacs::schedule::SystemParam>::WAKE))*
+                #wake_kind;
 
             #[allow(unused_mut, unused_variables)]
             fn init(mut world: ::reacs::schedule::ParamInit<'_>) {
                 #(#init_stmts)*
+                #wake_init
             }
 
             fn fetch<'__w>(world: ::reacs::schedule::ParamWorld<'__w>) -> #sp_item {
@@ -335,10 +392,12 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> 
             #[inline]
             fn pending(world: ::reacs::schedule::ParamWorld<'_>, system: u128, tick: u64) -> bool {
                 false #(|| <#field_tys as ::reacs::schedule::SystemParam>::pending(world, system, tick))*
+                    #wake_pending
             }
 
             fn wakes_on(names: &mut ::std::vec::Vec<&'static str>) {
                 #(<#field_tys as ::reacs::schedule::SystemParam>::wakes_on(names);)*
+                #wake_name
             }
         }
     };

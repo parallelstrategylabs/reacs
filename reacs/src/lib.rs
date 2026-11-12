@@ -19,6 +19,7 @@ pub mod world;
 
 #[doc(hidden)]
 pub mod __private {
+    pub use crate::signal::{wake_init, wake_name, wake_pending};
     pub use ctor;
     pub use serde;
 }

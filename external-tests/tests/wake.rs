@@ -25,6 +25,7 @@ pub struct Runs {
     pub watch: Vec<u64>,
     pub loud: Vec<u64>,
     pub relay: Vec<u64>,
+    pub steady: Vec<u64>,
 }
 
 #[param(write)]
@@ -43,6 +44,11 @@ pub struct Loud {
 pub struct Relay {
     pub ping: Receiver<Ping>,
     pub beat: Sender<Beat>,
+}
+
+#[param(write, wake = always)]
+pub struct Steady {
+    pub ping: Receiver<Ping>,
 }
 
 #[system]
@@ -123,6 +129,13 @@ fn relay(mut relay: Mut<Relay>, mut runs: Mut<Resource<Runs>>) {
     runs.relay.push(tick);
 }
 
+#[system(run_after(sender))]
+fn steady(mut steady: Mut<Steady>, mut runs: Mut<Resource<Runs>>) {
+    let tick = steady.ping.tick();
+    steady.ping.receive().for_each(drop);
+    runs.steady.push(tick);
+}
+
 const TICKS: u64 = 40;
 
 fn new_world() -> World {
@@ -155,6 +168,7 @@ fn gated_systems_run_only_when_they_have_something_to_receive() {
     assert_eq!(runs.signal, every);
     assert_eq!(runs.plain, every);
     assert_eq!(runs.loud, every);
+    assert_eq!(runs.steady, every);
 
     assert_eq!(
         runs.late,
@@ -212,7 +226,7 @@ fn system_order_marks_gated_systems() {
     assert!(line("early").ends_with("::early (wakes on Ping)"));
     assert!(line("watch").ends_with("::watch (wakes on Ping, Pulse)"));
     assert!(line("relay").ends_with("::relay (wakes on Ping)"));
-    for always in ["sender", "signal", "plain", "loud"] {
+    for always in ["sender", "signal", "plain", "loud", "steady"] {
         assert!(
             line(always).ends_with(&format!("::{always}")),
             "{}",
