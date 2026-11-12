@@ -17,7 +17,7 @@ use crate::{
     world::World,
 };
 
-const MAGIC: &[u8; 8] = b"REACSRC2";
+const MAGIC: &[u8; 8] = b"REACSRC3";
 pub const RECORD_HASH_EVERY: u64 = 64;
 
 fn options() -> bincode::DefaultOptions {
@@ -138,7 +138,7 @@ enum Record {
         ended: Option<u64>,
     },
     End {
-        tick: u64,
+        ended: Option<u64>,
     },
 }
 
@@ -153,8 +153,8 @@ pub struct Recorder {
     out: BufWriter<File>,
     hash_every: u64,
     first_ids: Vec<u64>,
-    last: Option<u64>,
-    written: u64,
+    last_recorded: Option<u64>,
+    last_written: u64,
     table: Vec<u128>,
     loads: u64,
     steps: u64,
@@ -175,43 +175,55 @@ impl Recorder {
         }
     }
 
-    pub fn finish(mut self) -> io::Result<()> {
+    pub fn error(&self) -> Option<&io::Error> {
+        self.error.as_ref()
+    }
+
+    pub fn finish(mut self, world: &World) -> io::Result<()> {
         if let Some(error) = self.error.take() {
             return Err(error);
         }
-        if let Some(tick) = self.last {
-            write(&mut self.out, &Record::End { tick }, &[])?;
-        }
+        let ended = self.ended(world);
+        write(&mut self.out, &Record::End { ended }, &[])?;
         self.out.flush()
+    }
+
+    fn ended(&self, world: &World) -> Option<u64> {
+        let ran = world.steps.saturating_sub(self.steps);
+        let reached = self
+            .last_recorded
+            .map_or(self.section_start + ran, |last| last + ran);
+        (reached > self.section_start).then(|| reached - 1)
     }
 
     fn write_tick(&mut self, world: &World) -> io::Result<()> {
         let tick = current_tick(world);
         let loaded = world.loads != self.loads;
-        if self.last == Some(tick) && !loaded {
+        if self.last_recorded == Some(tick) && !loaded {
             return Ok(());
         }
-        if loaded || tick != self.last.map_or(self.written, |last| last + 1) {
+        if loaded
+            || tick
+                != self
+                    .last_recorded
+                    .map_or(self.last_written, |last| last + 1)
+        {
             let state = world.save();
             let state_len = state.len() as u64;
-            let ran = world.steps.saturating_sub(self.steps);
-            let reached = self
-                .last
-                .map_or(self.section_start + ran, |last| last + ran);
-            let ended = (reached > self.section_start).then(|| reached - 1);
+            let ended = self.ended(world);
             let record = Record::Section {
                 tick,
                 state_len,
                 ended,
             };
             write(&mut self.out, &record, &state)?;
-            self.written = tick;
+            self.last_written = tick;
             self.section_start = tick;
             self.first_ids = next_ids(world);
         }
         self.loads = world.loads;
         self.steps = world.steps;
-        self.last = Some(tick);
+        self.last_recorded = Some(tick);
 
         let mut inputs = Vec::new();
         for (kind, (input, first_id)) in input_signals().iter().zip(&self.first_ids).enumerate() {
@@ -234,8 +246,8 @@ impl Recorder {
             return Ok(());
         }
 
-        let gap = tick - self.written;
-        self.written = tick;
+        let gap = tick - self.last_written;
+        self.last_written = tick;
         let record = Record::Tick {
             gap,
             hashes,
@@ -262,8 +274,8 @@ impl World {
             out,
             hash_every: RECORD_HASH_EVERY,
             first_ids: next_ids(self),
-            last: None,
-            written: start_tick,
+            last_recorded: None,
+            last_written: start_tick,
             table: Vec::new(),
             loads: self.loads,
             steps: self.steps,
@@ -413,10 +425,13 @@ impl Recording {
                     tick = start;
                     self.sections.push(section);
                 }
-                Record::End { tick: last } => {
+                Record::End { ended } => {
                     let section = self.sections.last_mut().unwrap();
-                    let end = last.checked_add(1).ok_or_else(corrupted)?;
-                    if end < section.tick || section.ticks.last().is_some_and(|x| x.tick >= end) {
+                    let end = match ended {
+                        Some(last) => last.checked_add(1).ok_or_else(corrupted)?,
+                        None => section.tick,
+                    };
+                    if end < section.tick || section.ticks.last().is_some_and(|x| x.tick > end) {
                         return Err(corrupted());
                     }
                     section.end = end;
@@ -436,10 +451,11 @@ pub struct Divergence {
 pub struct Playback {
     recording: Recording,
     section: usize,
-    next: usize,
-    at: u64,
+    next_record: usize,
+    next_tick: u64,
     section_ids: Vec<u64>,
     divergence: Option<Divergence>,
+    error: Option<io::Error>,
 }
 
 fn differing(recorded: &[(u128, u64)], current: &[(u128, u64)]) -> Vec<u128> {
@@ -482,7 +498,12 @@ impl Playback {
 
     pub fn finished(&self) -> bool {
         let sections = &self.recording.sections;
-        self.section + 1 == sections.len() && self.at >= sections[self.section].end
+        self.error.is_some()
+            || (self.section + 1 == sections.len() && self.next_tick >= sections[self.section].end)
+    }
+
+    pub fn error(&self) -> Option<&io::Error> {
+        self.error.as_ref()
     }
 
     pub fn diverged(&self) -> Option<&Divergence> {
@@ -496,21 +517,22 @@ impl Playback {
         while self.section + 1 < self.recording.sections.len()
             && current_tick(world) >= self.recording.sections[self.section].end
         {
+            let state = &self.recording.sections[self.section + 1].state;
+            if world.restore(state).is_none() {
+                self.error = Some(corrupted());
+                return;
+            }
             self.section += 1;
-            self.next = 0;
-            let state = &self.recording.sections[self.section].state;
-            world
-                .restore(state)
-                .unwrap_or_else(|| panic!("this recording is corrupted"));
+            self.next_record = 0;
             self.section_ids = next_ids(world);
         }
 
         let tick = current_tick(world);
         let ticks = &self.recording.sections[self.section].ticks;
-        while self.next < ticks.len() && ticks[self.next].tick < tick {
-            self.next += 1;
+        while self.next_record < ticks.len() && ticks[self.next_record].tick < tick {
+            self.next_record += 1;
         }
-        if let Some(recorded) = ticks.get(self.next).filter(|x| x.tick == tick) {
+        if let Some(recorded) = ticks.get(self.next_record).filter(|x| x.tick == tick) {
             for inputs in &recorded.inputs {
                 for payload in &inputs.payloads {
                     send_recorded(world, inputs.signal, payload);
@@ -524,16 +546,16 @@ impl Playback {
                     self.divergence = Some(Divergence { tick, resources });
                 }
             }
-            self.next += 1;
+            self.next_record += 1;
         }
-        self.at = tick + 1;
+        self.next_tick = tick + 1;
     }
 
     pub fn to_recorder(self, world: &World, path: impl AsRef<Path>) -> io::Result<Recorder> {
         let tick = current_tick(world);
         let sections = &self.recording.sections[..=self.section];
         let current = &sections[self.section];
-        if tick < current.tick || (tick != self.at && tick + 1 != self.at) {
+        if tick < current.tick || (tick != self.next_tick && tick + 1 != self.next_tick) {
             let message = "the world isn't where the playback left it";
             return Err(io::Error::new(ErrorKind::InvalidInput, message));
         }
@@ -560,8 +582,8 @@ impl Playback {
             out: BufWriter::new(OpenOptions::new().append(true).open(path)?),
             hash_every: RECORD_HASH_EVERY,
             first_ids,
-            last: (tick > current.tick).then(|| tick - 1),
-            written,
+            last_recorded: (tick > current.tick).then(|| tick - 1),
+            last_written: written,
             table,
             loads: world.loads,
             steps: world.steps - (tick > current.tick) as u64,
@@ -631,14 +653,15 @@ impl World {
         if self.restore(&start.state).is_none() {
             return Err(corrupted());
         }
-        let at = start.tick;
+        let next_tick = start.tick;
         Ok(Playback {
             recording,
             section: 0,
-            next: 0,
-            at,
+            next_record: 0,
+            next_tick,
             section_ids: next_ids(self),
             divergence: None,
+            error: None,
         })
     }
 
@@ -684,8 +707,8 @@ mod tests {
         found.map_or_else(Vec::new, |inputs| inputs.payloads.clone())
     }
 
-    fn finish(file: &PathBuf, recorder: Recorder) -> Vec<u8> {
-        recorder.finish().unwrap();
+    fn finish(file: &PathBuf, recorder: Recorder, world: &World) -> Vec<u8> {
+        recorder.finish(world).unwrap();
         let bytes = fs::read(file).unwrap();
         fs::remove_file(file).unwrap();
         bytes
@@ -729,7 +752,7 @@ mod tests {
             recorder.record(&world);
             advance(&mut world);
         }
-        finish(&file, recorder)
+        finish(&file, recorder, &world)
     }
 
     #[test]
@@ -746,7 +769,7 @@ mod tests {
         advance(&mut world);
         world.input(Press(3));
         recorder.record(&world);
-        let recording = open("inputs-read", &finish(&file, recorder)).unwrap();
+        let recording = open("inputs-read", &finish(&file, recorder, &world)).unwrap();
 
         assert!(!recording.truncated);
         assert_eq!(recording.sections.len(), 1);
@@ -771,7 +794,7 @@ mod tests {
         let start = world.save();
         world.input(Press(1));
         recorder.record(&world);
-        let recording = open("early-read", &finish(&file, recorder)).unwrap();
+        let recording = open("early-read", &finish(&file, recorder, &world)).unwrap();
 
         assert_eq!(recording.sections[0].state, start);
         let ticks = &recording.sections[0].ticks;
@@ -795,7 +818,7 @@ mod tests {
             }
             advance(&mut world);
         }
-        let bytes = finish(&file, recorder);
+        let bytes = finish(&file, recorder, &world);
 
         let recording = open("hashes-read", &bytes).unwrap();
         let hashes = recording.sections[0].ticks.iter();
@@ -827,14 +850,14 @@ mod tests {
         world.input(Press(2));
         recorder.record(&world);
         let _ = world.record(&mut recorder);
-        let records = raw_records(&finish(&file, recorder)).1;
+        let records = raw_records(&finish(&file, recorder, &world)).1;
 
         assert_eq!(records.len(), 2);
         let Record::Tick { gap, inputs, .. } = &records[0] else {
             panic!("expected a tick record");
         };
         assert_eq!((*gap, inputs.len(), inputs[0].1.len()), (0, 1, 1));
-        assert!(matches!(records[1], Record::End { tick: 0 }));
+        assert!(matches!(records[1], Record::End { ended: None }));
     }
 
     #[test]
@@ -853,7 +876,7 @@ mod tests {
         recorder.record(&world);
         world.load(&jumped);
         recorder.record(&world);
-        let recording = open("section-read", &finish(&file, recorder)).unwrap();
+        let recording = open("section-read", &finish(&file, recorder, &world)).unwrap();
 
         let starts: Vec<u64> = recording.sections.iter().map(|x| x.tick).collect();
         assert_eq!(starts, [0, 2, 2]);
@@ -881,11 +904,123 @@ mod tests {
         advance(&mut world);
         world.load(&jumped);
         recorder.record(&world);
-        let recording = open("ends-read", &finish(&file, recorder)).unwrap();
+        let recording = open("ends-read", &finish(&file, recorder, &world)).unwrap();
 
         let sections: Vec<(u64, u64)> =
             recording.sections.iter().map(|x| (x.tick, x.end)).collect();
-        assert_eq!(sections, [(0, 2), (2, 4), (2, 3)]);
+        assert_eq!(sections, [(0, 2), (2, 4), (2, 2)]);
+    }
+
+    #[test]
+    fn the_end_is_the_last_tick_the_run_reached() {
+        let file = path("end-recorded-not-run");
+        let mut world = World::new();
+        let mut recorder = world.to_recorder(&file).unwrap().with_hash_every(u64::MAX);
+        for tick in 0..3 {
+            world.input(Press(tick));
+            recorder.record(&world);
+            advance(&mut world);
+        }
+        world.input(Press(9));
+        recorder.record(&world);
+        let recording = open(
+            "end-recorded-not-run-read",
+            &finish(&file, recorder, &world),
+        )
+        .unwrap();
+        assert_eq!(
+            (recording.sections[0].tick, recording.sections[0].end),
+            (0, 3)
+        );
+        assert_eq!(recording.sections[0].ticks.last().unwrap().tick, 3);
+
+        let file = path("end-unrecorded-steps");
+        let mut world = World::new();
+        let mut recorder = world.to_recorder(&file).unwrap().with_hash_every(u64::MAX);
+        world.input(Press(1));
+        recorder.record(&world);
+        advance(&mut world);
+        advance(&mut world);
+        advance(&mut world);
+        let recording = open(
+            "end-unrecorded-steps-read",
+            &finish(&file, recorder, &world),
+        )
+        .unwrap();
+        assert_eq!(
+            (recording.sections[0].tick, recording.sections[0].end),
+            (0, 3)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_write_error_is_reported_while_the_game_goes_on() {
+        let file = path("full-disk");
+        let mut world = World::new();
+        let mut recorder = world.to_recorder(&file).unwrap();
+        fs::remove_file(&file).unwrap();
+        recorder.out = BufWriter::new(OpenOptions::new().write(true).open("/dev/full").unwrap());
+        assert!(recorder.error().is_none());
+
+        for tick in 0..3 {
+            world.input(Press(tick));
+            recorder.record(&world);
+            advance(&mut world);
+        }
+
+        assert_eq!(current_tick(&world), 3);
+        let kind = recorder.error().map(|error| error.kind());
+        assert_eq!(kind, Some(ErrorKind::StorageFull));
+        assert_eq!(
+            recorder.finish(&world).unwrap_err().kind(),
+            ErrorKind::StorageFull
+        );
+    }
+
+    #[test]
+    fn a_corrupted_section_stops_the_replay_with_an_error() {
+        let file = path("bad-section");
+        let mut world = World::new();
+        let start = world.save();
+        let mut recorder = world.to_recorder(&file).unwrap().with_hash_every(u64::MAX);
+        for tick in 0..3 {
+            world.input(Press(tick));
+            recorder.record(&world);
+            advance(&mut world);
+        }
+        world.load(&start);
+        for _ in 0..2 {
+            recorder.record(&world);
+            advance(&mut world);
+        }
+        let mut recording = open("bad-section-read", &finish(&file, recorder, &world)).unwrap();
+        assert_eq!(recording.sections.len(), 2);
+        recording.sections[1].state = vec![0xFF; 16];
+
+        let mut world = World::new();
+        world.restore(&recording.sections[0].state).unwrap();
+        let mut playback = Playback {
+            section_ids: next_ids(&world),
+            recording,
+            section: 0,
+            next_record: 0,
+            next_tick: 0,
+            divergence: None,
+            error: None,
+        };
+        let mut steps = 0;
+        while !playback.finished() {
+            let world = world.replay(&mut playback);
+            advance(world);
+            steps += 1;
+            assert!(steps < 10, "the replay never stopped");
+        }
+
+        let kind = playback.error().map(|error| error.kind());
+        assert_eq!(kind, Some(ErrorKind::InvalidData));
+        assert_eq!(steps, 4);
+        assert_eq!(current_tick(&world), 4);
     }
 
     #[test]
@@ -908,8 +1043,9 @@ mod tests {
         assert_eq!(recording.sections[0].end, 3);
 
         let file = path("empty");
-        let recorder = World::new().to_recorder(&file).unwrap();
-        let recording = open("empty-read", &finish(&file, recorder)).unwrap();
+        let empty = World::new();
+        let recorder = empty.to_recorder(&file).unwrap();
+        let recording = open("empty-read", &finish(&file, recorder, &empty)).unwrap();
         assert_eq!(
             (recording.sections[0].tick, recording.sections[0].end),
             (0, 0)
@@ -978,7 +1114,10 @@ mod tests {
         assert!(!full.truncated);
         let (header, records) = raw_records(&bytes);
         assert_eq!(records.len(), full.sections[0].ticks.len() + 1);
-        assert!(matches!(records.last(), Some(Record::End { tick: 5 })));
+        assert!(matches!(
+            records.last(),
+            Some(Record::End { ended: Some(5) })
+        ));
         assert_eq!(full.sections[0].end, 6);
         let start = bytes.len() - records.iter().map(|x| encoded_len(x)).sum::<usize>();
         assert!(start > header.state_len as usize);

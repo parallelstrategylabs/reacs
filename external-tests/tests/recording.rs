@@ -92,7 +92,7 @@ fn the_chained_form_writes_the_same_file_as_the_two_lines() {
                 world.step();
             }
         }
-        recorder.finish().unwrap();
+        recorder.finish(&world).unwrap();
         let bytes = fs::read(&file).unwrap();
         fs::remove_file(&file).unwrap();
         bytes
@@ -111,7 +111,7 @@ fn ticks_with_nothing_to_record_take_no_space() {
             recorder.record(&world);
             world.step();
         }
-        recorder.finish().unwrap();
+        recorder.finish(&world).unwrap();
         let size = fs::metadata(&file).unwrap().len();
         fs::remove_file(&file).unwrap();
         size
@@ -176,7 +176,7 @@ fn a_recording_reads_back_as_data_a_tool_can_run_again() {
     play(&mut world, &mut recorder, 10..12);
     world.load(&save);
     play(&mut world, &mut recorder, 10..14);
-    recorder.finish().unwrap();
+    recorder.finish(&world).unwrap();
 
     let recording = Recording::open(&file).unwrap();
     fs::remove_file(&file).unwrap();
@@ -217,7 +217,7 @@ fn record_session(name: &str) -> (PathBuf, World) {
     play(&mut world, &mut recorder, 10..12);
     world.load(&save);
     play(&mut world, &mut recorder, 10..14);
-    recorder.finish().unwrap();
+    recorder.finish(&world).unwrap();
     (file, world)
 }
 
@@ -320,7 +320,7 @@ fn a_replay_can_stop_at_a_tick_and_go_on_as_a_new_recording() {
             }
             world.record(&mut recorder).step();
         }
-        recorder.finish().unwrap();
+        recorder.finish(&world).unwrap();
 
         let recording = Recording::open(&branch).unwrap();
         assert_eq!(recording.sections.len(), 1);
@@ -377,7 +377,7 @@ fn a_branch_keeps_the_history_and_replays_from_the_start() {
         replay_to(&mut world, &mut playback, stop);
         let mut recorder = playback.to_recorder(&world, &branch).unwrap();
         play_branch(&mut world, &mut recorder, stop..stop + 8);
-        recorder.finish().unwrap();
+        recorder.finish(&world).unwrap();
 
         let (copy, recording) = replay_whole(&branch);
         fs::remove_file(&branch).unwrap();
@@ -397,7 +397,7 @@ fn a_branch_can_replace_the_file_it_replays() {
     replay_to(&mut world, &mut playback, 7);
     let mut recorder = playback.to_recorder(&world, &file).unwrap();
     play_branch(&mut world, &mut recorder, 7..15);
-    recorder.finish().unwrap();
+    recorder.finish(&world).unwrap();
 
     let (copy, recording) = replay_whole(&file);
     fs::remove_file(&file).unwrap();
@@ -414,7 +414,7 @@ fn a_branch_of_a_branch_keeps_both_histories() {
     replay_to(&mut world, &mut playback, 6);
     let mut recorder = playback.to_recorder(&world, &file).unwrap();
     play_branch(&mut world, &mut recorder, 6..14);
-    recorder.finish().unwrap();
+    recorder.finish(&world).unwrap();
 
     let mut world = World::new();
     let mut playback = world.to_playback(&file).unwrap();
@@ -424,7 +424,7 @@ fn a_branch_of_a_branch_keeps_both_histories() {
         world.input(Pause(t as u8));
         world.record(&mut recorder).step();
     }
-    recorder.finish().unwrap();
+    recorder.finish(&world).unwrap();
 
     let (copy, _) = replay_whole(&file);
     fs::remove_file(&file).unwrap();
@@ -449,7 +449,7 @@ fn inputs_on_the_branch_tick_are_recorded_once() {
         let mut recorder = playback.to_recorder(&world, &branch).unwrap();
         world.record(&mut recorder).step();
         play_branch(&mut world, &mut recorder, 10..14);
-        recorder.finish().unwrap();
+        recorder.finish(&world).unwrap();
 
         let (copy, recording) = replay_whole(&branch);
         fs::remove_file(&branch).unwrap();
@@ -506,7 +506,7 @@ fn a_load_to_the_next_tick_is_replayed() {
     world.load(&other_game);
     assert_eq!(tick(&world), 8);
     play(&mut world, &mut recorder, 8..12);
-    recorder.finish().unwrap();
+    recorder.finish(&world).unwrap();
 
     let (copy, recording) = replay_whole(&file);
     fs::remove_file(&file).unwrap();
@@ -525,7 +525,7 @@ fn a_load_between_recording_and_stepping_a_tick_is_replayed() {
     recorder.record(&world);
     world.load(&quick);
     play(&mut world, &mut recorder, 6..10);
-    recorder.finish().unwrap();
+    recorder.finish(&world).unwrap();
 
     let (copy, recording) = replay_whole(&file);
     fs::remove_file(&file).unwrap();
@@ -541,7 +541,7 @@ fn a_load_right_after_branching_keeps_the_ticks_replayed_before_it() {
     let fresh = world.save();
     let mut recorder = world.to_recorder(&file).unwrap().with_hash_every(4);
     play(&mut world, &mut recorder, 0..10);
-    recorder.finish().unwrap();
+    recorder.finish(&world).unwrap();
 
     let mut world = World::new();
     let mut playback = world.to_playback(&file).unwrap();
@@ -549,7 +549,7 @@ fn a_load_right_after_branching_keeps_the_ticks_replayed_before_it() {
     let mut recorder = playback.to_recorder(&world, &file).unwrap();
     world.load(&fresh);
     play_branch(&mut world, &mut recorder, 0..4);
-    recorder.finish().unwrap();
+    recorder.finish(&world).unwrap();
 
     let (copy, recording) = replay_whole(&file);
     fs::remove_file(&file).unwrap();
@@ -567,7 +567,7 @@ fn steps_before_the_first_record_count_as_run() {
     world.step();
     world.step();
     play(&mut world, &mut recorder, 2..6);
-    recorder.finish().unwrap();
+    recorder.finish(&world).unwrap();
 
     let recording = Recording::open(&file).unwrap();
     let sections: Vec<(u64, u64)> = recording.sections.iter().map(|s| (s.tick, s.end)).collect();
@@ -722,7 +722,7 @@ fn random_sessions_replay_step_by_step_and_branch() {
             &mut saves,
             &mut expected,
         );
-        recorder.finish().unwrap();
+        recorder.finish(&world).unwrap();
         let sections = Recording::open(&file).unwrap().sections.len();
         replay_step_by_step(&file, &expected, &format!("seed {seed}"));
 
@@ -746,7 +746,7 @@ fn random_sessions_replay_step_by_step_and_branch() {
             &mut saves,
             &mut branch_expected,
         );
-        recorder.finish().unwrap();
+        recorder.finish(&copy).unwrap();
         let what = format!("seed {seed}, branch at step {branch_at}, {sections} sections");
         replay_step_by_step(&branch, &branch_expected, &what);
 
