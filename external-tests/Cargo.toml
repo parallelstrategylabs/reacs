@@ -5,6 +5,6 @@ edition = "2024"
 publish = false
 
 [dev-dependencies]
-reacs = { path = "../reacs" }
+reacs = { path = "../reacs", features = ["invariants"] }
 plugin-top = { path = "plugins/top" }
 plugin-other = { path = "plugins/other" }

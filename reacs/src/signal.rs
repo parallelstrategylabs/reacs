@@ -200,6 +200,21 @@ pub struct SignalData<S: SignalType> {
     phantom: PhantomData<S>,
 }
 
+impl<S: SignalType> SignalData<S> {
+    #[cfg(any(test, feature = "invariants"))]
+    pub(crate) fn check_invariants(&self) {
+        let cursors = &self.cursors;
+        assert!(
+            cursors.windows(2).all(|w| w[0].system < w[1].system),
+            "cursors out of order"
+        );
+        assert!(
+            cursors.iter().all(|c| c.next <= self.next),
+            "cursor past the next id"
+        );
+    }
+}
+
 pub const WINDOW_CHUNK_TICKS: u64 = 64;
 const _: () = assert!(WINDOW_CHUNK_TICKS > 0 && WINDOW_CHUNK_TICKS <= 64);
 
@@ -859,6 +874,7 @@ impl<S: SignalType> Signals<S> {
             }
         }
 
+        debug_assert!(self.permanent_write <= self.permanent_read);
         let finished = self.permanent_read == self.permanent.len();
         if finished {
             self.permanent.truncate(self.permanent_write);
@@ -1068,6 +1084,126 @@ impl<S: SignalType> Signals<S> {
         if !S::Filter::ACTIVE && (self.permanent_cancelled > 0 || self.permanent_read > 0) {
             self.sweep(SWEEP_BUDGET, |_| true);
         }
+
+        #[cfg(any(test, feature = "invariants"))]
+        self.check_invariants(next_tick);
+    }
+
+    #[cfg(any(test, feature = "invariants"))]
+    pub(crate) fn check_invariants(&self, next_tick: u64) {
+        let by_id = |list: &[SignalInstance<S>]| list.windows(2).all(|w| w[0].id < w[1].id);
+        assert!(by_id(&self.transient), "transient out of id order");
+        assert!(
+            self.transient_buffer.is_empty(),
+            "transient_buffer kept after cleanup"
+        );
+        assert!(
+            self.transitory_pending.is_empty(),
+            "pending windows kept after cleanup"
+        );
+        assert!(
+            self.transitory_compact.is_empty(),
+            "compaction queue kept after cleanup"
+        );
+
+        for (active, chunks) in [
+            (true, &self.transitory_active),
+            (false, &self.transitory_inactive),
+        ] {
+            assert!(
+                chunks.windows(2).all(|w| w[0].key < w[1].key),
+                "chunks out of key order"
+            );
+            for chunk in chunks {
+                let key = chunk.key;
+                let live = chunk.live();
+                assert!(
+                    chunk.head <= chunk.entries.len(),
+                    "chunk {key}: head past its entries"
+                );
+                assert!(!live.is_empty(), "chunk {key}: empty chunk kept");
+                assert!(!chunk.due, "chunk {key}: compaction left due");
+                assert!(
+                    live.windows(2).all(|w| w[0].1.id < w[1].1.id),
+                    "chunk {key}: out of id order"
+                );
+                if active && chunk.by_end {
+                    assert!(
+                        live.is_sorted_by_key(|e| e.0.end),
+                        "chunk {key}: by_end but not in end order"
+                    );
+                }
+                let cancelled = live.iter().filter(|e| e.0.is_cancelled()).count() as u64;
+                assert_eq!(chunk.cancelled, cancelled, "chunk {key}: cancelled count");
+                for (window, signal) in live {
+                    let id = signal.id;
+                    assert!(window.end >= next_tick, "chunk {key}: {id} ended but kept");
+                    if !window.is_cancelled() {
+                        assert!(
+                            window.start < window.end,
+                            "chunk {key}: {id} has an empty window"
+                        );
+                        assert_eq!(
+                            window.start <= next_tick,
+                            active,
+                            "chunk {key}: {id} in the wrong list"
+                        );
+                    }
+                    if active || !window.is_cancelled() {
+                        let tick = if active { window.end } else { window.start };
+                        assert_eq!(chunk_key(tick), key, "chunk {key}: {id} in the wrong chunk");
+                        assert!(
+                            chunk.ticks & chunk_bit(tick) != 0,
+                            "chunk {key}: {id} has no mask bit"
+                        );
+                        assert!(
+                            tick >= self.transitory_wake,
+                            "chunk {key}: {id} before transitory_wake"
+                        );
+                    }
+                }
+            }
+        }
+
+        let joining = &self.permanent_joining;
+        assert!(
+            joining.windows(2).all(|w| w[0].1.id < w[1].1.id),
+            "permanent_joining out of id order"
+        );
+        assert!(
+            joining
+                .iter()
+                .all(|e| e.0.end == u64::MAX && !e.0.is_cancelled()),
+            "permanent_joining holds a finite or cancelled window"
+        );
+
+        let (write, read, len) = (
+            self.permanent_write,
+            self.permanent_read,
+            self.permanent.len(),
+        );
+        assert!(
+            write <= read && read <= len,
+            "sweep gap {write}..{read} of {len}"
+        );
+        let (checked, unchecked) = (&self.permanent[..write], &self.permanent[read..]);
+        assert!(
+            by_id(checked) && by_id(unchecked),
+            "permanent out of id order"
+        );
+        if let (Some(a), Some(b)) = (checked.last(), unchecked.first()) {
+            assert!(a.id < b.id, "permanent out of id order across the gap");
+        }
+        let bits = &self.permanent_cancelled_bits;
+        assert!(
+            (write..read).all(|i| !bits.get(i)),
+            "cancel bit left in the sweep gap"
+        );
+        let cancelled = (0..write).chain(read..len).filter(|&i| bits.get(i)).count() as u64;
+        assert_eq!(
+            self.permanent_cancelled, cancelled,
+            "permanent cancelled count"
+        );
     }
 
     fn cleanup_windows(&mut self, next_tick: u64, keep: impl Fn(&S) -> bool) {
@@ -1424,6 +1560,11 @@ fn cleanup_in_world<S: SignalType>(world: &World) {
         if let Some(mut cursor) = world.get_resource_mut::<SweepCursor>() {
             cursor.woken = true;
         }
+    }
+
+    #[cfg(any(test, feature = "invariants"))]
+    if let Some(data) = world.get_resource::<SignalData<S>>() {
+        data.check_invariants();
     }
 }
 
@@ -3724,6 +3865,10 @@ mod tests {
                 }
             }
 
+            world
+                .get_resource::<SignalData<Tagged>>()
+                .unwrap()
+                .check_invariants();
             let permanent = world
                 .get_resource::<Signals<Tagged>>()
                 .unwrap()

@@ -271,6 +271,50 @@ impl<K: Hash + Eq, V> IndexMap<K, V> {
                 self.set_slot(pos, slot);
             }
         }
+        #[cfg(any(test, feature = "invariants"))]
+        self.check_invariants();
+    }
+
+    #[cfg(any(test, feature = "invariants"))]
+    pub(crate) fn check_invariants(&self) {
+        let len = self.entries.len();
+        if self.slots.is_empty() {
+            assert_eq!(len, 0, "entries without a table");
+            return;
+        }
+        assert!(
+            self.slots.len().is_power_of_two(),
+            "table size not a power of two"
+        );
+        assert!(
+            len << LOAD_SHIFT <= self.slots.len(),
+            "table above its load limit"
+        );
+        let mask = self.mask();
+        let mut seen = vec![false; len];
+        for (pos, slot) in self.slots.iter().enumerate() {
+            if slot.index == EMPTY {
+                continue;
+            }
+            let index = slot.index as usize;
+            assert!(index < len, "slot {pos} points past the entries");
+            assert!(!seen[index], "entry {index} has two slots");
+            seen[index] = true;
+            assert_eq!(
+                slot.tag,
+                tag_of(&self.entries[index].0),
+                "slot {pos} has a stale tag"
+            );
+            let mut at = slot.tag as usize & mask;
+            while at != pos {
+                assert!(
+                    self.slots[at].index != EMPTY,
+                    "slot {pos} unreachable from its home"
+                );
+                at = (at + 1) & mask;
+            }
+        }
+        assert!(seen.iter().all(|&found| found), "an entry has no slot");
     }
 
     fn erase_slot(&mut self, pos: usize) {
@@ -383,6 +427,8 @@ where
                 return Err(A::Error::custom("duplicate key in IndexMap"));
             }
         }
+        #[cfg(any(test, feature = "invariants"))]
+        map.check_invariants();
         Ok(map)
     }
 }
@@ -466,6 +512,7 @@ mod tests {
         for op in ops(0x9e37_79b9, crate::test_size(20_000, 400), keys) {
             apply(&mut map, op, key);
             apply_model(&mut model, op, key);
+            map.check_invariants();
             assert_eq!(map.as_slice(), model.as_slice(), "after {op:?}");
         }
         for k in 0..keys {

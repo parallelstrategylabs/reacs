@@ -30,6 +30,31 @@ impl FreeList {
             .collect();
         self.first_open = 0;
         self.built = true;
+        #[cfg(any(test, feature = "invariants"))]
+        self.check_invariants();
+    }
+
+    #[cfg(any(test, feature = "invariants"))]
+    pub(crate) fn check_invariants(&self) {
+        if !self.built {
+            return;
+        }
+        let words = &self.bitset.words;
+        assert_eq!(self.full.len(), words.len().div_ceil(64), "summary length");
+        assert!(
+            self.first_open <= self.full.len(),
+            "first_open past the summary"
+        );
+        for (w, &word) in words.iter().enumerate() {
+            let marked = self.full[w >> 6] >> (w & 63) & 1 == 1;
+            assert_eq!(marked, word == !0u64, "summary bit of word {w}");
+        }
+        for s in 0..self.first_open {
+            assert_eq!(
+                self.full[s], !0u64,
+                "free index below first_open in summary word {s}"
+            );
+        }
     }
 
     pub fn reserve(&mut self) -> u64 {
@@ -53,6 +78,7 @@ impl FreeList {
                 if *word == !0u64 {
                     full[s] |= 1 << b;
                 }
+                debug_assert_eq!(full[s] >> b & 1 == 1, words[w] == !0u64);
                 self.first_open = s;
                 return w as u64 * 64 + o as u64;
             }
@@ -131,6 +157,7 @@ impl FreeList {
             if self.built {
                 self.full[w >> 6] &= !(1 << (w & 63));
                 self.first_open = self.first_open.min(w >> 6);
+                debug_assert!(self.first_open <= w >> 6, "freed word {w} below first_open");
             }
         }
         self.frees += 1;

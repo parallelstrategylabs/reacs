@@ -531,6 +531,11 @@ mod tests {
     }
 
     fn check_everything(world: &World, model: &Model, handles: &[Entity]) {
+        let free_list = world
+            .get_resource::<crate::entity::EntityFreeList>()
+            .unwrap();
+        free_list.check_invariants();
+        drop(free_list);
         let em = world.entities();
         let components = world.fetch_param::<Component<IntComponent>>();
         let map = world.get_component_map::<IntComponent>();
