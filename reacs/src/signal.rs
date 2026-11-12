@@ -3459,4 +3459,313 @@ mod tests {
         assert_eq!(restored.transitory_pending.len(), 1);
         assert_eq!(restored.transitory_pending[0].1.payload, NumSignal(42));
     }
+
+    #[signal(entity)]
+    pub struct Tagged(pub Entity, pub u64);
+
+    const RECEIVERS: usize = 4;
+
+    struct ModelSignal {
+        id: u64,
+        entity: Entity,
+        payload: u64,
+        sent: u64,
+        start: u64,
+        end: u64,
+        cancelled: bool,
+        taken: [bool; RECEIVERS],
+    }
+
+    #[derive(Default, Debug)]
+    struct ModelRun {
+        receives: u64,
+        delivered: u64,
+        idle: u64,
+        cancels: u64,
+        modifies: u64,
+        rejected: u64,
+        partial_sweeps: u64,
+        loads: u64,
+        loads_mid_lap: u64,
+        most_permanent: usize,
+    }
+
+    fn tagged_world() -> World {
+        let mut world = World::new();
+        world.init_param::<Mut<EntityManager>>();
+        world.init_signal::<Tagged>();
+        world
+    }
+
+    fn model_receive(
+        model: &mut [ModelSignal],
+        receiver: usize,
+        tick: u64,
+        first: bool,
+        alive: impl Fn(Entity) -> bool,
+    ) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        for signal in model.iter_mut().filter(|signal| !signal.cancelled) {
+            let window = first && tick > signal.sent && signal.start <= tick && tick < signal.end;
+            let transient = !signal.taken[receiver]
+                && signal.start <= signal.sent
+                && (tick == signal.sent || (tick == signal.sent + 1 && signal.end == tick));
+            if transient {
+                signal.taken[receiver] = true;
+            }
+            if (window || transient) && alive(signal.entity) {
+                out.push((signal.entity.to_bits(), signal.payload));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn signal_model_run(seed: u64, ticks: u64) -> ModelRun {
+        let mut rng = seed;
+        let mut random = move |below: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % below
+        };
+        let mut world = tagged_world();
+        let mut model: Vec<ModelSignal> = Vec::new();
+        let mut cancelled_ids: Vec<u64> = Vec::new();
+        let mut entities: Vec<Entity> = Vec::new();
+        let mut payloads = 0u64;
+        let mut run = ModelRun::default();
+
+        for tick in 0..ticks {
+            if tick > 0 && random(40) == 0 {
+                if random(2) == 0 {
+                    let mut signals = world.get_resource_mut::<Signals<Tagged>>().unwrap();
+                    let em = world.entities();
+                    signals.sweep(1 + random(6), |s| em.is_alive(s.0));
+                }
+                let bytes = world.save();
+                world = tagged_world();
+                world.load(&bytes);
+                run.loads += 1;
+                let signals = world.get_resource::<Signals<Tagged>>().unwrap();
+                run.loads_mid_lap += (signals.permanent_read > signals.permanent_write) as u64;
+            }
+            assert_eq!(world.get_resource::<Tick>().unwrap().0, tick);
+
+            let mut events: Vec<usize> = Vec::new();
+            for receiver in 0..RECEIVERS {
+                if random(6) != 0 {
+                    events.push(receiver);
+                    if random(8) == 0 {
+                        events.push(receiver);
+                    }
+                }
+            }
+            for _ in 0..random(12) {
+                events.push(RECEIVERS);
+            }
+            for i in (1..events.len()).rev() {
+                events.swap(i, random(i as u64 + 1) as usize);
+            }
+
+            let mut received_this_tick = [false; RECEIVERS];
+            for event in events {
+                let alive = |entity: Entity| world.entities().is_alive(entity);
+                if event < RECEIVERS {
+                    let receiver = event;
+                    let first = !received_this_tick[receiver];
+                    received_this_tick[receiver] = true;
+                    let expected = model_receive(&mut model, receiver, tick, first, alive);
+                    let system = receiver as u128 + 1;
+                    let pending = {
+                        let signals = world.get_resource::<Signals<Tagged>>().unwrap();
+                        let data = world.get_resource::<SignalData<Tagged>>().unwrap();
+                        signals.pending(&data, system, tick)
+                    };
+                    world.get_resource_mut::<CurrentSystem>().unwrap().0 = system;
+                    let mut received: Vec<(u64, u64)> = world
+                        .signal::<Tagged>()
+                        .receive()
+                        .map(|signal| (signal.0.to_bits(), signal.1))
+                        .collect();
+                    world.get_resource_mut::<CurrentSystem>().unwrap().0 = 0;
+                    received.sort();
+                    assert_eq!(
+                        received, expected,
+                        "seed {seed:x}, tick {tick}, receiver {receiver}, first {first}"
+                    );
+                    assert!(
+                        pending || received.is_empty(),
+                        "seed {seed:x}, tick {tick}: pending said no to {received:?}"
+                    );
+                    run.receives += 1;
+                    run.delivered += received.len() as u64;
+                    run.idle += (!pending) as u64;
+                    continue;
+                }
+
+                match random(100) {
+                    0..=9 => {
+                        let entity = world.entity_manager().spawn();
+                        entities.push(entity);
+                    }
+                    10..=14 if !entities.is_empty() => {
+                        let at = random(entities.len() as u64) as usize;
+                        world.entity_manager().despawn(entities[at]);
+                        if random(3) == 0 {
+                            entities.swap_remove(at);
+                        }
+                    }
+                    15..=59 => {
+                        let entity = if entities.is_empty() || random(20) == 0 {
+                            Entity::default()
+                        } else {
+                            entities[random(entities.len() as u64) as usize]
+                        };
+                        payloads += 1;
+                        let payload = Tagged(entity, payloads);
+                        let a = random(6);
+                        let b = random(8);
+                        let x = (tick + random(12)).saturating_sub(4);
+                        let (start, end, id) = {
+                            let mut signals = world.signal::<Tagged>();
+                            match random(10) {
+                                0 => (tick, tick + 1, Some(signals.emit(payload))),
+                                1 => (tick + a, tick + a + 1, signals.send(payload, In(a))),
+                                2 => (tick, tick + b, signals.send(payload, For(b))),
+                                3 => (
+                                    tick + a,
+                                    tick + a + b,
+                                    signals.send(payload, (In(a), For(b))),
+                                ),
+                                4 => (x, x + b, signals.send(payload, (At(x), To(x + b - 1)))),
+                                5 => (x, x + 1, signals.send(payload, At(x))),
+                                6 => (tick, x + 1, signals.send(payload, To(x))),
+                                7 => (tick + a, u64::MAX, signals.send(payload, (In(a), ..))),
+                                _ => (tick, u64::MAX, signals.send(payload, ..)),
+                            }
+                        };
+                        let valid = end > start && end > tick;
+                        assert_eq!(id.is_some(), valid, "tick {tick}: [{start}, {end})");
+                        let Some(id) = id else {
+                            run.rejected += 1;
+                            continue;
+                        };
+                        model.push(ModelSignal {
+                            id,
+                            entity,
+                            payload: payloads,
+                            sent: tick,
+                            start,
+                            end,
+                            cancelled: false,
+                            taken: [false; RECEIVERS],
+                        });
+                    }
+                    60..=79 if !model.is_empty() => {
+                        let at = random(model.len() as u64) as usize;
+                        let certain =
+                            alive(model[at].entity) && tick < model[at].end && !model[at].cancelled;
+                        let signal = &mut model[at];
+                        let entity = if random(4) == 0 && !entities.is_empty() {
+                            entities[random(entities.len() as u64) as usize]
+                        } else {
+                            signal.entity
+                        };
+                        payloads += 1;
+                        let changed = world
+                            .signal::<Tagged>()
+                            .modify(signal.id, Tagged(entity, payloads));
+                        assert!(
+                            changed || !certain,
+                            "tick {tick}: modify lost {}",
+                            signal.id
+                        );
+                        assert!(
+                            !(changed && signal.cancelled),
+                            "modified a cancelled signal"
+                        );
+                        if changed {
+                            signal.entity = entity;
+                            signal.payload = payloads;
+                            run.modifies += 1;
+                        }
+                    }
+                    80..=91 if !model.is_empty() => {
+                        let at = random(model.len() as u64) as usize;
+                        let certain =
+                            alive(model[at].entity) && tick < model[at].end && !model[at].cancelled;
+                        let id = model[at].id;
+                        let cancelled = world.signal::<Tagged>().cancel(id);
+                        assert!(cancelled || !certain, "tick {tick}: cancel lost {id}");
+                        assert!(!(cancelled && model[at].cancelled), "cancelled {id} twice");
+                        if cancelled {
+                            model[at].cancelled = true;
+                            cancelled_ids.push(id);
+                            run.cancels += 1;
+                        }
+                    }
+                    92..=95 if !cancelled_ids.is_empty() => {
+                        let id = cancelled_ids[random(cancelled_ids.len() as u64) as usize];
+                        let mut signals = world.signal::<Tagged>();
+                        assert!(!signals.cancel(id), "tick {tick}: cancelled {id} twice");
+                        assert!(!signals.modify(id, Tagged(Entity::default(), 0)));
+                    }
+                    96..=97 => {
+                        let mut signals = world.get_resource_mut::<Signals<Tagged>>().unwrap();
+                        let em = world.entities();
+                        let (_, done) = signals.sweep(1 + random(6), |s| em.is_alive(s.0));
+                        run.partial_sweeps += (!done) as u64;
+                    }
+                    _ => {
+                        let unknown = payloads + 1_000_000;
+                        assert!(!world.signal::<Tagged>().cancel(unknown));
+                    }
+                }
+            }
+
+            let permanent = world
+                .get_resource::<Signals<Tagged>>()
+                .unwrap()
+                .permanent
+                .len();
+            run.most_permanent = run.most_permanent.max(permanent);
+            end_tick(&world);
+            let next = tick + 1;
+            let alive = |entity: Entity| world.entities().is_alive(entity);
+            model.retain(|signal| {
+                !signal.cancelled
+                    && (next <= signal.sent + 1 || next < signal.end)
+                    && (alive(signal.entity) || next <= signal.sent + 1 || random(4) != 0)
+            });
+            if cancelled_ids.len() > 200 {
+                cancelled_ids.drain(..100);
+            }
+        }
+        run
+    }
+
+    #[test]
+    fn entity_signals_match_a_naive_model() {
+        let ticks = crate::test_size(4_000, 150) as u64;
+        for seed in [
+            0x2545F4914F6CDD1Du64,
+            0x9E3779B97F4A7C15,
+            0xD1B54A32D192ED03,
+        ] {
+            let run = signal_model_run(seed, ticks);
+            println!("seed {seed:x}: {run:?}");
+            assert!(
+                run.delivered > ticks && run.idle > 0 && run.rejected > 0,
+                "{run:?}"
+            );
+            assert!(
+                run.cancels > 0 && run.modifies > 0 && run.partial_sweeps > 0,
+                "{run:?}"
+            );
+            if !cfg!(miri) {
+                assert!(run.loads > 10 && run.loads_mid_lap > 0, "{run:?}");
+            }
+        }
+    }
 }
