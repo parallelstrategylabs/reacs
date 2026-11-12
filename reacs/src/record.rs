@@ -66,7 +66,8 @@ fn resend_input<S: SignalType>(world: &mut World, bytes: &[u8]) -> bool {
     })
 }
 
-pub fn register_input_signal<S: InputSignal>() {
+#[doc(hidden)]
+pub unsafe fn register_input_signal<S: InputSignal>() {
     let entry = InputEntry {
         uuid: Signals::<S>::TYPE_UUID,
         init: World::init_signal::<S>,

@@ -16,7 +16,7 @@ use crate::{
     world::World,
 };
 
-pub const SWEEP_BUDGET: u64 = 65536;
+pub const SWEEP_BUDGET: u64 = if cfg!(miri) { 256 } else { 65536 };
 
 pub trait SignalFilter<S>: 'static {
     const ACTIVE: bool;
@@ -1306,7 +1306,8 @@ pub struct SweepCursor {
     pub seen_stamp: u64,
 }
 
-pub fn register_signal<S: SignalType>() {
+#[doc(hidden)]
+pub unsafe fn register_signal<S: SignalType>() {
     unsafe {
         let ptr = addr_of_mut!(SIGNAL_REGISTRY);
         (*ptr)

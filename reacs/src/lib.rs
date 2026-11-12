@@ -45,3 +45,8 @@ pub mod prelude {
 
 #[resource]
 pub struct Tick(pub u64);
+
+#[cfg(test)]
+pub(crate) const fn test_size(native: usize, miri: usize) -> usize {
+    if cfg!(miri) { miri } else { native }
+}

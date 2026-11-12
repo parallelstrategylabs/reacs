@@ -15,7 +15,8 @@ use std::ptr::{addr_of, addr_of_mut};
 
 static mut SYSTEM_GRAPH: SystemGraph = SystemGraph::new();
 
-pub fn register_system(system: SystemEntry) {
+#[doc(hidden)]
+pub unsafe fn register_system(system: SystemEntry) {
     unsafe {
         (&mut *addr_of_mut!(SYSTEM_GRAPH)).insert(system);
     }

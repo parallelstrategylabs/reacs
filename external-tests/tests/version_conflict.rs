@@ -61,6 +61,7 @@ fn resolve_app(case: &str, plugin_reacs_version: &str) -> Output {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn single_reacs_version_resolves() {
     let output = resolve_app("single_version", "1.0.0");
 
@@ -72,6 +73,7 @@ fn single_reacs_version_resolves() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn mismatched_reacs_versions_fail_to_resolve() {
     let output = resolve_app("mismatched_versions", "2.0.0");
     let stderr = String::from_utf8_lossy(&output.stderr);

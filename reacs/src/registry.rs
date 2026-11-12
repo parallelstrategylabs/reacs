@@ -22,7 +22,8 @@ fn decode<T: for<'de> serde::Deserialize<'de>>(bytes: &[u8]) -> T {
 
 pub static mut REGISTRY: Option<IndexMap<u128, RegistryEntry>> = None;
 
-pub fn register_entry<T>(id: u128)
+#[doc(hidden)]
+pub unsafe fn register_entry<T>(id: u128)
 where
     T: serde::Serialize + for<'de> serde::Deserialize<'de> + 'static,
 {

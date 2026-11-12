@@ -463,7 +463,7 @@ mod tests {
     ) {
         let mut map = IndexMap::new();
         let mut model = Vec::new();
-        for op in ops(0x9e37_79b9, 20_000, keys) {
+        for op in ops(0x9e37_79b9, crate::test_size(20_000, 400), keys) {
             apply(&mut map, op, key);
             apply_model(&mut model, op, key);
             assert_eq!(map.as_slice(), model.as_slice(), "after {op:?}");
@@ -492,13 +492,14 @@ mod tests {
     #[test]
     fn order_does_not_depend_on_capacity() {
         let mut small = IndexMap::new();
-        let mut large = IndexMap::with_capacity(100_000);
+        let count = crate::test_size(20_000, 400);
+        let mut large = IndexMap::with_capacity(count * 5);
         let mut reserved = IndexMap::new();
-        for (i, op) in ops(42, 20_000, 500).into_iter().enumerate() {
+        for (i, op) in ops(42, count, 500).into_iter().enumerate() {
             apply(&mut small, op, |k| k as u64);
             apply(&mut large, op, |k| k as u64);
             apply(&mut reserved, op, |k| k as u64);
-            if i % 1000 == 0 {
+            if i % (count / 20) == 0 {
                 reserved.reserve(i);
             }
             assert_eq!(small.as_slice(), large.as_slice());
@@ -508,8 +509,9 @@ mod tests {
 
     #[test]
     fn save_and_load_keep_order_and_bytes() {
-        let all = ops(1234, 30_000, 400);
-        let (before, after) = all.split_at(10_000);
+        let count = crate::test_size(30_000, 600);
+        let all = ops(1234, count, 400);
+        let (before, after) = all.split_at(count / 3);
         let mut original = IndexMap::new();
         for &op in before {
             apply(&mut original, op, Weak);
@@ -606,19 +608,20 @@ mod tests {
 
     #[test]
     fn grows_and_finds_everything() {
+        let count = crate::test_size(100_000, 2_000) as u64;
         let mut map = IndexMap::new();
-        for i in 0..100_000u64 {
+        for i in 0..count {
             map.insert(i * 7919, i);
         }
-        assert_eq!(map.len(), 100_000);
-        for i in 0..100_000u64 {
+        assert_eq!(map.len() as u64, count);
+        for i in 0..count {
             assert_eq!(map.get(&(i * 7919)), Some(&i));
             assert_eq!(map.get(&(i * 7919 + 1)), None);
         }
-        for i in (0..100_000u64).step_by(2) {
+        for i in (0..count).step_by(2) {
             assert_eq!(map.swap_remove(&(i * 7919)), Some(i));
         }
-        for i in 0..100_000u64 {
+        for i in 0..count {
             let expected = (i % 2 == 1).then_some(i);
             assert_eq!(map.get(&(i * 7919)).copied(), expected);
         }
