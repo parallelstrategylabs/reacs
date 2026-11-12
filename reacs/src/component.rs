@@ -86,6 +86,11 @@ impl<C: Copy + Default> ComponentMap<C> {
     }
 }
 
+// SAFETY (every `unsafe` on `slots` below): `slots` and `len` are copied from `map.slots` at fetch
+// and after every `insert`, the only call that can reallocate it. `map` is the `RefCell` guard,
+// held for the param's whole life, so nothing else can write the map meanwhile (a second `Write`
+// borrow panics at fetch; host writes need `&mut World`). A `Read` param only reads through the
+// pointer; writes exist only on `Component<_, _, Write>`, whose pointer comes from `guard_mut`.
 pub struct Component<'w, C: 'static + Copy + Default, M: Mode = Read> {
     slots: *mut Slot<C>,
     len: usize,
@@ -104,6 +109,7 @@ impl<C: 'static + Copy + Default, M: Mode> Component<'_, C, M> {
         if index >= self.len {
             return None;
         }
+        // SAFETY: `index < len`, so the slot is inside the allocation (see `Component`).
         let slot = unsafe { self.slots.add(index) };
         (unsafe { (*slot).generation } == generation).then_some(slot)
     }
@@ -122,6 +128,8 @@ impl<C: 'static + Copy + Default, M: Mode> Component<'_, C, M> {
 impl<C: 'static + Copy + Default> Component<'_, C, Write> {
     #[inline]
     pub fn get_mut(&mut self, entity: Entity) -> Option<&mut C> {
+        // SAFETY: the `&mut C` borrows `self` mutably, so no other access through this param
+        // (or an `insert` that could reallocate) can happen while it lives.
         self.slot(entity).map(|slot| unsafe { &mut (*slot).value })
     }
 

@@ -168,11 +168,9 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
         #[::reacs::__private::ctor::ctor(unsafe, naked, crate_path = ::reacs::__private::ctor)]
         fn #ctor_fn() {
             #link
-            unsafe {
-                ::reacs::registry::register_entry::<#name>(
-                    <#name as ::reacs::hashed::Hashed>::TYPE_UUID
-                );
-            }
+            ::reacs::registry::register_entry::<#name>(
+                <#name as ::reacs::hashed::Hashed>::TYPE_UUID
+            );
         }
     };
 
@@ -214,11 +212,9 @@ pub fn component(_attr: TokenStream, item: TokenStream) -> TokenStream {
         fn #ctor_fn() {
         #link
         type Map = ::reacs::component::ComponentMap<#name>;
-        unsafe {
-            ::reacs::registry::register_entry::<Map>(
-                <Map as ::reacs::hashed::Hashed>::TYPE_UUID,
-            );
-        }
+        ::reacs::registry::register_entry::<Map>(
+            <Map as ::reacs::hashed::Hashed>::TYPE_UUID,
+        );
         }
     };
 
@@ -294,7 +290,7 @@ pub fn system(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .run_before(&[#(<#run_before as ::reacs::schedule::SystemId>::UUID),*])
                 .run_after(&[#(<#run_after as ::reacs::schedule::SystemId>::UUID),*])
                 .in_group(&[#(<#in_group as ::reacs::schedule::SystemId>::UUID),*]);
-            unsafe { ::reacs::schedule::register_system(system) };
+            ::reacs::schedule::register_system(system);
         }
     };
 
@@ -429,16 +425,14 @@ pub fn signal(attr: TokenStream, item: TokenStream) -> TokenStream {
             #link
             type Signals = ::reacs::signal::Signals<#name>;
             type Data = ::reacs::signal::SignalData<#name>;
-            unsafe {
-                ::reacs::registry::register_entry::<Signals>(
-                    <Signals as ::reacs::hashed::Hashed>::TYPE_UUID,
-                );
-                ::reacs::registry::register_entry::<Data>(
-                    <Data as ::reacs::hashed::Hashed>::TYPE_UUID,
-                );
-                ::reacs::signal::register_signal::<#name>();
-                #input_register
-            }
+            ::reacs::registry::register_entry::<Signals>(
+                <Signals as ::reacs::hashed::Hashed>::TYPE_UUID,
+            );
+            ::reacs::registry::register_entry::<Data>(
+                <Data as ::reacs::hashed::Hashed>::TYPE_UUID,
+            );
+            ::reacs::signal::register_signal::<#name>();
+            #input_register
         }
     };
 

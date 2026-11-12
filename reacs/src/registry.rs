@@ -1,4 +1,8 @@
-use std::{any::Any, cell::RefCell, ptr::addr_of_mut};
+use std::{
+    any::Any,
+    cell::RefCell,
+    sync::{Mutex, OnceLock, PoisonError},
+};
 
 use crate::{index_map::IndexMap, state_hash::hash_value};
 
@@ -20,55 +24,109 @@ fn decode<T: for<'de> serde::Deserialize<'de>>(bytes: &[u8]) -> T {
     })
 }
 
-pub static mut REGISTRY: Option<IndexMap<u128, RegistryEntry>> = None;
+pub(crate) struct Registry<T> {
+    building: Mutex<Building<T>>,
+    frozen: OnceLock<T>,
+}
+
+struct Building<T> {
+    closed: bool,
+    value: Option<T>,
+}
+
+impl<T: Default> Registry<T> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            building: Mutex::new(Building {
+                closed: false,
+                value: None,
+            }),
+            frozen: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn add(&self, name: &str, add: impl FnOnce(&mut T)) {
+        let mut building = self.building.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(
+            !building.closed,
+            "`{name}` was registered after reacs started running: registration only happens before \
+             main, from the code reacs macros generate"
+        );
+        add(building.value.get_or_insert_with(T::default));
+    }
+
+    pub(crate) fn get(&self) -> &T {
+        self.frozen.get_or_init(|| {
+            let mut building = self.building.lock().unwrap_or_else(PoisonError::into_inner);
+            building.closed = true;
+            building.value.take().unwrap_or_default()
+        })
+    }
+}
+
+static REGISTRY: Registry<IndexMap<u128, RegistryEntry>> = Registry::new();
 
 #[doc(hidden)]
-pub unsafe fn register_entry<T>(id: u128)
+pub fn register_entry<T>(id: u128)
 where
     T: serde::Serialize + for<'de> serde::Deserialize<'de> + 'static,
 {
-    unsafe {
-        let ptr = addr_of_mut!(REGISTRY);
-        let map = (*ptr).get_or_insert_with(IndexMap::new);
+    let type_name = std::any::type_name::<T>();
+    REGISTRY.add(type_name, |map| {
         if let Some(existing) = map.get(&id) {
             panic!(
-                "id collision: `{}` and `{}` share id {id:#034x}",
+                "id collision: `{}` and `{type_name}` share id {id:#034x}",
                 existing.type_name,
-                std::any::type_name::<T>(),
             );
         }
         map.insert(
             id,
             RegistryEntry {
-                type_name: std::any::type_name::<T>(),
+                type_name,
                 serialize: |v| bincode::serialize(v.downcast_ref::<T>().unwrap()).unwrap(),
                 deserialize: |b| Box::new(decode::<T>(b)),
                 restore: |b| Box::new(RefCell::new(decode::<T>(b))),
                 hash: |v| hash_value(v.downcast_ref::<T>().unwrap()),
             },
         );
-    }
+    });
 }
 
 pub fn registered_ids() -> Vec<u128> {
-    unsafe {
-        let ptr = addr_of_mut!(REGISTRY);
-        (*ptr)
-            .as_ref()
-            .map_or_else(Vec::new, |map| map.iter().map(|entry| entry.0).collect())
-    }
+    REGISTRY.get().iter().map(|entry| entry.0).collect()
 }
 
 pub fn get_registry_entry(id: u128) -> Option<&'static RegistryEntry> {
-    unsafe {
-        let ptr = addr_of_mut!(REGISTRY);
-        (*ptr).as_ref()?.get(&id)
-    }
+    REGISTRY.get().get(&id)
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{component::ComponentMap, prelude::*, registry::get_registry_entry};
+
+    #[test]
+    fn a_registry_keeps_what_was_added_before_the_first_read() {
+        let registry: super::Registry<Vec<u32>> = super::Registry::new();
+        registry.add("a", |list| list.push(1));
+        registry.add("b", |list| list.push(2));
+        assert_eq!(registry.get(), &[1, 2]);
+        assert_eq!(registry.get(), &[1, 2]);
+    }
+
+    #[test]
+    fn an_empty_registry_reads_as_empty() {
+        let registry: super::Registry<Vec<u32>> = super::Registry::new();
+        assert!(registry.get().is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "`late` was registered after reacs started running")]
+    fn registering_after_the_first_read_panics() {
+        let registry: super::Registry<Vec<u32>> = super::Registry::new();
+        registry.add("early", |list| list.push(1));
+        registry.get();
+        registry.add("late", |list| list.push(2));
+    }
 
     #[resource]
     struct IntResource(pub u64);

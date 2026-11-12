@@ -1,4 +1,6 @@
-use std::{any::TypeId, marker::PhantomData, ops::RangeFull, ptr::addr_of_mut};
+use std::{any::TypeId, marker::PhantomData, ops::RangeFull};
+
+use crate::registry::Registry;
 
 use reacs_derive::{param, resource};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -1428,11 +1430,11 @@ impl<'w, S: SignalType> Sender<'w, S, Write> {
     }
 }
 
-pub(crate) static mut SIGNAL_REGISTRY: Option<Vec<fn(&World)>> = None;
+static SIGNAL_REGISTRY: Registry<Vec<fn(&World)>> = Registry::new();
 
-pub(crate) static mut SWEEP_REGISTRY: Option<Vec<(u128, fn(&World, u64) -> (u64, bool))>> = None;
+static SWEEP_REGISTRY: Registry<Vec<(u128, fn(&World, u64) -> (u64, bool))>> = Registry::new();
 
-pub(crate) static mut SWEEP_STAMPS: Option<Vec<(TypeId, fn(&World) -> u64)>> = None;
+static SWEEP_STAMPS: Registry<Vec<(TypeId, fn(&World) -> u64)>> = Registry::new();
 
 #[resource]
 pub struct SweepCursor {
@@ -1443,27 +1445,22 @@ pub struct SweepCursor {
 }
 
 #[doc(hidden)]
-pub unsafe fn register_signal<S: SignalType>() {
-    unsafe {
-        let ptr = addr_of_mut!(SIGNAL_REGISTRY);
-        (*ptr)
-            .get_or_insert_with(Vec::new)
-            .push(cleanup_in_world::<S>);
+pub fn register_signal<S: SignalType>() {
+    let name = std::any::type_name::<S>();
+    SIGNAL_REGISTRY.add(name, |signals| signals.push(cleanup_in_world::<S>));
 
-        if S::Filter::ACTIVE {
-            let ptr = addr_of_mut!(SWEEP_REGISTRY);
-            let sweeps = (*ptr).get_or_insert_with(Vec::new);
+    if S::Filter::ACTIVE {
+        SWEEP_REGISTRY.add(name, |sweeps| {
             let uuid = Signals::<S>::TYPE_UUID;
             let i = sweeps.partition_point(|x| x.0 < uuid);
             sweeps.insert(i, (uuid, sweep_in_world::<S>));
-
-            let ptr = addr_of_mut!(SWEEP_STAMPS);
-            let stamps = (*ptr).get_or_insert_with(Vec::new);
+        });
+        SWEEP_STAMPS.add(name, |stamps| {
             let filter = TypeId::of::<S::Filter>();
             if !stamps.iter().any(|x| x.0 == filter) {
                 stamps.push((filter, S::Filter::stamp));
             }
-        }
+        });
     }
 }
 
@@ -1474,17 +1471,11 @@ pub unsafe fn register_signal<S: SignalType>() {
 pub trait InputSignal: SignalType {}
 
 fn get_registered_sweeps() -> &'static [(u128, fn(&World, u64) -> (u64, bool))] {
-    unsafe {
-        let ptr = addr_of_mut!(SWEEP_REGISTRY);
-        (*ptr).as_deref().unwrap_or(&[])
-    }
+    SWEEP_REGISTRY.get()
 }
 
 fn get_registered_stamps() -> &'static [(TypeId, fn(&World) -> u64)] {
-    unsafe {
-        let ptr = addr_of_mut!(SWEEP_STAMPS);
-        (*ptr).as_deref().unwrap_or(&[])
-    }
+    SWEEP_STAMPS.get()
 }
 
 fn sweep_in_world<S: SignalType>(world: &World, budget: u64) -> (u64, bool) {
@@ -1536,10 +1527,7 @@ fn sweep_signals(world: &World) {
 }
 
 fn get_registered_signals() -> &'static [fn(&World)] {
-    unsafe {
-        let ptr = addr_of_mut!(SIGNAL_REGISTRY);
-        (*ptr).as_deref().unwrap_or(&[])
-    }
+    SIGNAL_REGISTRY.get()
 }
 
 fn cleanup_in_world<S: SignalType>(world: &World) {

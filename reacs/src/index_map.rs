@@ -215,6 +215,10 @@ impl<K: Hash + Eq, V> IndexMap<K, V> {
             if slot.index == EMPTY {
                 return Err(pos);
             }
+            // SAFETY: every non-empty slot holds an index below `entries.len()`. Only this map
+            // writes its table (never loaded from a save), and every change keeps that true,
+            // even on panic: `insert` pushes before writing the slot, `grow_for` allocates before
+            // replacing the table, `swap_remove` hashes before changing anything.
             if slot.tag == tag
                 && unsafe { &self.entries.get_unchecked(slot.index as usize).0 } == key
             {
@@ -231,11 +235,14 @@ impl<K: Hash + Eq, V> IndexMap<K, V> {
 
     #[inline(always)]
     fn slot(&self, pos: usize) -> Slot {
+        // SAFETY: every `pos` is masked by `slots.len() - 1` (a power of two), and callers only
+        // reach here with a non-empty table (`find` returns early on an empty map).
         unsafe { *self.slots.get_unchecked(pos) }
     }
 
     #[inline(always)]
     fn set_slot(&mut self, pos: usize, slot: Slot) {
+        // SAFETY: as in `slot`.
         unsafe { *self.slots.get_unchecked_mut(pos) = slot }
     }
 

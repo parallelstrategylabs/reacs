@@ -94,6 +94,11 @@ pub(crate) struct ResourceCell<'w, T, M: Mode = Read> {
 impl<'w, T: 'static, M: Mode> ResourceCell<'w, T, M> {
     #[inline]
     pub(crate) fn read(&self) -> &T {
+        // SAFETY: skips the `RefCell` borrow. Sound only while no `RefMut` of this resource is
+        // live, so callers must never keep the reference past one expression. Enforced by
+        // visibility: `read` is `pub(crate)` and only used on `EntityGenerations` (`pub(crate)`),
+        // in single expressions in `entity.rs`; its only writer, `despawn`, holds `write()` for
+        // one statement.
         unsafe { &*self.cell.as_ptr() }
     }
 
@@ -122,6 +127,9 @@ impl<T: 'static + Default + Hashed, M: Mode> SystemParam for ResourceCell<'_, T,
             "resource has the wrong type"
         );
         ResourceCell {
+            // SAFETY: the cell was found by `T::TYPE_UUID`, and registration panics on a UUID
+            // collision, so it holds a `T`. The `is::<T>` check above confirms it whenever the
+            // cell isn't mutably borrowed.
             cell: unsafe { &*(cell as *const RefCell<dyn Any> as *const RefCell<T>) },
             marker: PhantomData,
         }

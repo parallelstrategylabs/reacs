@@ -1,6 +1,7 @@
 use crate::Tick;
 use crate::entity::{Entity, EntityManager};
 use crate::hashed::{Hashed, hash_path};
+use crate::registry::Registry;
 use crate::resource::LocalResourceType;
 use crate::signal::{Signal, SignalType};
 use crate::world::World;
@@ -11,19 +12,17 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fmt::Write as _;
 use std::ops::Deref;
-use std::ptr::{addr_of, addr_of_mut};
 
-static mut SYSTEM_GRAPH: SystemGraph = SystemGraph::new();
+static SYSTEM_GRAPH: Registry<SystemGraph> = Registry::new();
 
 #[doc(hidden)]
-pub unsafe fn register_system(system: SystemEntry) {
-    unsafe {
-        (&mut *addr_of_mut!(SYSTEM_GRAPH)).insert(system);
-    }
+pub fn register_system(system: SystemEntry) {
+    let name = format!("{}::{}", system.module, system.name);
+    SYSTEM_GRAPH.add(&name, |graph| graph.insert(system));
 }
 
 pub fn system_graph() -> &'static SystemGraph {
-    unsafe { &*addr_of!(SYSTEM_GRAPH) }
+    SYSTEM_GRAPH.get()
 }
 
 pub(crate) const ANONYMOUS_SYSTEM: u128 = 0;
@@ -43,8 +42,8 @@ pub struct SystemEntry {
     pub after: Vec<u128>,
     pub groups: Vec<u128>,
     pub wakes_on: Vec<&'static str>,
-    pub(crate) init_fn: Box<dyn Fn(&mut World)>,
-    pub(crate) run_fn: Box<dyn Fn(&mut World)>,
+    pub(crate) init_fn: Box<dyn Fn(&mut World) + Send + Sync>,
+    pub(crate) run_fn: Box<dyn Fn(&mut World) + Send + Sync>,
     pub(crate) wake_fn: Option<fn(ParamWorld<'_>, u128, u64) -> bool>,
 }
 
@@ -90,6 +89,12 @@ pub(crate) fn set_current_system(world: &World, uuid: u128) {
 
 pub struct SystemGraph {
     nodes: Vec<SystemEntry>,
+}
+
+impl Default for SystemGraph {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SystemGraph {
@@ -399,7 +404,7 @@ macro_rules! impl_into_system_tuples {
     ($($param:ident),*) => {
         impl<F, $($param),*> IntoSystem<($($param,)*)> for F
         where
-            F: Fn($($param),*) + 'static,
+            F: Fn($($param),*) + Send + Sync + 'static,
             F: for<'w> Fn($($param::Item<'w>),*),
             $($param: SystemParam),*
         {
@@ -612,7 +617,7 @@ pub struct ExclusiveSystem;
 
 impl<F> IntoSystem<ExclusiveSystem> for F
 where
-    F: for<'w> Fn(WorldAccess<'w, Write>) + 'static,
+    F: for<'w> Fn(WorldAccess<'w, Write>) + Send + Sync + 'static,
 {
     fn into_system(self) -> SystemEntry {
         SystemEntry {

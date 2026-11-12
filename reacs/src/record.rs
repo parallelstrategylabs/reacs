@@ -2,7 +2,6 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, BufRead, BufReader, BufWriter, ErrorKind, Read, Write},
     path::{Path, PathBuf},
-    ptr::addr_of_mut,
 };
 
 use bincode::Options;
@@ -11,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Tick,
     hashed::Hashed,
-    registry::registered_ids,
+    registry::{Registry, registered_ids},
     schedule::{Mut, system_graph},
     signal::{InputSignal, Signal, SignalData, SignalType, Signals},
     state_hash::hash_bytes,
@@ -41,7 +40,7 @@ struct InputEntry {
     resend: fn(&mut World, &[u8]) -> bool,
 }
 
-static mut INPUT_REGISTRY: Option<Vec<InputEntry>> = None;
+static INPUT_REGISTRY: Registry<Vec<InputEntry>> = Registry::new();
 
 fn next_input_id<S: SignalType>(world: &World) -> u64 {
     let data = world.get_resource::<SignalData<S>>();
@@ -67,7 +66,7 @@ fn resend_input<S: SignalType>(world: &mut World, bytes: &[u8]) -> bool {
 }
 
 #[doc(hidden)]
-pub unsafe fn register_input_signal<S: InputSignal>() {
+pub fn register_input_signal<S: InputSignal>() {
     let entry = InputEntry {
         uuid: Signals::<S>::TYPE_UUID,
         init: World::init_signal::<S>,
@@ -75,15 +74,14 @@ pub unsafe fn register_input_signal<S: InputSignal>() {
         capture: capture_input::<S>,
         resend: resend_input::<S>,
     };
-    unsafe {
-        let inputs = (*addr_of_mut!(INPUT_REGISTRY)).get_or_insert_with(Vec::new);
+    INPUT_REGISTRY.add(std::any::type_name::<S>(), |inputs| {
         let at = inputs.partition_point(|x| x.uuid < entry.uuid);
         inputs.insert(at, entry);
-    }
+    });
 }
 
 fn input_signals() -> &'static [InputEntry] {
-    unsafe { (*addr_of_mut!(INPUT_REGISTRY)).as_deref().unwrap_or(&[]) }
+    INPUT_REGISTRY.get()
 }
 
 pub(crate) fn init_input_signals(world: &mut World) {
@@ -197,7 +195,9 @@ impl Recorder {
             let state = world.save();
             let state_len = state.len() as u64;
             let ran = world.steps.saturating_sub(self.steps);
-            let reached = self.last.map_or(self.section_start + ran, |last| last + ran);
+            let reached = self
+                .last
+                .map_or(self.section_start + ran, |last| last + ran);
             let ended = (reached > self.section_start).then(|| reached - 1);
             let record = Record::Section {
                 tick,
