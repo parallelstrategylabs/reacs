@@ -103,8 +103,7 @@ fn dead_entitys_open_signal_is_removed_during_step() {
         world
             .get_resource::<Signals<Burn>>()
             .unwrap()
-            .permanent
-            .len(),
+            .permanent_len(),
         2
     );
 
@@ -116,14 +115,13 @@ fn dead_entitys_open_signal_is_removed_during_step() {
         world
             .get_resource::<Signals<Burn>>()
             .unwrap()
-            .permanent
-            .len(),
+            .permanent_len(),
         1
     );
 }
 
 fn permanent_len<S: SignalType>(world: &World) -> usize {
-    world.get_resource::<Signals<S>>().unwrap().permanent.len()
+    world.get_resource::<Signals<S>>().unwrap().permanent_len()
 }
 
 #[test]

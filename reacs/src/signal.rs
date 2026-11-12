@@ -175,27 +175,32 @@ impl SignalWindow {
     pub fn is_cancelled(&self) -> bool {
         self.start == u64::MAX
     }
+
+    #[inline]
+    fn cancel(&mut self) {
+        self.start = u64::MAX;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(bound = "S: SignalType")]
-pub struct SignalInstance<S> {
-    pub id: u64,
-    pub payload: S,
+pub(crate) struct SignalInstance<S> {
+    pub(crate) id: u64,
+    pub(crate) payload: S,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-pub struct ReceiveCursor {
-    pub system: u128,
-    pub next: u64,
-    pub windows_tick: u64,
+pub(crate) struct ReceiveCursor {
+    pub(crate) system: u128,
+    pub(crate) next: u64,
+    pub(crate) windows_tick: u64,
 }
 
 #[derive(Default, Hashed, Serialize, Deserialize)]
 #[serde(bound = "")]
 pub struct SignalData<S: SignalType> {
-    pub cursors: Vec<ReceiveCursor>,
-    pub next: u64,
+    pub(crate) cursors: Vec<ReceiveCursor>,
+    pub(crate) next: u64,
     phantom: PhantomData<S>,
 }
 
@@ -214,10 +219,10 @@ impl<S: SignalType> SignalData<S> {
     }
 }
 
-pub const WINDOW_CHUNK_TICKS: u64 = 64;
+pub(crate) const WINDOW_CHUNK_TICKS: u64 = 64;
 const _: () = assert!(WINDOW_CHUNK_TICKS > 0 && WINDOW_CHUNK_TICKS <= 64);
 
-pub type WindowEntry<S> = (SignalWindow, SignalInstance<S>);
+pub(crate) type WindowEntry<S> = (SignalWindow, SignalInstance<S>);
 
 #[inline]
 fn chunk_key(tick: u64) -> u64 {
@@ -236,19 +241,19 @@ fn chunk_bits_through(tick: u64) -> u64 {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound = "S: SignalType")]
-pub struct WindowChunk<S> {
-    pub key: u64,
-    pub ticks: u64,
-    pub cancelled: u64,
-    pub head: usize,
-    pub by_end: bool,
-    pub due: bool,
-    pub entries: Vec<WindowEntry<S>>,
+pub(crate) struct WindowChunk<S> {
+    pub(crate) key: u64,
+    pub(crate) ticks: u64,
+    pub(crate) cancelled: u64,
+    pub(crate) head: usize,
+    pub(crate) by_end: bool,
+    pub(crate) due: bool,
+    pub(crate) entries: Vec<WindowEntry<S>>,
 }
 
 impl<S: Copy> WindowChunk<S> {
     #[inline]
-    pub fn live(&self) -> &[WindowEntry<S>] {
+    pub(crate) fn live(&self) -> &[WindowEntry<S>] {
         &self.entries[self.head..]
     }
 
@@ -372,32 +377,32 @@ fn merge_by_id<S: Copy>(entries: &mut Vec<WindowEntry<S>>, joining: &[WindowEntr
 enum WindowSlot {
     Pending(usize),
     Joining(usize),
-    Active(usize, usize),
-    Inactive(usize, usize),
+    Running(usize, usize),
+    Waiting(usize, usize),
 }
 
 #[derive(Default, Hashed, Serialize, Deserialize)]
 #[serde(bound = "")]
 pub struct Signals<S: SignalType> {
-    pub transient: Vec<SignalInstance<S>>,
-    pub transient_buffer: Vec<SignalInstance<S>>,
+    pub(crate) transient: Vec<SignalInstance<S>>,
+    pub(crate) transient_buffer: Vec<SignalInstance<S>>,
 
-    pub transitory_pending: Vec<WindowEntry<S>>,
-    pub transitory_active: Vec<WindowChunk<S>>,
-    pub transitory_inactive: Vec<WindowChunk<S>>,
-    pub transitory_compact: Vec<(bool, u64)>,
-    pub transitory_wake: u64,
+    pub(crate) transitory_pending: Vec<WindowEntry<S>>,
+    pub(crate) transitory_running: Vec<WindowChunk<S>>,
+    pub(crate) transitory_waiting: Vec<WindowChunk<S>>,
+    pub(crate) transitory_compact: Vec<(bool, u64)>,
+    pub(crate) transitory_wake: u64,
 
-    pub permanent_joining: Vec<WindowEntry<S>>,
+    pub(crate) permanent_joining: Vec<WindowEntry<S>>,
     #[serde(skip)]
-    pub window_spare: Vec<Vec<WindowEntry<S>>>,
+    pub(crate) window_spare: Vec<Vec<WindowEntry<S>>>,
     #[serde(skip)]
-    pub window_started: Vec<WindowEntry<S>>,
-    pub permanent: Vec<SignalInstance<S>>,
-    pub permanent_write: usize,
-    pub permanent_read: usize,
-    pub permanent_cancelled: u64,
-    pub permanent_cancelled_bits: BitSet,
+    pub(crate) window_started: Vec<WindowEntry<S>>,
+    pub(crate) permanent: Vec<SignalInstance<S>>,
+    pub(crate) permanent_write: usize,
+    pub(crate) permanent_read: usize,
+    pub(crate) permanent_cancelled: u64,
+    pub(crate) permanent_cancelled_bits: BitSet,
 }
 
 static EMPTY_BITS: BitSet = BitSet { words: Vec::new() };
@@ -444,7 +449,7 @@ where
 
 enum ReceiveStage {
     TransientBuffer,
-    Active,
+    Running,
     PermanentLeft,
     PermanentRight,
     PermanentCancelled,
@@ -456,7 +461,7 @@ struct ReceiveIter<'a, S: SignalType, K> {
     entries: std::slice::Iter<'a, (SignalWindow, SignalInstance<S>)>,
     stage: ReceiveStage,
     transient_buffer: &'a [SignalInstance<S>],
-    active: &'a [WindowChunk<S>],
+    running: &'a [WindowChunk<S>],
     joining: &'a [WindowEntry<S>],
     permanent: &'a [SignalInstance<S>],
     write: usize,
@@ -500,12 +505,12 @@ impl<'a, S: SignalType, K: Fn(&S) -> bool> ReceiveIter<'a, S, K> {
             match self.stage {
                 ReceiveStage::TransientBuffer => {
                     self.run = self.transient_buffer.iter();
-                    self.stage = ReceiveStage::Active;
+                    self.stage = ReceiveStage::Running;
                 }
-                ReceiveStage::Active => {
-                    if let Some((chunk, rest)) = self.active.split_first() {
+                ReceiveStage::Running => {
+                    if let Some((chunk, rest)) = self.running.split_first() {
                         self.entries = chunk.live().iter();
-                        self.active = rest;
+                        self.running = rest;
                         continue;
                     }
                     self.entries = self.joining.iter();
@@ -576,10 +581,10 @@ impl<'a, S: SignalType, K: Fn(&S) -> bool> Iterator for ReceiveIter<'a, S, K> {
             match self.stage {
                 ReceiveStage::TransientBuffer => {
                     acc = fold_instances(self.transient_buffer, acc, &mut f, &self.keep);
-                    self.stage = ReceiveStage::Active;
+                    self.stage = ReceiveStage::Running;
                 }
-                ReceiveStage::Active => {
-                    for chunk in self.active {
+                ReceiveStage::Running => {
+                    for chunk in self.running {
                         acc = fold_entries(chunk.live(), acc, &mut f, &self.keep);
                     }
                     acc = fold_entries(self.joining, acc, &mut f, &self.keep);
@@ -628,7 +633,7 @@ impl<'a, S: SignalType, K: Fn(&S) -> bool> Iterator for ReceiveIter<'a, S, K> {
 }
 
 impl<S: SignalType> Signals<S> {
-    pub fn send(
+    pub(crate) fn send(
         &mut self,
         data: &mut SignalData<S>,
         tick: u64,
@@ -657,7 +662,7 @@ impl<S: SignalType> Signals<S> {
     }
 
     #[inline]
-    pub fn emit(&mut self, data: &mut SignalData<S>, signal: S) -> u64 {
+    pub(crate) fn emit(&mut self, data: &mut SignalData<S>, signal: S) -> u64 {
         let id = data.next;
         data.next += 1;
         self.transient_buffer.push(SignalInstance {
@@ -673,12 +678,12 @@ impl<S: SignalType> Signals<S> {
             .map(WindowSlot::Pending)
             .or_else(|| search(&self.permanent_joining).map(WindowSlot::Joining))
             .or_else(|| {
-                let (c, i) = find_in_chunks(&self.transitory_active, id)?;
-                Some(WindowSlot::Active(c, i))
+                let (c, i) = find_in_chunks(&self.transitory_running, id)?;
+                Some(WindowSlot::Running(c, i))
             })
             .or_else(|| {
-                let (c, i) = find_in_chunks(&self.transitory_inactive, id)?;
-                Some(WindowSlot::Inactive(c, i))
+                let (c, i) = find_in_chunks(&self.transitory_waiting, id)?;
+                Some(WindowSlot::Waiting(c, i))
             })
     }
 
@@ -686,8 +691,8 @@ impl<S: SignalType> Signals<S> {
         match *slot {
             WindowSlot::Pending(i) => &mut self.transitory_pending[i],
             WindowSlot::Joining(i) => &mut self.permanent_joining[i],
-            WindowSlot::Active(c, i) => &mut self.transitory_active[c].entries[i],
-            WindowSlot::Inactive(c, i) => &mut self.transitory_inactive[c].entries[i],
+            WindowSlot::Running(c, i) => &mut self.transitory_running[c].entries[i],
+            WindowSlot::Waiting(c, i) => &mut self.transitory_waiting[c].entries[i],
         }
     }
 
@@ -697,7 +702,7 @@ impl<S: SignalType> Signals<S> {
             .or_else(|| Some(search(&self.permanent[self.permanent_read..])? + self.permanent_read))
     }
 
-    pub fn modify(&mut self, id: u64, f: impl FnOnce(&mut S)) -> bool {
+    pub(crate) fn modify(&mut self, id: u64, f: impl FnOnce(&mut S)) -> bool {
         if let Some(i) = self.find_permanent(id) {
             if self.permanent_cancelled_bits.get(i) {
                 return false;
@@ -730,7 +735,7 @@ impl<S: SignalType> Signals<S> {
         false
     }
 
-    pub fn cancel(&mut self, id: u64) -> bool {
+    pub(crate) fn cancel(&mut self, id: u64) -> bool {
         if let Some(i) = self.find_permanent(id) {
             if self.permanent_cancelled_bits.get(i) {
                 return false;
@@ -746,20 +751,20 @@ impl<S: SignalType> Signals<S> {
             if window.is_cancelled() {
                 return false;
             }
-            window.start = u64::MAX;
+            window.cancel();
             found = true;
 
-            if let WindowSlot::Active(c, _) | WindowSlot::Inactive(c, _) = slot {
-                let active = matches!(slot, WindowSlot::Active(..));
-                let chunks = match active {
-                    true => &mut self.transitory_active,
-                    false => &mut self.transitory_inactive,
+            if let WindowSlot::Running(c, _) | WindowSlot::Waiting(c, _) = slot {
+                let running = matches!(slot, WindowSlot::Running(..));
+                let chunks = match running {
+                    true => &mut self.transitory_running,
+                    false => &mut self.transitory_waiting,
                 };
                 let chunk = &mut chunks[c];
                 chunk.cancelled += 1;
                 if !chunk.due && chunk.cancelled * 2 > chunk.live().len() as u64 {
                     chunk.due = true;
-                    self.transitory_compact.push((active, chunk.key));
+                    self.transitory_compact.push((running, chunk.key));
                 }
             }
         }
@@ -775,7 +780,7 @@ impl<S: SignalType> Signals<S> {
     }
 
     pub(crate) fn pending(&self, data: &SignalData<S>, system: u128, tick: u64) -> bool {
-        let running = !self.transitory_active.is_empty()
+        let running = !self.transitory_running.is_empty()
             || !self.permanent_joining.is_empty()
             || self.permanent_write > 0
             || self.permanent_read < self.permanent.len();
@@ -793,7 +798,7 @@ impl<S: SignalType> Signals<S> {
     }
 
     #[inline(always)]
-    pub fn receive<'a, K: Fn(&S) -> bool>(
+    pub(crate) fn receive<'a, K: Fn(&S) -> bool>(
         &'a self,
         data: &mut SignalData<S>,
         system: u128,
@@ -835,7 +840,7 @@ impl<S: SignalType> Signals<S> {
             stage: ReceiveStage::TransientBuffer,
             transient_buffer,
             entries: [].iter(),
-            active: &self.transitory_active,
+            running: &self.transitory_running,
             joining: &self.permanent_joining,
             permanent: &self.permanent,
             write: self.permanent_write,
@@ -845,7 +850,7 @@ impl<S: SignalType> Signals<S> {
             keep,
         };
         if !windows {
-            iter.active = &[];
+            iter.running = &[];
             iter.joining = &[];
             iter.permanent = &[];
             iter.write = 0;
@@ -936,16 +941,16 @@ impl<S: SignalType> Signals<S> {
         });
     }
 
-    fn expire_active(&mut self, next_tick: u64) {
+    fn expire_running(&mut self, next_tick: u64) {
         let key = chunk_key(next_tick);
         let expired = self
-            .transitory_active
+            .transitory_running
             .partition_point(|chunk| chunk.key < key);
-        for chunk in self.transitory_active.drain(..expired) {
+        for chunk in self.transitory_running.drain(..expired) {
             recycle(&mut self.window_spare, chunk.entries);
         }
 
-        let Some(chunk) = self.transitory_active.first_mut() else {
+        let Some(chunk) = self.transitory_running.first_mut() else {
             return;
         };
         let through = chunk_bits_through(next_tick);
@@ -970,16 +975,16 @@ impl<S: SignalType> Signals<S> {
         }
         chunk.ticks &= !through;
         if chunk.is_empty() {
-            let chunk = self.transitory_active.remove(0);
+            let chunk = self.transitory_running.remove(0);
             recycle(&mut self.window_spare, chunk.entries);
         }
     }
 
     fn compact_cancelled(&mut self) {
-        for (active, key) in std::mem::take(&mut self.transitory_compact) {
-            let chunks = match active {
-                true => &mut self.transitory_active,
-                false => &mut self.transitory_inactive,
+        for (running, key) in std::mem::take(&mut self.transitory_compact) {
+            let chunks = match running {
+                true => &mut self.transitory_running,
+                false => &mut self.transitory_waiting,
             };
             let Ok(c) = chunks.binary_search_by_key(&key, |chunk| chunk.key) else {
                 continue;
@@ -997,11 +1002,11 @@ impl<S: SignalType> Signals<S> {
         }
     }
 
-    fn start_inactive(&mut self, next_tick: u64, started: &mut Vec<WindowEntry<S>>) {
+    fn start_waiting(&mut self, next_tick: u64, started: &mut Vec<WindowEntry<S>>) {
         let key = chunk_key(next_tick);
         let through = chunk_bits_through(next_tick);
 
-        while let Some(chunk) = self.transitory_inactive.first_mut() {
+        while let Some(chunk) = self.transitory_waiting.first_mut() {
             if chunk.key > key || (chunk.key == key && chunk.ticks & through == 0) {
                 break;
             }
@@ -1021,7 +1026,7 @@ impl<S: SignalType> Signals<S> {
             if !chunk.is_empty() {
                 break;
             }
-            let chunk = self.transitory_inactive.remove(0);
+            let chunk = self.transitory_waiting.remove(0);
             recycle(&mut self.window_spare, chunk.entries);
         }
     }
@@ -1038,7 +1043,7 @@ impl<S: SignalType> Signals<S> {
             }
 
             let key = chunk_key(window.start);
-            let chunk = chunk_mut(&mut self.transitory_inactive, &mut self.window_spare, key);
+            let chunk = chunk_mut(&mut self.transitory_waiting, &mut self.window_spare, key);
             chunk.ticks |= chunk_bit(window.start);
             chunk.entries.push(entry);
         }
@@ -1052,7 +1057,7 @@ impl<S: SignalType> Signals<S> {
 
         for group in started.chunk_by(|a, b| chunk_key(a.0.end) == chunk_key(b.0.end)) {
             let key = chunk_key(group[0].0.end);
-            let chunk = chunk_mut(&mut self.transitory_active, &mut self.window_spare, key);
+            let chunk = chunk_mut(&mut self.transitory_running, &mut self.window_spare, key);
             for entry in group {
                 chunk.ticks |= chunk_bit(entry.0.end);
             }
@@ -1067,7 +1072,12 @@ impl<S: SignalType> Signals<S> {
         })
     }
 
-    pub fn cleanup(&mut self, tick: u64, keep: impl Fn(&S) -> bool) {
+    #[doc(hidden)]
+    pub fn permanent_len(&self) -> usize {
+        self.permanent.len()
+    }
+
+    pub(crate) fn cleanup(&mut self, tick: u64, keep: impl Fn(&S) -> bool) {
         std::mem::swap(&mut self.transient, &mut self.transient_buffer);
         self.transient_buffer.clear();
 
@@ -1105,9 +1115,9 @@ impl<S: SignalType> Signals<S> {
             "compaction queue kept after cleanup"
         );
 
-        for (active, chunks) in [
-            (true, &self.transitory_active),
-            (false, &self.transitory_inactive),
+        for (running, chunks) in [
+            (true, &self.transitory_running),
+            (false, &self.transitory_waiting),
         ] {
             assert!(
                 chunks.windows(2).all(|w| w[0].key < w[1].key),
@@ -1126,7 +1136,7 @@ impl<S: SignalType> Signals<S> {
                     live.windows(2).all(|w| w[0].1.id < w[1].1.id),
                     "chunk {key}: out of id order"
                 );
-                if active && chunk.by_end {
+                if running && chunk.by_end {
                     assert!(
                         live.is_sorted_by_key(|e| e.0.end),
                         "chunk {key}: by_end but not in end order"
@@ -1136,7 +1146,7 @@ impl<S: SignalType> Signals<S> {
                 assert_eq!(chunk.cancelled, cancelled, "chunk {key}: cancelled count");
                 for (window, signal) in live {
                     let id = signal.id;
-                    assert!(window.end >= next_tick, "chunk {key}: {id} ended but kept");
+                    assert!(window.end > next_tick, "chunk {key}: {id} ended but kept");
                     if !window.is_cancelled() {
                         assert!(
                             window.start < window.end,
@@ -1144,12 +1154,12 @@ impl<S: SignalType> Signals<S> {
                         );
                         assert_eq!(
                             window.start <= next_tick,
-                            active,
+                            running,
                             "chunk {key}: {id} in the wrong list"
                         );
                     }
-                    if active || !window.is_cancelled() {
-                        let tick = if active { window.end } else { window.start };
+                    if running || !window.is_cancelled() {
+                        let tick = if running { window.end } else { window.start };
                         assert_eq!(chunk_key(tick), key, "chunk {key}: {id} in the wrong chunk");
                         assert!(
                             chunk.ticks & chunk_bit(tick) != 0,
@@ -1210,10 +1220,10 @@ impl<S: SignalType> Signals<S> {
         if !self.transitory_compact.is_empty() {
             self.compact_cancelled();
         }
-        self.expire_active(next_tick);
+        self.expire_running(next_tick);
 
         let mut started = std::mem::take(&mut self.window_started);
-        self.start_inactive(next_tick, &mut started);
+        self.start_waiting(next_tick, &mut started);
         self.place_pending(next_tick, &mut started);
 
         let mut open = Vec::new();
@@ -1258,8 +1268,8 @@ impl<S: SignalType> Signals<S> {
             self.merge_late_permanent(first_new);
         }
 
-        self.transitory_wake = Self::first_bit_tick(&self.transitory_active)
-            .min(Self::first_bit_tick(&self.transitory_inactive));
+        self.transitory_wake = Self::first_bit_tick(&self.transitory_running)
+            .min(Self::first_bit_tick(&self.transitory_waiting));
     }
 }
 
@@ -1284,35 +1294,35 @@ pub fn wake_name<S: SignalType>(names: &mut Vec<&'static str>) {
 
 #[param(write, wake = always)]
 pub struct Signal<S: SignalType> {
-    pub signals: Resource<Signals<S>>,
-    pub data: Resource<SignalData<S>>,
+    signals: Resource<Signals<S>>,
+    data: Resource<SignalData<S>>,
     #[read]
-    pub tick: Resource<Tick>,
+    tick: Resource<Tick>,
     #[read]
-    pub current: Resource<CurrentSystem>,
+    current: Resource<CurrentSystem>,
     #[read]
-    pub world: WorldAccess,
+    world: WorldAccess,
 }
 
 #[param(write, wake = __gate(S))]
 pub struct Receiver<S: SignalType> {
     #[read]
-    pub signals: Resource<Signals<S>>,
-    pub data: Resource<SignalData<S>>,
+    signals: Resource<Signals<S>>,
+    data: Resource<SignalData<S>>,
     #[read]
-    pub tick: Resource<Tick>,
+    tick: Resource<Tick>,
     #[read]
-    pub current: Resource<CurrentSystem>,
+    current: Resource<CurrentSystem>,
     #[read]
-    pub world: WorldAccess,
+    world: WorldAccess,
 }
 
 #[param(write)]
 pub struct Sender<S: SignalType> {
-    pub signals: Resource<Signals<S>>,
-    pub data: Resource<SignalData<S>>,
+    signals: Resource<Signals<S>>,
+    data: Resource<SignalData<S>>,
     #[read]
-    pub tick: Resource<Tick>,
+    tick: Resource<Tick>,
 }
 
 impl<'w, S: SignalType> Signal<'w, S, Write> {
@@ -1409,11 +1419,11 @@ static SWEEP_REGISTRY: Registry<Vec<(u128, fn(&World, u64) -> (u64, bool))>> = R
 static SWEEP_STAMPS: Registry<Vec<(TypeId, fn(&World) -> u64)>> = Registry::new();
 
 #[resource]
-pub struct SweepCursor {
-    pub type_index: usize,
-    pub running: bool,
-    pub woken: bool,
-    pub seen_stamp: u64,
+pub(crate) struct SweepCursor {
+    pub(crate) type_index: usize,
+    pub(crate) running: bool,
+    pub(crate) woken: bool,
+    pub(crate) seen_stamp: u64,
 }
 
 #[doc(hidden)]
@@ -1855,7 +1865,7 @@ mod tests {
             }
 
             let signals = world.get_resource::<Signals<NumSignal>>().unwrap();
-            for chunks in [&signals.transitory_active, &signals.transitory_inactive] {
+            for chunks in [&signals.transitory_running, &signals.transitory_waiting] {
                 assert!(chunks.windows(2).all(|w| w[0].key < w[1].key));
                 for chunk in chunks {
                     assert!(chunk.live().windows(2).all(|w| w[0].1.id < w[1].1.id));
@@ -1865,7 +1875,7 @@ mod tests {
 
         let signals = world.get_resource::<Signals<NumSignal>>().unwrap();
         let active: Vec<u64> = signals
-            .transitory_active
+            .transitory_running
             .iter()
             .flat_map(|chunk| chunk.live().iter().map(|x| x.1.payload.0))
             .collect();
@@ -2081,13 +2091,17 @@ mod tests {
             end_tick(&world);
 
             let signals = world.get_resource::<Signals<NumSignal>>().unwrap();
-            if signals.transitory_active.iter().any(|chunk| chunk.head > 0) {
+            if signals
+                .transitory_running
+                .iter()
+                .any(|chunk| chunk.head > 0)
+            {
                 head_moves += 1;
             }
         }
 
         let signals = world.get_resource::<Signals<NumSignal>>().unwrap();
-        assert!(signals.transitory_active.len() + signals.transitory_inactive.len() > 1);
+        assert!(signals.transitory_running.len() + signals.transitory_waiting.len() > 1);
         head_moves
     }
 
@@ -2570,8 +2584,8 @@ mod tests {
         end_tick(&world);
 
         let signals = world.get_resource::<Signals<NumSignal>>().unwrap();
-        assert!(signals.transitory_active.is_empty());
-        assert!(signals.transitory_inactive.is_empty());
+        assert!(signals.transitory_running.is_empty());
+        assert!(signals.transitory_waiting.is_empty());
     }
 
     #[test]
@@ -2586,7 +2600,7 @@ mod tests {
 
         let live = |world: &World| {
             let signals = world.get_resource::<Signals<NumSignal>>().unwrap();
-            signals.transitory_active[0].live().len()
+            signals.transitory_running[0].live().len()
         };
         assert_eq!(live(&world), 10);
         assert_eq!(receive(&world), vec![5, 6, 7, 8, 9]);
@@ -2653,8 +2667,8 @@ mod tests {
         end_tick(&world);
         let signals = world.get_resource::<Signals<NumSignal>>().unwrap();
         assert!(signals.permanent_joining.is_empty());
-        assert!(signals.transitory_active.is_empty());
-        assert!(signals.transitory_inactive.is_empty());
+        assert!(signals.transitory_running.is_empty());
+        assert!(signals.transitory_waiting.is_empty());
         assert_eq!(signals.permanent.len(), 1);
     }
 
@@ -3684,11 +3698,18 @@ mod tests {
                         signals.pending(&data, system, tick)
                     };
                     world.get_resource_mut::<CurrentSystem>().unwrap().0 = system;
-                    let mut received: Vec<(u64, u64)> = world
-                        .signal::<Tagged>()
-                        .receive()
-                        .map(|signal| (signal.0.to_bits(), signal.1))
-                        .collect();
+                    let mut received: Vec<(u64, u64)> = Vec::new();
+                    let mut signals = world.signal::<Tagged>();
+                    if run.receives % 2 == 0 {
+                        for signal in signals.receive() {
+                            received.push((signal.0.to_bits(), signal.1));
+                        }
+                    } else {
+                        signals
+                            .receive()
+                            .for_each(|signal| received.push((signal.0.to_bits(), signal.1)));
+                    }
+                    drop(signals);
                     world.get_resource_mut::<CurrentSystem>().unwrap().0 = 0;
                     received.sort();
                     assert_eq!(
