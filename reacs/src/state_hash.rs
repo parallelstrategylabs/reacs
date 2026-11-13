@@ -77,11 +77,11 @@ impl StateHasher {
 
     fn write_bytes(&mut self, bytes: &[u8]) {
         self.write(bytes.len() as u64, 64);
-        let mut chunks = bytes.chunks_exact(8);
-        for chunk in &mut chunks {
-            self.write(u64::from_le_bytes(chunk.try_into().unwrap()), 64);
+        let (chunks, remainder) = bytes.as_chunks::<8>();
+        for chunk in chunks {
+            self.write(u64::from_le_bytes(*chunk), 64);
         }
-        for byte in chunks.remainder() {
+        for byte in remainder {
             self.write(*byte as u64, 8);
         }
     }

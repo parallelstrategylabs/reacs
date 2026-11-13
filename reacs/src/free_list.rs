@@ -49,9 +49,9 @@ impl FreeList {
             let marked = self.full[w >> 6] >> (w & 63) & 1 == 1;
             assert_eq!(marked, word == !0u64, "summary bit of word {w}");
         }
-        for s in 0..self.first_open {
+        for (s, &summary) in self.full[..self.first_open].iter().enumerate() {
             assert_eq!(
-                self.full[s], !0u64,
+                summary, !0u64,
                 "free index below first_open in summary word {s}"
             );
         }
