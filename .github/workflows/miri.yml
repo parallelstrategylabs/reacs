@@ -1,0 +1,34 @@
+name: Miri
+
+# Runs every test under Miri to catch undefined behaviour in `unsafe` code.
+# Manual only (`gh workflow run Miri`): it takes many runner minutes, so run it before a release
+# or after changing `unsafe` code. One job per module, since one process for everything takes hours.
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-ignore-leaks
+
+jobs:
+  miri:
+    name: miri (${{ matrix.tests }})
+    strategy:
+      fail-fast: false
+      matrix:
+        tests: [ bit_set, component, direct_map, entity, free_list, index_map, record, registry,
+                 resource, schedule, signal, state_hash, world, external ]
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install nightly Rust with Miri
+      run: rustup toolchain install nightly --profile minimal --component miri && cargo +nightly miri setup
+    - name: Run the module's inline tests
+      if: matrix.tests != 'external'
+      run: cargo +nightly miri test -p reacs --lib ${{ matrix.tests }}::
+    - name: Run the external test binaries
+      if: matrix.tests == 'external'
+      run: cargo +nightly miri test -p reacs-external-tests --tests

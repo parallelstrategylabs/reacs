@@ -1,5 +1,7 @@
 name: Rust
 
+# Pushes to main run the cheap checks and the tests on 64-bit and 32-bit Linux.
+# Pull requests, manual runs (`gh workflow run Rust`) and `v*` tags add Windows and macOS.
 on:
   push:
     branches: [ "main" ]
@@ -18,11 +20,41 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  fmt:
+    name: check rustfmt
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install stable Rust
+      run: rustup update stable && rustup default stable && rustup component add rustfmt
+    - run: cargo fmt --all --check
+
+  clippy:
+    name: check clippy
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install stable Rust
+      run: rustup update stable && rustup default stable && rustup component add clippy
+    - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  docs:
+    name: check docs
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install stable Rust
+      run: rustup update stable && rustup default stable
+    - run: cargo doc --workspace --no-deps
+
   test:
+    name: test (${{ matrix.target }})
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) && fromJSON('["ubuntu-latest", "windows-latest", "macos-latest"]') || fromJSON('["ubuntu-latest"]') }}
+        include: ${{ fromJSON((github.event_name != 'push' || startsWith(github.ref, 'refs/tags/')) && '[{"os":"ubuntu-latest","target":"x86_64-unknown-linux-gnu"},{"os":"ubuntu-latest","target":"i686-unknown-linux-gnu"},{"os":"windows-latest","target":"x86_64-pc-windows-msvc"},{"os":"macos-latest","target":"aarch64-apple-darwin"}]' || '[{"os":"ubuntu-latest","target":"x86_64-unknown-linux-gnu"},{"os":"ubuntu-latest","target":"i686-unknown-linux-gnu"}]') }}
 
     runs-on: ${{ matrix.os }}
 
@@ -32,38 +64,41 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Install stable Rust
-      run: rustup update stable && rustup default stable
-    - name: Build
-      run: cargo build --workspace --verbose
+      run: rustup update stable && rustup default stable && rustup target add ${{ matrix.target }}
+    - name: Install the 32-bit C libraries
+      if: matrix.target == 'i686-unknown-linux-gnu'
+      run: sudo apt-get update && sudo apt-get install -y gcc-multilib
     - name: Run tests
-      run: cargo test --workspace --verbose
+      run: cargo test --workspace --target ${{ matrix.target }} --verbose
     - name: Run tests (release)
-      run: cargo test --workspace --release --verbose
+      run: cargo test --workspace --target ${{ matrix.target }} --release --verbose
     - name: Upload the session hashes
       uses: actions/upload-artifact@v4
       with:
-        name: determinism-${{ matrix.os }}
+        name: determinism-${{ matrix.target }}
         path: determinism/
         retention-days: 7
 
   determinism:
     needs: test
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    env:
+      EXPECTED_FILES: ${{ (github.event_name != 'push' || startsWith(github.ref, 'refs/tags/')) && 8 || 4 }}
 
     steps:
     - uses: actions/download-artifact@v4
       with:
         pattern: determinism-*
         path: determinism
-    - name: Compare the session hashes of every OS and build
+    - name: Compare the session hashes of every target and build
       shell: python3 {0}
       run: |
-        import pathlib, sys
+        import os, pathlib, sys
         files = sorted(pathlib.Path("determinism").rglob("*.txt"))
         print("\n".join(str(f) for f in files))
-        if len(files) != 6:
-            sys.exit(f"expected 6 files (3 OSes, debug and release), found {len(files)}")
+        expected = int(os.environ["EXPECTED_FILES"])
+        if len(files) != expected:
+            sys.exit(f"expected {expected} files (debug and release per target), found {len(files)}")
         reference = files[0].read_text().splitlines()
         failed = False
         for f in files[1:]:
@@ -84,4 +119,4 @@ jobs:
                     failed = True
         if failed:
             sys.exit(1)
-        print("every OS and build gave the same hashes on every tick")
+        print("every target and build gave the same hashes on every tick")
