@@ -36,6 +36,72 @@ fn linked_crates() -> proc_macro2::TokenStream {
     quote! { #( use #names as _; )* }
 }
 
+fn attr_named<'a>(attrs: &'a [syn::Attribute], names: &[&str]) -> Option<&'a syn::Attribute> {
+    attrs.iter().find(|attr| {
+        attr.path()
+            .segments
+            .last()
+            .is_some_and(|segment| names.iter().any(|name| segment.ident == name))
+    })
+}
+
+const DATA_DERIVES: &[&str] = &["Clone", "Copy", "Default", "Serialize", "Deserialize"];
+const TYPE_DERIVES: &[&str] = &[
+    "Clone",
+    "Copy",
+    "Default",
+    "Hashed",
+    "DeriveHashed",
+    "Serialize",
+    "Deserialize",
+];
+const RESOURCE_DERIVES: &[&str] = &[
+    "Default",
+    "Hashed",
+    "DeriveHashed",
+    "Serialize",
+    "Deserialize",
+];
+
+fn derived_path(attrs: &[syn::Attribute], names: &[&str]) -> Option<Path> {
+    let parser = syn::punctuated::Punctuated::<Path, syn::Token![,]>::parse_terminated;
+    attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("derive"))
+        .filter_map(|attr| attr.parse_args_with(parser).ok())
+        .flatten()
+        .find(|path| {
+            path.segments
+                .last()
+                .is_some_and(|last| names.iter().any(|name| last.ident == name))
+        })
+}
+
+fn reject_derives(
+    attrs: &[syn::Attribute],
+    macro_name: &str,
+    derived: &[&str],
+) -> Option<TokenStream> {
+    let path = derived_path(attrs, derived)?;
+    let name = &path.segments.last()?.ident;
+    let message = format!("remove `{name}` from this derive: {macro_name} already derives it");
+    Some(
+        syn::Error::new(path.span(), message)
+            .to_compile_error()
+            .into(),
+    )
+}
+
+fn reject_data(attrs: &[syn::Attribute], macro_name: &str) -> Option<TokenStream> {
+    let attr = attr_named(attrs, &["data"])?;
+    let message = format!("remove #[data]: {macro_name} already makes this type serializable");
+    Some(
+        syn::Error::new(attr.span(), message)
+            .to_compile_error()
+            .into(),
+    )
+}
+
 #[proc_macro]
 pub fn world(input: TokenStream) -> TokenStream {
     parse_macro_input!(input as syn::parse::Nothing);
@@ -118,6 +184,26 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as DeriveInput);
     let name = &input.ident;
 
+    if let Some(attr) = attr_named(&input.attrs, &["data"]) {
+        let message = if local {
+            "remove #[data]: a local resource is never saved, so it doesn't need serde"
+        } else {
+            "remove #[data]: #[resource] already makes this type serializable"
+        };
+        return syn::Error::new(attr.span(), message)
+            .to_compile_error()
+            .into();
+    }
+
+    let derived = if local {
+        reject_derives(&input.attrs, "#[resource(local)]", &["Default"])
+    } else {
+        reject_derives(&input.attrs, "#[resource]", RESOURCE_DERIVES)
+    };
+    if let Some(error) = derived {
+        return error;
+    }
+
     if !input.generics.params.is_empty() {
         let message = if local {
             "#[resource(local)] does not support generic resources"
@@ -182,6 +268,12 @@ pub fn component(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as DeriveInput);
     let name = &input.ident;
 
+    if let Some(error) = reject_data(&input.attrs, "#[component]")
+        .or_else(|| reject_derives(&input.attrs, "#[component]", TYPE_DERIVES))
+    {
+        return error;
+    }
+
     if !input.generics.params.is_empty() {
         return syn::Error::new(
             input.generics.span(),
@@ -219,6 +311,205 @@ pub fn component(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     TokenStream::from(expanded)
+}
+
+/// Makes your own type usable as a field of components, signals and resources.
+///
+/// Everything in a world is saved, loaded and hashed, so every field type must implement serde's
+/// `Serialize` and `Deserialize`. `#[component]`, `#[signal]` and `#[resource]` derive them for the
+/// types they declare, but a type used as a field, like an enum or a small struct, needs them too.
+/// `#[data]` derives both through reacs, so your crate doesn't need serde as a dependency.
+///
+/// The macro derives `Clone`, `Copy`, `Default`, `Serialize` and `Deserialize`, like `#[component]`
+/// and `#[signal]`, so don't derive them yourself; other derives, like `PartialEq` or `Debug`, are
+/// fine. An enum needs `#[default]` on one variant. Generic types are supported, and so are serde's
+/// field attributes.
+///
+/// A field marked `#[serde(skip)]` isn't saved or hashed: after a load it holds its `Default`
+/// value. Like a local resource, it may only hold a cache the simulation can rebuild. If game logic
+/// reads it, a loaded world or a replay gives different results, and recorded hashes only notice
+/// once the difference reaches saved data.
+///
+/// `#[data(no_copy)]` leaves out `Copy`, for types holding a `Vec`, a `String` or an `IndexMap`.
+/// Components and signals must be `Copy`, so those types can only be used in resources.
+///
+/// Types declared with `#[component]`, `#[signal]` or `#[resource]` are already serializable and
+/// can be used as fields without `#[data]`. A type from another crate, like a math library's
+/// vector, can't take `#[data]`; it works as a field when that crate implements serde, usually
+/// behind a `serde` feature you enable in your `Cargo.toml`.
+///
+/// Changing a `#[data]` type, like adding or reordering enum variants, changes what saved data
+/// means, just as changing a component does: raise the app version (`World::set_app_version`) in
+/// that release.
+///
+/// # Compile errors
+///
+/// `#[data]` together with `#[component]`, `#[signal]` or `#[resource]` on the same type is an
+/// error, since those already derive serde (a local resource is never saved and doesn't need it).
+/// So is deriving a trait `#[data]` already derives, or `Copy` with `no_copy`.
+///
+/// A field type without `#[data]` fails to compile with errors saying it doesn't implement
+/// `Serialize`, `Deserialize`, `Default`, `Clone` or `Copy`. The compiler suggests deriving those
+/// traits; with reacs, add `#[data]` instead.
+///
+/// # Examples
+///
+/// ```standalone_crate
+/// use reacs::prelude::*;
+///
+/// #[data]
+/// #[derive(PartialEq, Debug)]
+/// enum Element {
+///     #[default]
+///     Fire,
+///     Ice,
+/// }
+///
+/// #[data]
+/// struct Hit {
+///     element: Element,
+///     amount: i32,
+/// }
+///
+/// #[component]
+/// struct Weakness(Element);
+///
+/// #[signal(entity)]
+/// struct Damage {
+///     target: Entity,
+///     hit: Hit,
+/// }
+///
+/// #[resource]
+/// struct Log {
+///     hits: Vec<Hit>,
+/// }
+///
+/// #[system]
+/// fn take_damage(
+///     mut damage: Mut<Receiver<Damage>>,
+///     weakness: Component<Weakness>,
+///     mut log: Mut<Resource<Log>>,
+/// ) {
+///     for damage in damage.receive() {
+///         let mut hit = damage.hit;
+///         if weakness.get(damage.target).is_some_and(|weak| weak.0 == hit.element) {
+///             hit.amount *= 2;
+///         }
+///         log.hits.push(hit);
+///     }
+/// }
+///
+/// fn main() {
+///     let mut world = World::build(|setup| {
+///         let ship = setup.spawn();
+///         setup.set_component(ship, Weakness(Element::Ice));
+///         let hit = Hit { element: Element::Ice, amount: 5 };
+///         setup.signal::<Damage>().emit(Damage { target: ship, hit });
+///     });
+///     world.step();
+///
+///     let save = world.save();
+///     world.load(&save);
+///     let hit = world.get_resource::<Log>().unwrap().hits[0];
+///     assert_eq!((hit.element, hit.amount), (Element::Ice, 10));
+/// }
+/// ```
+///
+/// A type holding a `Vec`, used in a resource:
+///
+/// ```standalone_crate
+/// use reacs::prelude::*;
+///
+/// #[data(no_copy)]
+/// struct Squad {
+///     members: Vec<Entity>,
+/// }
+///
+/// #[resource]
+/// struct Army {
+///     squads: IndexMap<u32, Squad>,
+/// }
+///
+/// fn main() {
+///     let mut world = World::build(|setup| {
+///         let soldier = setup.spawn();
+///         let squad = Squad { members: vec![soldier] };
+///         setup.insert_resource(Army { squads: IndexMap::from([(7, squad)]) });
+///     });
+///
+///     let save = world.save();
+///     world.load(&save);
+///     assert_eq!(world.get_resource::<Army>().unwrap().squads[&7].members.len(), 1);
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn data(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let mut no_copy = false;
+    let attr_parser = syn::meta::parser(|meta| {
+        if meta.path.is_ident("no_copy") {
+            no_copy = true;
+            Ok(())
+        } else {
+            Err(meta.error("unsupported #[data] argument, expected `no_copy`"))
+        }
+    });
+    parse_macro_input!(attr with attr_parser);
+    let input = parse_macro_input!(item as DeriveInput);
+
+    if let Some(attr) = attr_named(&input.attrs, &["component", "signal", "resource"]) {
+        let name = attr.path().segments.last().unwrap().ident.to_string();
+        let local = matches!(&attr.meta, syn::Meta::List(list)
+            if list.tokens.clone().into_iter().any(|token| token.to_string() == "local"));
+        let message = if local {
+            "remove #[data]: a local resource is never saved, so it doesn't need serde".to_string()
+        } else {
+            format!("remove #[data]: #[{name}] already makes this type serializable")
+        };
+        return syn::Error::new(proc_macro2::Span::call_site(), message)
+            .to_compile_error()
+            .into();
+    }
+
+    let derived = if no_copy {
+        let copy = derived_path(&input.attrs, &["Copy"]).map(|path| {
+            let message = "remove `Copy` from this derive, or `no_copy` from #[data]";
+            syn::Error::new(path.span(), message)
+                .to_compile_error()
+                .into()
+        });
+        copy.or_else(|| {
+            reject_derives(
+                &input.attrs,
+                "#[data(no_copy)]",
+                &["Clone", "Default", "Serialize", "Deserialize"],
+            )
+        })
+    } else {
+        reject_derives(&input.attrs, "#[data]", DATA_DERIVES)
+    };
+    if let Some(error) = derived {
+        return error;
+    }
+
+    let copy = (!no_copy).then(|| quote! { ::core::marker::Copy, });
+    let link = linked_crates();
+
+    TokenStream::from(quote! {
+        #[derive(
+            ::core::clone::Clone,
+            #copy
+            ::core::default::Default,
+            ::reacs::__private::serde::Serialize,
+            ::reacs::__private::serde::Deserialize,
+        )]
+        #[serde(crate = "::reacs::__private::serde")]
+        #input
+
+        const _: () = {
+            #link
+        };
+    })
 }
 
 #[proc_macro_attribute]
@@ -356,6 +647,12 @@ pub fn signal(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let input = parse_macro_input!(item as DeriveInput);
     let name = &input.ident;
+
+    if let Some(error) = reject_data(&input.attrs, "#[signal]")
+        .or_else(|| reject_derives(&input.attrs, "#[signal]", TYPE_DERIVES))
+    {
+        return error;
+    }
 
     if !input.generics.params.is_empty() {
         return syn::Error::new(

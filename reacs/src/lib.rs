@@ -40,7 +40,7 @@ pub mod prelude {
     pub use crate::world::World;
 
     pub use reacs_derive::{
-        Hashed as DeriveHashed, component, param, resource, signal, system, world,
+        Hashed as DeriveHashed, component, data, param, resource, signal, system, world,
     };
 }
 
