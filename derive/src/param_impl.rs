@@ -17,7 +17,7 @@ enum Modes {
 
 enum WakeArg {
     Always,
-    Gate(Type),
+    Gate(Box<Type>),
 }
 
 struct ParamArgs {
@@ -50,7 +50,7 @@ impl Parse for ParamArgs {
                         "__gate" => {
                             let content;
                             syn::parenthesized!(content in input);
-                            WakeArg::Gate(content.parse()?)
+                            WakeArg::Gate(Box::new(content.parse()?))
                         }
                         _ => return Err(syn::Error::new(kind.span(), PARAM_ARGS)),
                     });

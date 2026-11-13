@@ -33,7 +33,7 @@ impl<S> SignalFilter<S> for NoFilter {
     type Context<'w> = ();
 
     #[inline]
-    fn fetch<'w>(_world: &'w World) {}
+    fn fetch(_world: &World) {}
 
     #[inline]
     fn keep(_context: &(), _signal: &S) -> bool {
@@ -1414,9 +1414,16 @@ impl<'w, S: SignalType> Sender<'w, S, Write> {
 
 static SIGNAL_REGISTRY: Registry<Vec<fn(&World)>> = Registry::new();
 
-static SWEEP_REGISTRY: Registry<Vec<(u128, fn(&World, u64) -> (u64, bool))>> = Registry::new();
+/// Sweeps one filtered signal type for at most `budget`; returns the budget used and whether the
+/// lap finished.
+type SweepFn = fn(&World, u64) -> (u64, bool);
 
-static SWEEP_STAMPS: Registry<Vec<(TypeId, fn(&World) -> u64)>> = Registry::new();
+/// Reads a filter's stamp, which changes when signals may have started failing it.
+type StampFn = fn(&World) -> u64;
+
+static SWEEP_REGISTRY: Registry<Vec<(u128, SweepFn)>> = Registry::new();
+
+static SWEEP_STAMPS: Registry<Vec<(TypeId, StampFn)>> = Registry::new();
 
 #[resource]
 pub(crate) struct SweepCursor {
@@ -1452,11 +1459,11 @@ pub fn register_signal<S: SignalType>() {
 )]
 pub trait InputSignal: SignalType {}
 
-fn get_registered_sweeps() -> &'static [(u128, fn(&World, u64) -> (u64, bool))] {
+fn get_registered_sweeps() -> &'static [(u128, SweepFn)] {
     SWEEP_REGISTRY.get()
 }
 
-fn get_registered_stamps() -> &'static [(TypeId, fn(&World) -> u64)] {
+fn get_registered_stamps() -> &'static [(TypeId, StampFn)] {
     SWEEP_STAMPS.get()
 }
 
@@ -1526,10 +1533,11 @@ fn cleanup_in_world<S: SignalType>(world: &World) {
             .is_none_or(|context| S::Filter::keep(context, signal))
     });
 
-    if S::Filter::ACTIVE && signals.permanent_cancelled > 0 {
-        if let Some(mut cursor) = world.get_resource_mut::<SweepCursor>() {
-            cursor.woken = true;
-        }
+    if S::Filter::ACTIVE
+        && signals.permanent_cancelled > 0
+        && let Some(mut cursor) = world.get_resource_mut::<SweepCursor>()
+    {
+        cursor.woken = true;
     }
 
     #[cfg(any(test, feature = "invariants"))]
@@ -1618,7 +1626,7 @@ mod tests {
         (0..ticks)
             .map(|_| {
                 let r = receive(world);
-                end_tick(&world);
+                end_tick(world);
                 r
             })
             .collect()
@@ -2218,7 +2226,7 @@ mod tests {
 
         a.run(&mut world);
         assert_eq!(take_a(&world), vec![1]);
-        assert_eq!((*world.get_resource::<CurrentSystem>().unwrap()).0, 0);
+        assert_eq!(world.get_resource::<CurrentSystem>().unwrap().0, 0);
 
         world.signal::<NumSignal>().emit(NumSignal(2));
         assert_eq!(receive(&world), vec![2]);
@@ -2820,7 +2828,7 @@ mod tests {
     #[test]
     fn sweep_drops_failed_signals_across_ticks_and_keeps_order() {
         let world = permanent_world(6);
-        let even = |s: &NumSignal| s.0 % 2 == 0;
+        let even = |s: &NumSignal| s.0.is_multiple_of(2);
 
         assert_eq!(sweep(&world, 2, even), (2, false));
         assert_eq!(sweep(&world, 2, even), (2, false));
@@ -3517,9 +3525,9 @@ mod tests {
 
     fn receive_by_next(world: &World) -> Vec<u64> {
         let mut signal = world.signal::<NumSignal>();
-        let mut received = signal.receive();
+        let received = signal.receive();
         let mut payloads = Vec::new();
-        while let Some(s) = received.next() {
+        for s in received {
             payloads.push(s.0);
         }
         payloads
@@ -3676,9 +3684,7 @@ mod tests {
                     }
                 }
             }
-            for _ in 0..random(12) {
-                events.push(RECEIVERS);
-            }
+            events.extend(std::iter::repeat_n(RECEIVERS, random(12) as usize));
             for i in (1..events.len()).rev() {
                 events.swap(i, random(i as u64 + 1) as usize);
             }

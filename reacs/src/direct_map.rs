@@ -21,7 +21,7 @@ impl<T: Copy + Default> DirectMap<T> {
 
     #[inline]
     pub fn get(&self, key: usize) -> Option<&T> {
-        self.has(key).then(|| &self.values[key as usize])
+        self.has(key).then(|| &self.values[key])
     }
 
     #[inline]

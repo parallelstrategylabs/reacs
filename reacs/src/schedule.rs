@@ -337,10 +337,10 @@ impl SystemGraph {
             .unwrap_or_else(|| conflict::<Tick>())
             .0;
         for system in self.iter() {
-            if let Some(wake) = system.wake_fn {
-                if !wake(ParamWorld(world), system.uuid, tick) {
-                    continue;
-                }
+            if let Some(wake) = system.wake_fn
+                && !wake(ParamWorld(world), system.uuid, tick)
+            {
+                continue;
             }
             system.run(world);
         }
@@ -437,6 +437,8 @@ macro_rules! impl_into_system_tuples {
                     }),
 
                     run_fn: Box::new(move |world: &mut World| {
+                        // One argument per system param, so the bigger tuples pass more than 7.
+                        #[allow(clippy::too_many_arguments)]
                         fn call_inner<$($param),*>(
                             f: impl Fn($($param),*),
                             $($param: $param),*
@@ -766,8 +768,8 @@ mod tests {
             res_int: Resource<IntResource>,
             res_bool: Resource<BoolResource>,
         ) {
-            (*res_custom).value = (*res_int).0 as i32;
-            (*res_custom).active = (*res_bool).0;
+            res_custom.value = (*res_int).0 as i32;
+            res_custom.active = (*res_bool).0;
         }
 
         let mut world = World::new();
@@ -777,8 +779,8 @@ mod tests {
         three_param_system.into_system().run(&mut world);
 
         let custom = world.get_resource::<CustomResource>().unwrap();
-        assert_eq!((*custom).value, 7);
-        assert!((*custom).active);
+        assert_eq!(custom.value, 7);
+        assert!(custom.active);
     }
 
     #[resource]

@@ -64,6 +64,9 @@ impl FreeList {
         let words = &mut self.bitset.words;
         let full = &mut self.full;
 
+        // `s` also numbers the summary word, to find the bitset word `w`; this is measured spawn
+        // code, so it keeps the indexed loop clippy would turn into an iterator.
+        #[allow(clippy::needless_range_loop)]
         for s in self.first_open..full.len() {
             let summary = full[s];
             if summary != !0u64 {

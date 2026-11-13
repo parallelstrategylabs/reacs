@@ -168,7 +168,7 @@ mod tests {
         write_system.into_system().run(&mut world);
 
         let res = world.get_resource::<IntResource>();
-        assert_eq!((*res.unwrap()).0, 234);
+        assert_eq!(res.unwrap().0, 234);
     }
 
     #[resource(local)]

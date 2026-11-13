@@ -67,10 +67,10 @@ fn burn_control(
     for request in open.receive() {
         (*id).0 = burns.send(Burn(request.0), ..);
     }
-    if close.receive().next().is_some() {
-        if let Some(open) = (*id).0.take() {
-            burns.cancel(open);
-        }
+    if close.receive().next().is_some()
+        && let Some(open) = (*id).0.take()
+    {
+        burns.cancel(open);
     }
 }
 

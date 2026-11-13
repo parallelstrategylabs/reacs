@@ -244,7 +244,7 @@ impl Recorder {
             }
         }
 
-        let hashes = (tick % self.hash_every == 0).then(|| {
+        let hashes = tick.is_multiple_of(self.hash_every).then(|| {
             let (ids, values): (Vec<u128>, Vec<u64>) = world.resource_hashes().into_iter().unzip();
             let table = (ids != self.table).then(|| {
                 self.table.clone_from(&ids);
@@ -1189,7 +1189,7 @@ mod tests {
             Some(Record::End { ended: Some(5) })
         ));
         assert_eq!(full.sections[0].end, 6);
-        let start = bytes.len() - records.iter().map(|x| encoded_len(x)).sum::<usize>();
+        let start = bytes.len() - records.iter().map(encoded_len).sum::<usize>();
         assert!(start > header.state_len as usize);
 
         let mut truncated = 0;

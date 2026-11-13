@@ -78,10 +78,10 @@ impl<C: Copy + Default> ComponentMap<C> {
     #[inline]
     pub(crate) fn remove(&mut self, entity: Entity) {
         let generation = entity.generation();
-        if let Some(slot) = self.slots.get_mut(entity.index() as usize) {
-            if slot.generation == generation {
-                slot.generation = EMPTY;
-            }
+        if let Some(slot) = self.slots.get_mut(entity.index() as usize)
+            && slot.generation == generation
+        {
+            slot.generation = EMPTY;
         }
     }
 }
@@ -498,10 +498,10 @@ mod tests {
             if index >= self.slots.len() {
                 self.slots.resize(index + 1, None);
             }
-            if let Some((newest, _)) = self.slots[index] {
-                if newest.wrapping_sub(generation) as i32 > 0 {
-                    return;
-                }
+            if let Some((newest, _)) = self.slots[index]
+                && newest.wrapping_sub(generation) as i32 > 0
+            {
+                return;
             }
             self.slots[index] = Some((generation, value));
         }
@@ -518,15 +518,15 @@ mod tests {
 
         fn increment(&mut self, entity: Entity) {
             let index = entity.index() as usize;
-            if self.is_current(entity) {
-                if let Some(value) = &mut self.owned[index] {
-                    *value += 1;
-                }
+            if self.is_current(entity)
+                && let Some(value) = &mut self.owned[index]
+            {
+                *value += 1;
             }
-            if self.slot(entity).is_some() {
-                if let Some((_, value)) = &mut self.slots[index] {
-                    *value += 1;
-                }
+            if self.slot(entity).is_some()
+                && let Some((_, value)) = &mut self.slots[index]
+            {
+                *value += 1;
             }
         }
     }

@@ -47,6 +47,14 @@ pub struct World {
 
 static WORLDS: AtomicU64 = AtomicU64::new(0);
 
+impl Default for World {
+    /// Creates a world with [`World::new`].
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl World {
     #[inline]
     pub fn new() -> Self {
@@ -93,7 +101,7 @@ impl World {
         let id = R::TYPE_UUID;
         let search_result = self.resources.binary_search_by(|x| x.0.cmp(&id));
 
-        if let Some(i) = search_result.ok() {
+        if let Ok(i) = search_result {
             self.resources.remove(i);
         }
 
@@ -379,7 +387,7 @@ mod tests {
             .get_resource::<IntResource>()
             .expect("Resource not initialized!");
 
-        assert_eq!((*value).0, 78);
+        assert_eq!(value.0, 78);
     }
 
     #[resource]

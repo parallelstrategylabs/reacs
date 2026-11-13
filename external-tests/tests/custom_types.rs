@@ -124,7 +124,7 @@ fn defender(
         };
         let mut victims = (*by_element).0.get(&key).cloned().unwrap_or_default();
         victims.elements.push(hit.element);
-        victims.names.push_str("x");
+        victims.names.push('x');
         (*by_element).0.insert(key, victims);
         (*log).0.push(Entry {
             hit,

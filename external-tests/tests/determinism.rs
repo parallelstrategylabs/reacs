@@ -63,6 +63,8 @@ fn mix(seed: u32) -> u32 {
     x ^ (x >> 12)
 }
 
+// A system takes one argument per param, so a busy one passes clippy's limit of 7.
+#[allow(clippy::too_many_arguments)]
 #[system]
 fn spawn(
     mut orders: Mut<Receiver<SpawnOrder>>,
@@ -182,13 +184,13 @@ const LOAD_AT: u64 = 190;
 
 fn send_inputs(world: &mut World, tick: u64) {
     let r = mix(tick as u32 ^ 0xA5A5);
-    if tick % 25 == 0 && tick < 300 {
+    if tick.is_multiple_of(25) && tick < 300 {
         world.input(SpawnOrder {
             count: 8 + r % 24,
             seed: r,
         });
     }
-    if r % 3 == 0 {
+    if r.is_multiple_of(3) {
         world.input(AttackOrder { seed: r });
     }
 }
