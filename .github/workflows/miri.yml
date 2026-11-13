@@ -28,7 +28,7 @@ jobs:
       run: rustup toolchain install nightly --profile minimal --component miri && cargo +nightly miri setup
     - name: Run the module's inline tests
       if: matrix.tests != 'external'
-      run: cargo +nightly miri test -p reacs --lib ${{ matrix.tests }}::
+      run: cargo +nightly miri test -p reacs --lib "${{ matrix.tests }}::"
     - name: Run the external test binaries
       if: matrix.tests == 'external'
       run: cargo +nightly miri test -p reacs-external-tests --tests
