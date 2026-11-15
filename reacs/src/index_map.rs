@@ -1,3 +1,6 @@
+//! [`IndexMap`], the hash map that iterates in insertion order and keeps it
+//! through saves.
+
 use std::{
     fmt,
     hash::{Hash, Hasher},

@@ -1,3 +1,5 @@
+//! The tick: how many times the world has stepped, readable by everything and writable by nothing.
+
 use std::marker::PhantomData;
 
 use reacs_derive::resource;

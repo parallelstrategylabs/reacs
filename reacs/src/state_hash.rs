@@ -1,3 +1,5 @@
+//! The hash reacs uses for world state, the same on every platform and build.
+
 use std::fmt::Error;
 
 use serde::{
@@ -20,12 +22,25 @@ fn mix(a: u64, b: u64) -> u64 {
     product as u64 ^ (product >> 64) as u64
 }
 
+/// Hashes `bytes` with the hash reacs uses for world state.
+///
+/// The same bytes give the same hash on every platform and build.
 pub fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut hasher = StateHasher::new();
     hasher.write_bytes(bytes);
     hasher.finish()
 }
 
+/// Hashes `value` the way [`World::resource_hashes`](crate::world::World::resource_hashes) hashes a
+/// resource.
+///
+/// It feeds the value's serde serialization straight into the hash, without encoding it first, so
+/// it skips what saves skip (`#[serde(skip)]` fields) and gives the same result on every platform
+/// and build, floats included.
+///
+/// # Panics
+///
+/// Panics if the value's `Serialize` implementation fails.
 pub fn hash_value<T: Serialize>(value: &T) -> u64 {
     let mut hasher = StateHasher::new();
     value

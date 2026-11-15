@@ -1,3 +1,5 @@
+//! The [`World`]: everything a simulation holds, saved, loaded and hashed as a whole.
+
 use std::{
     any::{Any, TypeId},
     cell::{Ref, RefCell, RefMut},

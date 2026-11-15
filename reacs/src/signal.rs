@@ -1,3 +1,5 @@
+//! Signals: messages between systems, lasting one tick or a window of ticks.
+
 use std::{any::TypeId, marker::PhantomData, ops::RangeFull};
 
 use crate::registry::Registry;
@@ -15,17 +17,40 @@ use crate::{
     world::World,
 };
 
+/// How much work the sweep of dead signals may do per tick: each signal type visited and each
+/// open-ended signal checked costs one.
+///
+/// The sweep removes open-ended signals that their filter dropped, like those of despawned
+/// entities, a little each tick, so its cost per tick stays flat whatever the number of signals.
+/// Changing it changes on which tick signals leave memory, and so the order some signals arrive in
+/// and the contents of saves.
 pub const SWEEP_BUDGET: u64 = if cfg!(miri) { 256 } else { 65536 };
 
+/// Decides which signals of type `S` are still delivered.
+///
+/// [`SignalType::Filter`] picks it: plain `#[signal]` types use [`NoFilter`], and
+/// `#[signal(entity)]` types use [`AliveFilter`](crate::entity::AliveFilter). Receiving checks every
+/// signal against it, and the sweep removes open-ended signals it drops. Game code doesn't
+/// implement it.
 pub trait SignalFilter<S>: 'static {
+    /// `false` for a filter that keeps every signal, so receiving skips it entirely.
     const ACTIVE: bool;
+    /// What [`keep`](Self::keep) reads, fetched once per receive.
     type Context<'w>;
 
+    /// Fetches the context from the world.
     fn fetch<'w>(world: &'w World) -> Self::Context<'w>;
+    /// Returns `true` if `signal` should still be delivered.
+    ///
+    /// Once it returns `false` for a signal, it must keep doing so: the sweep removes that signal
+    /// from memory for good.
     fn keep(context: &Self::Context<'_>, signal: &S) -> bool;
+    /// Returns a number that changes whenever [`keep`](Self::keep) may have started dropping a
+    /// signal, like the count of despawned entities. The sweep stays idle while it doesn't change.
     fn stamp(world: &World) -> u64;
 }
 
+/// The filter of plain `#[signal]` types: it keeps every signal, and compiles away.
 pub struct NoFilter;
 
 impl<S> SignalFilter<S> for NoFilter {
@@ -255,6 +280,11 @@ pub(crate) struct ReceiveCursor {
     pub(crate) windows_tick: u64,
 }
 
+/// Where each system is in receiving signal type `S`, and the next signal id. Saved with the
+/// world.
+///
+/// One of the two resources a signal type is stored in, with [`Signals`]. Systems use it through
+/// [`Receiver`], [`Sender`] and [`Signal`]; its contents are private.
 #[derive(Default, Hashed, Serialize, Deserialize)]
 #[serde(bound = "")]
 pub struct SignalData<S: SignalType> {
@@ -440,6 +470,11 @@ enum WindowSlot {
     Waiting(usize, usize),
 }
 
+/// Every signal of type `S` in flight, grouped by how long it lasts. Saved with the world.
+///
+/// One of the two resources a signal type is stored in, with [`SignalData`]. Its id is the one
+/// recordings name input signals by ([`RecordedInputs::signal`](crate::record::RecordedInputs)).
+/// Systems use it through [`Receiver`], [`Sender`] and [`Signal`]; its contents are private.
 #[derive(Default, Hashed, Serialize, Deserialize)]
 #[serde(bound = "")]
 pub struct Signals<S: SignalType> {

@@ -1,3 +1,5 @@
+//! Resources, single values shared by the world, and local resources, which aren't saved.
+
 use crate::{
     hashed::Hashed,
     schedule::{Mode, ParamInit, ParamWorld, Read, SystemParam, WithMode, conflict},

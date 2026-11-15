@@ -1,3 +1,5 @@
+//! The registry of every type declared with a reacs macro, by id.
+
 use std::{
     any::Any,
     cell::RefCell,
@@ -6,10 +8,25 @@ use std::{
 
 use crate::{index_map::IndexMap, state_hash::hash_value};
 
+/// What reacs knows about a registered type, found by its id with [`get_registry_entry`].
+///
+/// `#[resource]`, `#[component]` and `#[signal]` register their types before `main`. Tools built on
+/// recordings use these entries to name and decode the resources a save or a hash list refers to.
 #[derive(Debug)]
 pub struct RegistryEntry {
+    /// The type's full name, as [`std::any::type_name`] gives it.
     pub type_name: &'static str,
+    /// Encodes a value of the type, passed as `&dyn Any`, the way saves store it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the value isn't of the entry's type.
     pub serialize: fn(&dyn Any) -> Vec<u8>,
+    /// Decodes bytes written by [`serialize`](Self::serialize) into a boxed value of the type.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the bytes don't decode as the type.
     pub deserialize: fn(&[u8]) -> Box<dyn Any>,
     pub(crate) restore: fn(&[u8]) -> Box<RefCell<dyn Any>>,
     pub(crate) hash: fn(&dyn Any) -> u64,
@@ -92,10 +109,18 @@ where
     });
 }
 
+/// Returns the id of every registered type, the ids saves and resource hashes use.
+///
+/// Look one up with [`get_registry_entry`]. The first call closes registration, as reading any
+/// registry does.
 pub fn registered_ids() -> Vec<u128> {
     REGISTRY.get().iter().map(|entry| entry.0).collect()
 }
 
+/// Returns the registered type with id `id`, or `None` if no type has it.
+///
+/// Ids are the types' [`TYPE_UUID`](crate::hashed::Hashed::TYPE_UUID), as stored in saves,
+/// [`World::resource_hashes`](crate::world::World::resource_hashes) and recordings.
 pub fn get_registry_entry(id: u128) -> Option<&'static RegistryEntry> {
     REGISTRY.get().get(&id)
 }

@@ -1,3 +1,5 @@
+//! Components: small, `Copy` data attached to entities and reached by [`Entity`] in O(1).
+
 use reacs_derive::Hashed;
 use serde::{Deserialize, Serialize};
 

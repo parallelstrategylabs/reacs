@@ -1,3 +1,5 @@
+//! Entities, their handles, and the param that spawns and despawns them.
+
 use std::ops::{Deref, DerefMut};
 
 use reacs_derive::{param, resource};
@@ -163,21 +165,31 @@ impl<M: Mode> EntityManager<'_, M> {
     }
 }
 
+/// What [`AliveFilter`] reads to tell whether an entity is alive.
+///
+/// It compares generations only, which is right for any handle [`EntityManager::spawn`] returned:
+/// despawning raises the generation. It never borrows the entity manager's free list, so it can't
+/// conflict with a `Mut<EntityManager>` in the same system.
 pub struct EntityLife<'w> {
     generations: ResourceCell<'w, EntityGenerations>,
 }
 
 impl EntityLife<'_> {
+    /// Returns `true` if `entity` hasn't been despawned since it was spawned.
     #[inline]
     pub fn is_alive(&self, entity: Entity) -> bool {
         self.generations.read().current(entity.index() as usize) == entity.generation()
     }
 }
 
+/// A signal tied to the life of one entity. `#[signal(entity)]` implements it.
 pub trait EntitySignal {
+    /// Returns the entity the signal is about.
     fn entity(&self) -> Entity;
 }
 
+/// The filter of `#[signal(entity)]` types: a signal stops being delivered once its entity is
+/// despawned, and an open-ended one is then dropped from memory.
 pub struct AliveFilter;
 
 impl<S: EntitySignal> SignalFilter<S> for AliveFilter {

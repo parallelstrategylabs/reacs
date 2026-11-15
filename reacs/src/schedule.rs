@@ -1,3 +1,5 @@
+//! Systems, their params and their order, and the setup that writes a new world.
+
 use crate::entity::{Entity, EntityManager};
 use crate::hashed::{Hashed, hash_path};
 use crate::registry::Registry;
@@ -31,10 +33,19 @@ pub fn system_graph() -> &'static SystemGraph {
 
 pub(crate) const ANONYMOUS_SYSTEM: u128 = 0;
 
+/// The id of the system running now, or 0 outside systems. Saved with the world.
+///
+/// Signal params read it to find the running system's receive position. [`World::load`] resets it
+/// to 0. Systems must not write it: receiving would then use another system's position.
 #[resource]
 pub struct CurrentSystem(pub u128);
 
+/// The id of a system, implemented by `#[system]` on a type named after the function.
+///
+/// That type is what `run_before(...)`, `run_after(...)` and `in_group(...)` name.
 pub trait SystemId {
+    /// A hash of the function's module path and name (see
+    /// [`hash_path`]).
     const UUID: u128;
 }
 
@@ -378,12 +389,20 @@ impl SystemGraph {
     }
 }
 
+/// The world as [`SystemParam::fetch`] sees it.
+///
+/// Only reacs creates one, so code outside it can't fetch a param, a writing one included, outside
+/// a system. A `#[param]` bundle passes it on to its fields.
 #[derive(Clone, Copy)]
 pub struct ParamWorld<'w>(pub(crate) &'w World);
 
+/// The world as [`SystemParam::init`] sees it, to create what a param needs, like a resource.
+///
+/// Only reacs creates one. A `#[param]` bundle passes it on to its fields.
 pub struct ParamInit<'w>(pub(crate) &'w mut World);
 
 impl ParamInit<'_> {
+    /// Borrows it again for a shorter time, to pass to one field's `init` and keep it for the next.
     #[inline]
     pub fn reborrow(&mut self) -> ParamInit<'_> {
         ParamInit(self.0)
@@ -513,14 +532,34 @@ impl_into_system_tuples!(P1, P2, P3, P4, P5, P6);
 impl_into_system_tuples!(P1, P2, P3, P4, P5, P6, P7);
 impl_into_system_tuples!(P1, P2, P3, P4, P5, P6, P7, P8);
 
+/// The mode of a param that only reads, the default: `Resource<T>` is `Resource<T, Read>`.
 pub struct Read;
+
+/// The mode of a param that writes: [`Mut<P>`](Mut) is `P` in this mode.
 pub struct Write;
 
+/// Whether a param reads or writes, which decides how it borrows what it uses.
+///
+/// Implemented by [`Read`] and [`Write`] only. Params take it as their last type parameter.
 pub trait Mode {
+    /// What holds a borrowed resource: `Ref<T>` when reading, `RefMut<T>` when writing.
     type Guard<'w, T: 'w>: Deref<Target = T>;
+    /// How [`WorldAccess`] holds the world: `&World` when reading, `&mut World` when writing.
     type WorldGuard<'w>: Deref<Target = World>;
+    /// Borrows resource `T` for the param's life.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the world has no `T`, or if another param of the system holds it in a way that
+    /// conflicts, like a read beside a write.
     fn fetch<'w, T: 'static + Hashed>(world: ParamWorld<'w>) -> Self::Guard<'w, T>;
+    /// Borrows local resource `T`, with the same rules as [`fetch`](Self::fetch).
+    ///
+    /// # Panics
+    ///
+    /// Panics as `fetch` does.
     fn fetch_local<'w, T: LocalResourceType>(world: ParamWorld<'w>) -> Self::Guard<'w, T>;
+    /// Returns the guarded value for writing, or `None` when reading.
     fn guard_mut<'a, T>(guard: &'a mut Self::Guard<'_, T>) -> Option<&'a mut T>;
 }
 
@@ -569,7 +608,12 @@ impl Mode for Write {
     label = "this param only reads",
     note = "take it without `Mut`"
 )]
+/// A param that exists in mode `M`, giving its type in that mode.
+///
+/// [`Mut<P>`](Mut) uses it to turn a param into its writing form. A param without a writing form,
+/// like [`Tick`](crate::tick::Tick), doesn't implement it for [`Write`].
 pub trait WithMode<M: Mode> {
+    /// The param in mode `M`.
     type Out;
 }
 
@@ -852,7 +896,10 @@ impl SystemParam for WorldAccess<'_, Read> {
     }
 }
 
+/// Anything a system function can take: every [`SystemParam`], plus `Mut<WorldAccess>`, which
+/// isn't a param since it borrows the whole world.
 pub trait SystemArg {
+    /// The argument as the system function receives it.
     type Item<'w>;
 }
 
@@ -864,6 +911,8 @@ impl SystemArg for WorldAccess<'_, Write> {
     type Item<'w> = WorldAccess<'w, Write>;
 }
 
+/// Marks the [`IntoSystem`] implementation for functions taking only `Mut<WorldAccess>`, which
+/// borrow the whole world and so can't take other params.
 pub struct ExclusiveSystem;
 
 impl<F> IntoSystem<ExclusiveSystem> for F

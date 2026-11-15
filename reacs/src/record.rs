@@ -1,3 +1,5 @@
+//! Recording a session's inputs to a file, replaying it, and reading recordings as data.
+
 use std::{
     fs::{File, OpenOptions},
     io::{self, BufRead, BufReader, BufWriter, ErrorKind, Read, Write},
@@ -17,6 +19,8 @@ use crate::{
 };
 
 const MAGIC: &[u8; 8] = b"REACSRC4";
+/// How often a [`Recorder`] stores the hash of every resource, in ticks, unless
+/// [`Recorder::with_hash_every`] sets another interval.
 pub const RECORD_HASH_EVERY: u64 = 64;
 
 fn invalid(message: &'static str) -> io::Error {
@@ -90,12 +94,24 @@ fn next_ids(world: &World) -> Vec<u64> {
     inputs.map(|input| (input.next_id)(world)).collect()
 }
 
+/// Sends one recorded input to `world` again, as the host sent it when recording.
+///
+/// `signal` is the id stored in [`RecordedInputs::signal`] and `payload` one of its
+/// [`payloads`](RecordedInputs::payloads). For tools that re-run a [`Recording`] themselves;
+/// [`World::replay`] does this for every recorded input.
+///
+/// Returns `false`, sending nothing, if `signal` isn't an input signal of this program or `payload`
+/// doesn't decode as one.
 pub fn send_recorded(world: &mut World, signal: u128, payload: &[u8]) -> bool {
     let inputs = input_signals();
     let found = inputs.binary_search_by_key(&signal, |input| input.uuid);
     found.is_ok_and(|at| (inputs[at].resend)(world, payload))
 }
 
+/// Returns a hash identifying this build of the program for recordings.
+///
+/// It covers every registered type, every system and every input signal, so it changes when any of
+/// them is added, removed or renamed. A recording only opens in a build with the same id.
 pub fn build_id() -> u64 {
     let mut registered = registered_ids();
     registered.sort_unstable();
@@ -152,6 +168,17 @@ fn same_world(expected: u64, world: &World, made_by: &str, calls: &str) {
     );
 }
 
+/// Writes a session's inputs to a file as the world runs, so it can be replayed later.
+///
+/// Made by [`World::to_recorder`] or [`Playback::to_recorder`]. Call
+/// [`record`](Self::record) (or [`World::record`]) after sending each tick's inputs, right before
+/// stepping, then [`finish`](Self::finish) at the end. The file holds the start state, each tick's
+/// inputs, resource hashes every [`RECORD_HASH_EVERY`] ticks, and a full save wherever the world was
+/// loaded or stepped without recording. Ticks with nothing to store take no space.
+///
+/// Recording never stops the game: at the first write error it stops writing and keeps the error
+/// for [`error`](Self::error) and `finish`. The file is written as it goes, so a crash keeps
+/// everything up to the last tick with something to store.
 pub struct Recorder {
     world: u64,
     out: BufWriter<File>,
@@ -167,12 +194,30 @@ pub struct Recorder {
 }
 
 impl Recorder {
+    /// Stores resource hashes every `ticks` ticks instead of every [`RECORD_HASH_EVERY`].
+    ///
+    /// A hash tick visits every value in the world, so its cost grows with the world. A wider
+    /// interval costs less but leaves fewer points where a replay can detect a divergence.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ticks` is 0.
     pub fn with_hash_every(mut self, ticks: u64) -> Self {
         assert!(ticks > 0, "hash_every must be at least 1");
         self.hash_every = ticks;
         self
     }
 
+    /// Records the current tick of `world`: the inputs the host sent since the last step, and the
+    /// resource hashes on hash ticks.
+    ///
+    /// Call it after sending the tick's inputs and right before [`World::step`]. If the world was
+    /// loaded or stepped without recording since the last call, it first stores a full save.
+    /// Calling it twice for the same tick records it once.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `world` isn't the world this recorder was made from.
     pub fn record(&mut self, world: &World) {
         same_world(self.world, world, "to_recorder", "Recorder::record");
         if self.error.is_none() {
@@ -180,10 +225,25 @@ impl Recorder {
         }
     }
 
+    /// Returns the write error that stopped recording, if any.
+    ///
+    /// The game keeps running after one, so check this when it suits, for example to tell the
+    /// player that recording stopped.
     pub fn error(&self) -> Option<&io::Error> {
         self.error.as_ref()
     }
 
+    /// Ends the recording, storing the last tick the world reached.
+    ///
+    /// Pass the world being recorded: a tick recorded but never stepped isn't replayed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error that stopped recording earlier, if any, or the error writing the end.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `world` isn't the world this recorder was made from.
     pub fn finish(mut self, world: &World) -> io::Result<()> {
         same_world(self.world, world, "to_recorder", "Recorder::finish");
         if let Some(error) = self.error.take() {
@@ -371,32 +431,59 @@ impl World {
     }
 }
 
+/// The inputs of one signal type sent on a recorded tick.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedInputs {
+    /// The id of the input signal's storage, `Signals<S>`'s
+    /// [`TYPE_UUID`](crate::hashed::Hashed::TYPE_UUID). Pass it to [`send_recorded`].
     pub signal: u128,
+    /// Each input sent, encoded, in the order the host sent them.
     pub payloads: Vec<Vec<u8>>,
 }
 
+/// A recorded tick that stored something: inputs, hashes, or both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedTick {
+    /// The tick.
     pub tick: u64,
+    /// The inputs the host sent for this tick, by signal type.
     pub inputs: Vec<RecordedInputs>,
+    /// On hash ticks, the hash of every resource after the inputs were sent and before stepping, in
+    /// the shape [`World::resource_hashes`] returns, so the two compare with `==`.
     pub hashes: Option<Vec<(u128, u64)>>,
 }
 
+/// A stretch of a recording that starts from a full save.
+///
+/// The first section starts from the world the recorder was made from. A new one starts wherever
+/// the world was loaded, or stepped without recording.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedSection {
+    /// The tick the section starts on.
     pub tick: u64,
+    /// The first tick after the section: the run reached tick `end - 1` before the next section
+    /// replaced its state.
     pub end: u64,
+    /// The world at the start of the section, as [`World::save`] wrote it. Restore it with
+    /// [`World::restore`].
     pub state: Vec<u8>,
+    /// The section's ticks that stored something, in order.
     pub ticks: Vec<RecordedTick>,
 }
 
 const UNKNOWN_END: u64 = u64::MAX;
 
+/// A recording file, read as data.
+///
+/// For tools that inspect a session or re-run it themselves with [`World::restore`],
+/// [`send_recorded`] and [`World::resource_hashes`]. To simply replay one, use
+/// [`World::to_playback`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recording {
+    /// The sections, in the order the session ran them. There's always at least one.
     pub sections: Vec<RecordedSection>,
+    /// `true` if the file ends in the middle of a record, as after a crash or while the recorder
+    /// is still writing. Everything before the cut is read.
     pub truncated: bool,
 }
 
@@ -416,6 +503,16 @@ fn read_section(
 }
 
 impl Recording {
+    /// Reads the recording at `path`.
+    ///
+    /// A file cut short is read up to the cut, with [`truncated`](Self::truncated) set. Bytes that
+    /// start a record and never finish it are read the same way, since they look the same.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file can't be read. Returns an [`InvalidData`](ErrorKind::InvalidData)
+    /// error if it isn't a recording, was made by a different build ([`build_id`]), or is
+    /// corrupted.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let mut reader = BufReader::new(File::open(path)?);
 
@@ -521,12 +618,22 @@ impl Recording {
     }
 }
 
+/// The first tick where a replay differed from its recording.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Divergence {
+    /// The first tick whose resource hashes differed.
     pub tick: u64,
+    /// The ids of the resources that differed on that tick, or that existed on only one side. Get
+    /// their names with [`get_registry_entry`](crate::registry::get_registry_entry).
     pub resources: Vec<u128>,
 }
 
+/// A recording being replayed into a world.
+///
+/// Made by [`World::to_playback`], which puts the world in the recording's start state. Then call
+/// `world.replay(&mut playback).step()` until [`finished`](Self::finished). The replay goes through
+/// every load the recorded session made and compares the recorded hashes. Stop at any tick and call
+/// [`to_recorder`](Self::to_recorder) to keep playing from there.
 pub struct Playback {
     world: u64,
     recording: Recording,
@@ -572,20 +679,33 @@ fn differing(recorded: &[(u128, u64)], current: &[(u128, u64)]) -> Vec<u128> {
 }
 
 impl Playback {
+    /// Returns the recording being replayed.
     pub fn recording(&self) -> &Recording {
         &self.recording
     }
 
+    /// Returns `true` once every recorded tick has been replayed, or after an [`error`](Self::error).
     pub fn finished(&self) -> bool {
         let sections = &self.recording.sections;
         self.error.is_some()
             || (self.section + 1 == sections.len() && self.next_tick >= sections[self.section].end)
     }
 
+    /// Returns the error that stopped the replay, if any.
+    ///
+    /// A section whose saved state is corrupted stops the replay with an
+    /// [`InvalidData`](ErrorKind::InvalidData) error and makes it [`finished`](Self::finished). The
+    /// `step` chained after that `replay` call still runs once, with nothing checked, and
+    /// branching from there is refused.
     pub fn error(&self) -> Option<&io::Error> {
         self.error.as_ref()
     }
 
+    /// Returns the first tick where this run's resource hashes differed from the recording, if
+    /// any.
+    ///
+    /// A divergence means a code change, a local resource that game logic depends on, or a
+    /// determinism bug. The replay keeps going after one, so a tool can still show what happened.
     pub fn diverged(&self) -> Option<&Divergence> {
         self.divergence.as_ref()
     }
@@ -632,6 +752,23 @@ impl Playback {
         self.next_tick = tick + 1;
     }
 
+    /// Ends the replay and starts recording from the tick it reached, keeping the history.
+    ///
+    /// The file at `path` gets the start state, every section and recorded tick replayed so far,
+    /// then whatever is recorded from now on, so it replays from the start in one go. Nothing is
+    /// simulated again: the history is copied. `path` may be the file being replayed; it's written
+    /// to `path` plus `.reacs-tmp` and then renamed over it, so a crash leaves the old file or the
+    /// new one, never part of one. Call it before or after `replay` for the current tick; either
+    /// way that tick's inputs are recorded once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InvalidInput`](ErrorKind::InvalidInput) error if the world was stepped outside
+    /// the replay, and any error writing the file.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `world` isn't the world this playback was made for.
     pub fn to_recorder(self, world: &World, path: impl AsRef<Path>) -> io::Result<Recorder> {
         same_world(self.world, world, "to_playback", "Playback::to_recorder");
         let tick = current_tick(world);
