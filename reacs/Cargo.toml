@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 description = "A reactive, signal-driven ECS on a deterministic, tick-based simulation kernel"
 license = "Apache-2.0"
+repository = "https://github.com/parallelstrategylabs/reacs"
 readme = "../README.md"
 links = "reacs"
 
