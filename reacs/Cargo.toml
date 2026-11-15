@@ -2,6 +2,7 @@
 name = "reacs"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "A reactive, signal-driven ECS on a deterministic, tick-based simulation kernel"
 license = "Apache-2.0"
 links = "reacs"

@@ -2,6 +2,7 @@
 name = "reacs-derive"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "Macros for reacs"
 license = "Apache-2.0"
 

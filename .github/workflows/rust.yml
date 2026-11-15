@@ -49,6 +49,19 @@ jobs:
       run: rustup update stable && rustup default stable
     - run: cargo doc --workspace --no-deps
 
+  msrv:
+    name: check msrv
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install the minimum supported Rust (`rust-version` in reacs/Cargo.toml)
+      run: |
+        msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' reacs/Cargo.toml)
+        test -n "$msrv" || { echo "::error::no rust-version in reacs/Cargo.toml"; exit 1; }
+        echo "MSRV $msrv"
+        rustup toolchain install "$msrv" --profile minimal && rustup default "$msrv"
+    - run: cargo check --workspace --all-targets --all-features
+
   test:
     name: test (${{ matrix.target }})
     strategy:
