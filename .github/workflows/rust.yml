@@ -12,8 +12,10 @@ on:
     paths-ignore: [ "**.md", "LICENSE" ]
   workflow_dispatch:
 
+# A new run cancels an older one of the same kind on the same ref, so a manual run doesn't cancel
+# the push run of the same commit.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 env:
