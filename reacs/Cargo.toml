@@ -11,7 +11,7 @@ links = "reacs"
 [dependencies]
 reacs-derive = { path = "../derive", version = "0.1.0" }
 serde = { version = "1.0", features = ["derive"] }
-bincode = "1.3"
+postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 ctor = "1"
 
 [features]

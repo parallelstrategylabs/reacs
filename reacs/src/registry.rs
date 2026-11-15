@@ -16,7 +16,7 @@ pub struct RegistryEntry {
 }
 
 fn decode<T: for<'de> serde::Deserialize<'de>>(bytes: &[u8]) -> T {
-    bincode::deserialize(bytes).unwrap_or_else(|error| {
+    crate::codec::from_slice(bytes).unwrap_or_else(|error| {
         panic!(
             "Failed to deserialize `{}`: {error}",
             std::any::type_name::<T>()
@@ -83,7 +83,7 @@ where
             id,
             RegistryEntry {
                 type_name,
-                serialize: |v| bincode::serialize(v.downcast_ref::<T>().unwrap()).unwrap(),
+                serialize: |v| crate::codec::to_vec(v.downcast_ref::<T>().unwrap()).unwrap(),
                 deserialize: |b| Box::new(decode::<T>(b)),
                 restore: |b| Box::new(RefCell::new(decode::<T>(b))),
                 hash: |v| hash_value(v.downcast_ref::<T>().unwrap()),

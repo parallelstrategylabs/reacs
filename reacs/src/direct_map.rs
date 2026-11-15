@@ -207,8 +207,8 @@ mod tests {
         map.insert(3, 33);
         map.remove(3);
 
-        let bytes = bincode::serialize(&map).unwrap();
-        let restored: DirectMap<u32> = bincode::deserialize(&bytes).unwrap();
+        let bytes = crate::codec::to_vec(&map).unwrap();
+        let restored: DirectMap<u32> = crate::codec::from_slice(&bytes).unwrap();
 
         assert_eq!(restored.get(1), Some(&11));
         assert_eq!(restored.get(70), Some(&22));

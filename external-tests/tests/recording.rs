@@ -117,7 +117,8 @@ fn ticks_with_nothing_to_record_take_no_space() {
         size
     };
 
-    assert_eq!(size(3), size(250));
+    // Both end below tick 128, so the last tick in the `End` record takes one byte either way.
+    assert_eq!(size(3), size(120));
 }
 
 #[test]

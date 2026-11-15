@@ -204,8 +204,8 @@ mod tests {
         }
         list.free(5);
 
-        let bytes = bincode::serialize(&list).unwrap();
-        let mut restored: FreeList = bincode::deserialize(&bytes).unwrap();
+        let bytes = crate::codec::to_vec(&list).unwrap();
+        let mut restored: FreeList = crate::codec::from_slice(&bytes).unwrap();
 
         assert_eq!(restored.reserve(), 5);
         assert_eq!(restored.reserve(), 70);
@@ -237,8 +237,8 @@ mod tests {
         }
         list.reserve();
 
-        let bytes = bincode::serialize(&list).unwrap();
-        let mut restored: FreeList = bincode::deserialize(&bytes).unwrap();
+        let bytes = crate::codec::to_vec(&list).unwrap();
+        let mut restored: FreeList = crate::codec::from_slice(&bytes).unwrap();
         for _ in 0..5 {
             assert_eq!(restored.reserve(), list.reserve());
         }

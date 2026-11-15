@@ -4,7 +4,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use bincode::Options;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -17,12 +16,8 @@ use crate::{
     world::World,
 };
 
-const MAGIC: &[u8; 8] = b"REACSRC3";
+const MAGIC: &[u8; 8] = b"REACSRC4";
 pub const RECORD_HASH_EVERY: u64 = 64;
-
-fn options() -> bincode::DefaultOptions {
-    bincode::DefaultOptions::new()
-}
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(ErrorKind::InvalidData, message)
@@ -51,14 +46,14 @@ fn capture_input<S: SignalType>(world: &World, first_id: u64, out: &mut Vec<Vec<
     if let Some(signals) = world.get_resource::<Signals<S>>() {
         let sent = signals.transient_buffer.iter();
         out.extend(sent.filter(|x| x.id >= first_id).map(|x| {
-            let payload = options().serialize(&x.payload);
+            let payload = crate::codec::to_vec(&x.payload);
             payload.expect("failed to encode an input signal")
         }));
     }
 }
 
 fn resend_input<S: SignalType>(world: &mut World, bytes: &[u8]) -> bool {
-    let signal = options().deserialize::<S>(bytes);
+    let signal = crate::codec::from_slice::<S>(bytes);
     signal.is_ok_and(|signal| {
         world.fetch_param::<Mut<Signal<S>>>().emit(signal);
         true
@@ -143,8 +138,9 @@ enum Record {
 }
 
 fn write<T: Serialize>(out: &mut impl Write, value: &T, state: &[u8]) -> io::Result<()> {
-    let encoded = options().serialize_into(&mut *out, value);
-    encoded.map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
+    let encoded = crate::codec::to_vec(value);
+    let encoded = encoded.map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
+    out.write_all(&encoded)?;
     out.write_all(state)?;
     out.flush()
 }
@@ -427,7 +423,7 @@ impl Recording {
         if reader.read_exact(&mut magic).is_err() || &magic != MAGIC {
             return Err(invalid("this file is not a recording"));
         }
-        let header = options().deserialize_from::<_, Header>(&mut reader);
+        let header = crate::codec::read::<Header, _>(&mut reader);
         let header = header.map_err(|_| corrupted())?;
         if header.build_id != build_id() {
             return Err(invalid("this recording was made by a different build"));
@@ -450,11 +446,10 @@ impl Recording {
         let mut tick = self.sections[0].tick;
         let mut table = Vec::new();
         while !reader.fill_buf()?.is_empty() {
-            let record = match options().deserialize_from(&mut *reader) {
+            let record = match crate::codec::read(&mut *reader) {
                 Ok(record) => record,
                 Err(error) => {
-                    let cut = matches!(&*error, bincode::ErrorKind::Io(io)
-                        if io.kind() == ErrorKind::UnexpectedEof);
+                    let cut = matches!(error, crate::codec::Error::DeserializeUnexpectedEnd);
                     return if cut { Ok(true) } else { Err(corrupted()) };
                 }
             };
@@ -808,7 +803,7 @@ mod tests {
     }
 
     fn encoded<S: SignalType>(signal: S) -> Vec<u8> {
-        options().serialize(&signal).unwrap()
+        crate::codec::to_vec(&signal).unwrap()
     }
 
     fn payloads_of<S: SignalType>(recorded: &RecordedTick) -> Vec<Vec<u8>> {
@@ -834,11 +829,11 @@ mod tests {
 
     fn raw_records(bytes: &[u8]) -> (Header, Vec<Record>) {
         let mut rest = &bytes[MAGIC.len()..];
-        let header: Header = options().deserialize_from(&mut rest).unwrap();
+        let header: Header = crate::codec::read(&mut rest).unwrap();
         rest = &rest[header.state_len as usize..];
         let mut records = Vec::new();
         while !rest.is_empty() {
-            let record = options().deserialize_from(&mut rest).unwrap();
+            let record = crate::codec::read(&mut rest).unwrap();
             if let Record::Section { state_len, .. } = &record {
                 rest = &rest[*state_len as usize..];
             }
@@ -1261,7 +1256,7 @@ mod tests {
     #[test]
     fn a_corrupted_start_state_is_refused() {
         let mut bytes = short_run("bad-start");
-        let at = MAGIC.len() + options().serialized_size(&raw_records(&bytes).0).unwrap() as usize;
+        let at = MAGIC.len() + crate::codec::to_vec(&raw_records(&bytes).0).unwrap().len();
         bytes[at..at + 8].fill(0xFF);
         let file = path("bad-start-read");
         fs::write(&file, &bytes).unwrap();
@@ -1301,7 +1296,7 @@ mod tests {
     }
 
     fn encoded_len(record: &Record) -> usize {
-        options().serialized_size(record).unwrap() as usize
+        crate::codec::to_vec(record).unwrap().len()
     }
 
     #[test]
@@ -1347,9 +1342,15 @@ mod tests {
                 "this recording is corrupted"
             );
         }
+        // A record that can't exist (there are three kinds) is corruption.
         let mut garbage = bytes.clone();
-        garbage.extend_from_slice(&[0xFF; 3]);
+        garbage.push(9);
         assert_eq!(message(&garbage), "this recording is corrupted");
+
+        // Bytes that start a record and never finish it can't be told apart from a file cut short.
+        let mut unfinished = bytes.clone();
+        unfinished.extend_from_slice(&[0xFF; 3]);
+        assert!(open("rejected-read", &unfinished).unwrap().truncated);
     }
 
     #[test]

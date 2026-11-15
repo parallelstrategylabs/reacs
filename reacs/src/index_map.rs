@@ -629,32 +629,33 @@ mod tests {
         }
         assert!(original.len() > 10);
 
-        let bytes = bincode::serialize(&original).unwrap();
-        let mut restored: IndexMap<Weak, u64> = bincode::deserialize(&bytes).unwrap();
+        let bytes = crate::codec::to_vec(&original).unwrap();
+        let mut restored: IndexMap<Weak, u64> = crate::codec::from_slice(&bytes).unwrap();
         assert_eq!(restored.as_slice(), original.as_slice());
-        assert_eq!(bincode::serialize(&restored).unwrap(), bytes);
+        assert_eq!(crate::codec::to_vec(&restored).unwrap(), bytes);
 
         for &op in after {
             apply(&mut original, op, Weak);
             apply(&mut restored, op, Weak);
             assert_eq!(
-                bincode::serialize(&restored).unwrap(),
-                bincode::serialize(&original).unwrap()
+                crate::codec::to_vec(&restored).unwrap(),
+                crate::codec::to_vec(&original).unwrap()
             );
         }
     }
 
     #[test]
     fn load_rejects_duplicate_keys() {
-        let bytes = bincode::serialize(&vec![(1u64, 2u64), (1, 3)]).unwrap();
-        assert!(bincode::deserialize::<IndexMap<u64, u64>>(&bytes).is_err());
+        let bytes = crate::codec::to_vec(&vec![(1u64, 2u64), (1, 3)]).unwrap();
+        assert!(crate::codec::from_slice::<IndexMap<u64, u64>>(&bytes).is_err());
     }
 
     #[test]
     fn load_survives_a_corrupt_length() {
-        let mut bytes = bincode::serialize(&IndexMap::from([(1u64, 2u64)])).unwrap();
-        bytes[..8].copy_from_slice(&u64::MAX.to_le_bytes());
-        assert!(bincode::deserialize::<IndexMap<u64, u64>>(&bytes).is_err());
+        let mut bytes = crate::codec::to_vec(&IndexMap::from([(1u64, 2u64)])).unwrap();
+        // A length whose variable-length encoding never ends inside the value's bytes.
+        bytes.splice(..1, [0xFF; 9].into_iter().chain([0x01]));
+        assert!(crate::codec::from_slice::<IndexMap<u64, u64>>(&bytes).is_err());
     }
 
     #[test]

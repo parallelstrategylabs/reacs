@@ -16,6 +16,10 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 
+/// The first bytes of every save, so garbage or a save in another format is reported as corrupted
+/// instead of being decoded as a header.
+const SAVE_MAGIC: &[u8; 8] = b"REACSSV1";
+
 #[derive(Serialize, Deserialize)]
 struct SaveHeader {
     app_version: u32,
@@ -350,7 +354,7 @@ impl World {
         let header = SaveHeader {
             app_version: self.app_version,
         };
-        bincode::serialize(&(header, saved)).expect("failed to encode save")
+        crate::codec::to_vec_after(SAVE_MAGIC, &(header, saved)).expect("failed to encode save")
     }
 
     /// Returns a hash of every resource, as `(type UUID, hash)` pairs sorted by type UUID.
@@ -386,8 +390,10 @@ impl World {
     /// Panics if the bytes are corrupted, the save has a different app version, or the save and
     /// the world don't hold the same resources. The world is unchanged when it panics.
     pub fn load(&mut self, bytes: &[u8]) {
-        let mut body = bytes;
-        let header: SaveHeader = bincode::deserialize_from(&mut body)
+        let body = bytes
+            .strip_prefix(SAVE_MAGIC)
+            .unwrap_or_else(|| panic!("Failed to load save, it's corrupted or not a reacs save"));
+        let (header, body): (SaveHeader, &[u8]) = crate::codec::take(body)
             .unwrap_or_else(|error| panic!("Failed to load save, it's corrupted: {error}"));
 
         if header.app_version != self.app_version {
@@ -397,7 +403,7 @@ impl World {
             );
         }
 
-        let saved: Vec<(u128, Vec<u8>)> = bincode::deserialize(body)
+        let saved: Vec<(u128, Vec<u8>)> = crate::codec::from_slice(body)
             .unwrap_or_else(|error| panic!("Failed to load save, it's corrupted: {error}"));
 
         for (id, _) in &self.resources {
@@ -432,9 +438,9 @@ impl World {
     ///
     /// Meant for tools built on recordings; games should use `load`.
     pub fn restore(&mut self, bytes: &[u8]) -> Option<()> {
-        let mut body = bytes;
-        let header: SaveHeader = bincode::deserialize_from(&mut body).ok()?;
-        let saved: Vec<(u128, Vec<u8>)> = bincode::deserialize(body).ok()?;
+        let body = bytes.strip_prefix(SAVE_MAGIC)?;
+        let (header, body): (SaveHeader, &[u8]) = crate::codec::take(body).ok()?;
+        let saved: Vec<(u128, Vec<u8>)> = crate::codec::from_slice(body).ok()?;
 
         let mut resources = Vec::with_capacity(saved.len());
         for (id, bytes) in &saved {
@@ -459,7 +465,7 @@ impl World {
 
 #[cfg(test)]
 mod tests {
-    use super::SaveHeader;
+    use super::{SAVE_MAGIC, SaveHeader};
     use crate::prelude::*;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -468,9 +474,9 @@ mod tests {
 
     fn save_with_unknown_resource(world: &World) -> Vec<u8> {
         let (header, mut saved): (SaveHeader, Vec<(u128, Vec<u8>)>) =
-            bincode::deserialize(&world.save()).unwrap();
+            crate::codec::from_slice(&world.save()[SAVE_MAGIC.len()..]).unwrap();
         saved.push((1, Vec::new()));
-        bincode::serialize(&(header, saved)).unwrap()
+        crate::codec::to_vec_after(SAVE_MAGIC, &(header, saved)).unwrap()
     }
 
     #[test]
@@ -723,7 +729,8 @@ mod tests {
         let mut world = World::new();
         world.set_app_version(3);
 
-        let header: SaveHeader = bincode::deserialize(&world.save()).unwrap();
+        let (header, _): (SaveHeader, &[u8]) =
+            crate::codec::take(&world.save()[SAVE_MAGIC.len()..]).unwrap();
 
         assert_eq!(header.app_version, 3);
     }

@@ -137,6 +137,7 @@
 extern crate self as reacs;
 
 pub mod bit_set;
+pub(crate) mod codec;
 pub mod component;
 pub mod direct_map;
 pub mod entity;
