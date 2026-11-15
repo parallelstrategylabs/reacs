@@ -1,34 +1,67 @@
+//! A map from small integer keys to values, stored by index.
+
 use reacs_derive::Hashed;
 use serde::{Deserialize, Serialize};
 
 use crate::bit_set::BitSet;
 
+/// A map from small `usize` keys, like entity indexes, to `Copy` values.
+///
+/// Each key has its own slot in a `Vec`, so `get`, `insert` and `remove` are O(1) with no hashing.
+/// Memory follows the largest key, not the number of entries, so it suits dense keys. Removing a
+/// key only clears its flag: the old value stays in its slot until a later `insert` overwrites it.
+///
+/// # Examples
+///
+/// ```
+/// use reacs::direct_map::DirectMap;
+///
+/// let mut ages: DirectMap<u32> = DirectMap::new();
+/// ages.insert(3, 40);
+///
+/// assert_eq!(ages.get(3), Some(&40));
+/// assert!(!ages.has(2));
+///
+/// ages.remove(3);
+/// assert_eq!(ages.get(3), None);
+/// ```
 #[derive(Default, Hashed, Serialize, Deserialize)]
 pub struct DirectMap<T: Copy + Default> {
+    /// The keys that hold a value.
     pub active: BitSet,
+    /// One slot per key. Slots of keys not in `active` hold stale or default values. Every key in
+    /// `active` must be below `values.len()`, or [`get`](Self::get) panics on that key.
     pub values: Vec<T>,
 }
 
 impl<T: Copy + Default> DirectMap<T> {
+    /// Creates an empty map.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Returns `true` if `key` holds a value.
     #[inline]
     pub fn has(&self, key: usize) -> bool {
         self.active.get(key)
     }
 
+    /// Returns the value of `key`, or `None` if it holds none.
     #[inline]
     pub fn get(&self, key: usize) -> Option<&T> {
         self.has(key).then(|| &self.values[key])
     }
 
+    /// Returns the value of `key` for writing, or `None` if it holds none.
     #[inline]
     pub fn get_mut(&mut self, key: usize) -> Option<&mut T> {
         self.has(key).then(|| &mut self.values[key])
     }
 
+    /// Sets the value of `key`, replacing any value it had.
+    ///
+    /// A key past the end grows the slots to the next power of two above it, filled with
+    /// `T::default()`.
     #[inline]
     pub fn insert(&mut self, key: usize, value: T) {
         self.active.set(key, true);
@@ -41,11 +74,13 @@ impl<T: Copy + Default> DirectMap<T> {
         self.values[key] = value;
     }
 
+    /// Removes the value of `key`, if any. Its slot keeps the old value until overwritten.
     #[inline]
     pub fn remove(&mut self, key: usize) {
         self.active.set(key, false);
     }
 
+    /// Removes every value, keeping the memory.
     #[inline]
     pub fn clear(&mut self) {
         self.active.clear();

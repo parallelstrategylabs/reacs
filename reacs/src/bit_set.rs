@@ -1,11 +1,35 @@
+//! A growable set of indexes stored as bits.
+
 use serde::{Deserialize, Serialize};
 
+/// A growable set of `usize` indexes, one bit per index.
+///
+/// Index `i` is bit `i % 64` of word `i / 64`. Setting an index past the end grows the set;
+/// reading or clearing one past the end treats it as unset. Memory follows the largest index set,
+/// not the number of indexes, so it suits dense indexes like entity indexes.
+///
+/// # Examples
+///
+/// ```
+/// use reacs::bit_set::BitSet;
+///
+/// let mut set = BitSet::new();
+/// set.set(3, true);
+/// set.set(70, true);
+///
+/// assert!(set.get(70));
+/// assert!(!set.get(4));
+/// assert_eq!(set.next_set(4, 100), 70);
+/// assert_eq!(set.next_set(71, 100), 100);
+/// ```
 #[derive(Default, Clone, Serialize, Deserialize, Debug)]
 pub struct BitSet {
+    /// The bits, 64 indexes per word: index `i` is bit `i % 64` of `words[i / 64]`.
     pub words: Vec<u64>,
 }
 
 impl BitSet {
+    /// Creates an empty set.
     #[inline]
     pub fn new() -> Self {
         Self { words: Vec::new() }
@@ -16,6 +40,7 @@ impl BitSet {
         (index >> 6, index & 63)
     }
 
+    /// Returns `true` if `index` is in the set.
     #[inline]
     pub fn get(&self, index: usize) -> bool {
         let (bucket, bit) = self.extract(index);
@@ -25,6 +50,9 @@ impl BitSet {
             .unwrap_or(false)
     }
 
+    /// Adds `index` to the set if `state` is `true`, or removes it if `false`.
+    ///
+    /// Adding an index past the end grows the set; removing one does nothing.
     #[inline]
     pub fn set(&mut self, index: usize, state: bool) {
         let (bucket, bit) = self.extract(index);
@@ -40,6 +68,9 @@ impl BitSet {
         }
     }
 
+    /// Returns the first index in the set within `from..limit`, or `limit` if there's none.
+    ///
+    /// It skips 64 indexes at a time over empty words.
     #[inline]
     pub fn next_set(&self, from: usize, limit: usize) -> usize {
         let mut index = from;
@@ -57,11 +88,14 @@ impl BitSet {
         limit
     }
 
+    /// Returns word `index`, the bits of indexes `index * 64` to `index * 64 + 63`, or `None` past
+    /// the end.
     #[inline]
     pub fn get_word(&self, index: usize) -> Option<u64> {
         self.words.get(index).copied()
     }
 
+    /// Replaces word `index` with `word`, growing the set if needed.
     #[inline]
     pub fn set_word(&mut self, index: usize, word: u64) {
         if index >= self.words.len() {
@@ -70,6 +104,7 @@ impl BitSet {
         self.words[index] = word;
     }
 
+    /// Removes every index, keeping the memory.
     #[inline]
     pub fn clear(&mut self) {
         self.words.fill(0);
