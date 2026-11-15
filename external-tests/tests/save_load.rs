@@ -44,22 +44,22 @@ fn spawner(
 ) {
     let tick = tick.get();
     let entity = em.spawn();
-    (*living).0.push(entity);
-    (*ages).0.insert(entity, 0);
+    living.0.push(entity);
+    ages.0.insert(entity, 0);
     spawned.emit(Spawned(entity));
     burn.send(Burn(entity), (In(1), For(3)));
     late.emit(Late(tick));
 
     if tick % 3 == 2 {
-        let dead = (*living).0.remove(0);
-        (*ages).0.swap_remove(&dead);
+        let dead = living.0.remove(0);
+        ages.0.swap_remove(&dead);
         em.despawn(dead);
     }
 }
 
 #[system(run_after(spawner))]
 fn ager(mut ages: Mut<Resource<Ages>>, mut trace: Mut<Resource<Trace>>) {
-    for (entity, age) in (*ages).0.iter_mut() {
+    for (entity, age) in ages.0.iter_mut() {
         *age += 1;
         mix(&mut trace, entity.to_bits() ^ *age);
     }

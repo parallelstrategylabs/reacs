@@ -33,8 +33,8 @@ fn take_orders(
     mut rng: Mut<Resource<Rng>>,
 ) {
     for order in orders.receive() {
-        (*rng).0 = (*rng).0.wrapping_mul(31).wrapping_add(order.0);
-        blows.emit(Blow((*rng).0));
+        rng.0 = rng.0.wrapping_mul(31).wrapping_add(order.0);
+        blows.emit(Blow(rng.0));
     }
     for pause in pauses.receive() {
         blows.emit(Blow(pause.0 as u64));
@@ -48,9 +48,9 @@ fn land_blows(
     bias: LocalResource<Bias>,
 ) {
     for blow in blows.receive() {
-        mix(&mut trace, blow.0 + (*bias).0);
+        mix(&mut trace, blow.0 + bias.0);
     }
-    mix(&mut trace, (*bias).0 + 1);
+    mix(&mut trace, bias.0 + 1);
 }
 
 #[system(run_after(land_blows))]

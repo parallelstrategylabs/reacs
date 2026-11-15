@@ -16,9 +16,6 @@ use std::{
 /// The resource exists in every world that has a system using it, starting from its `Default`
 /// value.
 ///
-/// For a tuple resource, write `(*score).0` rather than `score.0`: `.0` names this param's own
-/// field.
-///
 /// # Panics
 ///
 /// The system panics when it runs if another of its params also borrows `T` and one of them
@@ -51,7 +48,7 @@ use std::{
 ///     assert_eq!(world.get_resource::<Bank>().unwrap().gold, 10);
 /// }
 /// ```
-pub struct Resource<'w, T: 'static, M: Mode = Read>(pub M::Guard<'w, T>);
+pub struct Resource<'w, T: 'static, M: Mode = Read>(pub(crate) M::Guard<'w, T>);
 
 impl<'w, T: 'static, M0: Mode, M: Mode> WithMode<M> for Resource<'w, T, M0> {
     type Out = Resource<'w, T, M>;
@@ -103,7 +100,7 @@ pub trait LocalResourceType: 'static + Default {
 /// [`Resource`]. Local resources aren't saved or hashed, so they may only hold caches that can be
 /// rebuilt from saved state: game logic that depends on one gives different results after a load
 /// or in a replay.
-pub struct LocalResource<'w, T: 'static, M: Mode = Read>(pub M::Guard<'w, T>);
+pub struct LocalResource<'w, T: 'static, M: Mode = Read>(pub(crate) M::Guard<'w, T>);
 
 impl<'w, T: 'static, M0: Mode, M: Mode> WithMode<M> for LocalResource<'w, T, M0> {
     type Out = LocalResource<'w, T, M>;
