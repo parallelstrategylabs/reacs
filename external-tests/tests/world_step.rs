@@ -17,10 +17,10 @@ pub struct Seen {
 fn record(
     mut once: Mut<Signal<Once>>,
     mut windowed: Mut<Signal<Windowed>>,
-    tick: Resource<Tick>,
+    tick: Tick,
     mut seen: Mut<Resource<Seen>>,
 ) {
-    let tick = (*tick).0;
+    let tick = tick.get();
     seen.ticks.push(tick);
     for signal in once.receive() {
         seen.once.push((tick, signal.0));
@@ -42,10 +42,10 @@ pub struct RepeatSeen {
 #[system]
 fn receives_twice(
     mut repeated: Mut<Signal<Repeated>>,
-    tick: Resource<Tick>,
+    tick: Tick,
     mut seen: Mut<Resource<RepeatSeen>>,
 ) {
-    let tick = (*tick).0;
+    let tick = tick.get();
     for signal in repeated.receive() {
         seen.first.push((tick, signal.0));
     }
@@ -59,7 +59,7 @@ fn receives_twice(
 fn world_new_starts_at_tick_zero() {
     let world = World::new();
 
-    assert_eq!(world.get_resource::<Tick>().unwrap().0, 0);
+    assert_eq!(world.tick(), 0);
 }
 
 #[test]
@@ -69,7 +69,7 @@ fn step_runs_systems_then_advances_the_tick() {
     world.step();
     world.step();
 
-    assert_eq!(world.get_resource::<Tick>().unwrap().0, 2);
+    assert_eq!(world.tick(), 2);
     assert_eq!(world.get_resource::<Seen>().unwrap().ticks, [0, 1]);
 }
 

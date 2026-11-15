@@ -1,5 +1,3 @@
-use reacs_derive::resource;
-
 extern crate self as reacs;
 
 pub mod bit_set;
@@ -15,6 +13,7 @@ pub mod resource;
 pub mod schedule;
 pub mod signal;
 pub mod state_hash;
+pub mod tick;
 pub mod world;
 
 #[doc(hidden)]
@@ -25,7 +24,6 @@ pub mod __private {
 }
 
 pub mod prelude {
-    pub use crate::Tick;
     pub use crate::component::Component;
     pub use crate::entity::{Entity, EntityManager};
     pub use crate::hashed::Hashed;
@@ -37,15 +35,13 @@ pub mod prelude {
     pub use crate::signal::{
         At, For, In, InputSignal, IntoWindow, Receiver, Sender, Signal, SignalType, To,
     };
+    pub use crate::tick::Tick;
     pub use crate::world::World;
 
     pub use reacs_derive::{
         Hashed as DeriveHashed, component, data, param, resource, signal, system, world,
     };
 }
-
-#[resource]
-pub struct Tick(pub u64);
 
 #[cfg(test)]
 pub(crate) const fn test_size(native: usize, miri: usize) -> usize {

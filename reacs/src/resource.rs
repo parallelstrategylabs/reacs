@@ -32,7 +32,7 @@ where
     }
 }
 
-impl<T: 'static + Default + Hashed, M: Mode> SystemParam for Resource<'_, T, M> {
+impl<T: 'static + Hashed + Default, M: Mode> SystemParam for Resource<'_, T, M> {
     type Item<'w> = Resource<'w, T, M>;
 
     fn init(world: ParamInit<'_>) {

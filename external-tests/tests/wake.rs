@@ -82,8 +82,8 @@ fn signal(mut pings: Mut<Signal<Ping>>, mut runs: Mut<Resource<Runs>>) {
 }
 
 #[system]
-fn plain(tick: Resource<Tick>, mut runs: Mut<Resource<Runs>>) {
-    runs.plain.push((*tick).0);
+fn plain(tick: Tick, mut runs: Mut<Resource<Runs>>) {
+    runs.plain.push(tick.get());
 }
 
 #[system]
@@ -147,7 +147,7 @@ fn new_world() -> World {
 }
 
 fn step(world: &mut World) {
-    let tick = world.get_resource::<Tick>().unwrap().0;
+    let tick = world.tick();
     if tick == 3 || tick == 17 {
         world.input(Poke(tick));
     }

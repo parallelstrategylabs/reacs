@@ -68,9 +68,9 @@ fn attacker(
     mut weakness: Mut<Component<Weakness>>,
     mut resist: Mut<Component<Resist>>,
     mut damage: Mut<Sender<Damage>>,
-    tick: Resource<Tick>,
+    tick: Tick,
 ) {
-    let tick = (*tick).0;
+    let tick = tick.get();
     let target = em.spawn();
     let element = match tick % 3 {
         0 => Element::Fire,
@@ -102,7 +102,7 @@ fn defender(
     mut log: Mut<Resource<Log>>,
     mut last: Mut<Resource<Last>>,
     mut by_element: Mut<Resource<ByElement>>,
-    tick: Resource<Tick>,
+    tick: Tick,
 ) {
     for damage in damage.receive() {
         let mut hit = damage.hit;
@@ -128,7 +128,7 @@ fn defender(
         (*by_element).0.insert(key, victims);
         (*log).0.push(Entry {
             hit,
-            tick: (*tick).0,
+            tick: tick.get(),
             scratch: 99,
         });
     }

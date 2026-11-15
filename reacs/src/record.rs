@@ -8,12 +8,12 @@ use bincode::Options;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Tick,
     hashed::Hashed,
     registry::{Registry, registered_ids},
     schedule::{Mut, system_graph},
     signal::{InputSignal, Signal, SignalData, SignalType, Signals},
     state_hash::hash_bytes,
+    tick::TickCount,
     world::World,
 };
 
@@ -115,7 +115,7 @@ pub fn build_id() -> u64 {
 }
 
 fn current_tick(world: &World) -> u64 {
-    world.get_resource::<Tick>().map_or(0, |tick| tick.0)
+    world.get_resource::<TickCount>().map_or(0, |tick| tick.0)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -710,7 +710,7 @@ mod tests {
     fn advance(world: &mut World) {
         world.steps += 1;
         world.cleanup_signals();
-        world.get_resource_mut::<Tick>().unwrap().0 += 1;
+        world.get_resource_mut::<TickCount>().unwrap().0 += 1;
     }
 
     fn encoded<S: SignalType>(signal: S) -> Vec<u8> {

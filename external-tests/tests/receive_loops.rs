@@ -32,10 +32,10 @@ fn killer(mut kills: Mut<Signal<Kill>>, mut em: Mut<EntityManager>) {
 fn for_receiver(
     mut pings: Mut<Signal<Ping>>,
     mut burns: Mut<Signal<Burn>>,
-    tick: Resource<Tick>,
+    tick: Tick,
     mut seen: Mut<Resource<ForSeen>>,
 ) {
-    let tick = (*tick).0;
+    let tick = tick.get();
     for ping in pings.receive() {
         seen.pings.push((tick, ping.0));
     }
@@ -48,10 +48,10 @@ fn for_receiver(
 fn for_each_receiver(
     mut pings: Mut<Signal<Ping>>,
     mut burns: Mut<Signal<Burn>>,
-    tick: Resource<Tick>,
+    tick: Tick,
     mut seen: Mut<Resource<ForEachSeen>>,
 ) {
-    let tick = (*tick).0;
+    let tick = tick.get();
     pings
         .receive()
         .for_each(|ping| seen.pings.push((tick, ping.0)));
@@ -61,8 +61,8 @@ fn for_each_receiver(
 }
 
 #[system(run_after(for_receiver, for_each_receiver))]
-fn sender(mut pings: Mut<Signal<Ping>>, tick: Resource<Tick>) {
-    let tick = (*tick).0;
+fn sender(mut pings: Mut<Signal<Ping>>, tick: Tick) {
+    let tick = tick.get();
     pings.emit(Ping(tick * 10));
     if tick == 1 {
         pings.send(Ping(100), For(3));

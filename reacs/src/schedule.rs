@@ -1,9 +1,9 @@
-use crate::Tick;
 use crate::entity::{Entity, EntityManager};
 use crate::hashed::{Hashed, hash_path};
 use crate::registry::Registry;
 use crate::resource::LocalResourceType;
 use crate::signal::{Signal, SignalType};
+use crate::tick::TickCount;
 use crate::world::World;
 
 use reacs_derive::resource;
@@ -333,8 +333,8 @@ impl SystemGraph {
 
     pub(crate) fn run(&self, world: &mut World) {
         let tick = world
-            .get_resource::<Tick>()
-            .unwrap_or_else(|| conflict::<Tick>())
+            .get_resource::<TickCount>()
+            .unwrap_or_else(|| conflict::<TickCount>())
             .0;
         for system in self.iter() {
             if let Some(wake) = system.wake_fn
@@ -517,6 +517,11 @@ impl Mode for Write {
     }
 }
 
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` has no `Mut` form",
+    label = "this param only reads",
+    note = "take it without `Mut`"
+)]
 pub trait WithMode<M: Mode> {
     type Out;
 }
@@ -675,8 +680,8 @@ impl World {
         self.steps += 1;
         self.run_systems();
         self.cleanup_signals();
-        self.get_resource_mut::<Tick>()
-            .unwrap_or_else(|| conflict::<Tick>())
+        self.get_resource_mut::<TickCount>()
+            .unwrap_or_else(|| conflict::<TickCount>())
             .0 += 1;
     }
 }

@@ -40,9 +40,9 @@ fn spawner(
     mut late: Mut<Signal<Late>>,
     mut living: Mut<Resource<Living>>,
     mut ages: Mut<Resource<Ages>>,
-    tick: Resource<Tick>,
+    tick: Tick,
 ) {
-    let tick = (*tick).0;
+    let tick = tick.get();
     let entity = em.spawn();
     (*living).0.push(entity);
     (*ages).0.insert(entity, 0);

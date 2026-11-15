@@ -112,7 +112,7 @@ fn an_input_can_be_sent_when_no_system_reads_it() {
     world.input(Unread(2));
     world.step();
 
-    assert_eq!(world.get_resource::<Tick>().unwrap().0, 2);
+    assert_eq!(world.tick(), 2);
 }
 
 #[test]
@@ -170,7 +170,7 @@ fn build_runs_before_the_first_tick() {
         setup.set_component(unit, Health(30));
     });
 
-    assert_eq!(world.get_resource::<Tick>().unwrap().0, 0);
+    assert_eq!(world.tick(), 0);
     assert_eq!(world.get_resource::<Config>().unwrap().0, 9);
     assert_eq!(world.get_component::<Health>(unit).unwrap().0, 30);
     assert!(world.entities().is_alive(unit));

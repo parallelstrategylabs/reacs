@@ -1,5 +1,10 @@
 pub use reacs_derive::Hashed;
 
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` isn't declared with #[resource], #[component] or #[signal]",
+    label = "not a reacs type",
+    note = "if this is `Tick`: it's a param, not a resource, so take `tick: Tick` to read the tick (nothing can write it)"
+)]
 pub trait Hashed {
     const TYPE_UUID: u128;
 }

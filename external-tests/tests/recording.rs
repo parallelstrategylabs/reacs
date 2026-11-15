@@ -161,7 +161,7 @@ fn a_game_can_compare_two_worlds_by_their_resource_hashes() {
         "{changed:?}"
     );
     assert!(
-        !changed.iter().any(|name| name.ends_with("Tick")),
+        !changed.iter().any(|name| name.ends_with("TickCount")),
         "{changed:?}"
     );
 }
@@ -192,7 +192,7 @@ fn a_recording_reads_back_as_data_a_tool_can_run_again() {
     let mut copy = World::new();
     assert!(copy.restore(&recording.sections[0].state).is_some());
     for recorded in &recording.sections[0].ticks {
-        while copy.get_resource::<Tick>().unwrap().0 < recorded.tick {
+        while copy.tick() < recorded.tick {
             copy.step();
         }
         for inputs in &recorded.inputs {
@@ -236,7 +236,7 @@ fn a_playback_replays_a_session_with_a_load_into_the_same_world() {
 
     assert_eq!(playback.diverged(), None);
     assert_eq!(steps, 12 + 4);
-    assert_eq!(world.get_resource::<Tick>().unwrap().0, 14);
+    assert_eq!(world.tick(), 14);
     assert_eq!(world.resource_hashes(), original.resource_hashes());
     assert_eq!(world.save(), original.save());
 }
@@ -268,7 +268,7 @@ fn a_playback_reports_where_a_different_world_diverges() {
 }
 
 fn tick(world: &World) -> u64 {
-    world.get_resource::<Tick>().unwrap().0
+    world.tick()
 }
 
 #[test]

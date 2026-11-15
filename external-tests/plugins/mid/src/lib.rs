@@ -15,7 +15,7 @@ pub fn apply_damage(
     mut combat: Mut<Combat>,
     mut died: Mut<Signal<Died>>,
 ) {
-    let tick = (*combat.tick).0;
+    let tick = combat.tick.get();
     for signal in damage.receive() {
         let Some(health) = combat.health.get_mut(signal.target) else {
             continue;

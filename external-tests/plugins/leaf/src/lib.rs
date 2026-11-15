@@ -22,7 +22,7 @@ pub struct Combat {
     pub health: Component<Health>,
     pub log: Resource<CombatLog>,
     #[read]
-    pub tick: Resource<Tick>,
+    pub tick: Tick,
 }
 
 #[system]

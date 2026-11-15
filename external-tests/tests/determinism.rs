@@ -210,8 +210,8 @@ fn run_session() -> Vec<String> {
     let mut saved = None;
     let mut loaded = false;
 
-    while world.get_resource::<Tick>().unwrap().0 < TICKS {
-        let tick = world.get_resource::<Tick>().unwrap().0;
+    while world.tick() < TICKS {
+        let tick = world.tick();
         if tick == SAVE_AT && saved.is_none() {
             saved = Some(world.save());
         }

@@ -12,9 +12,9 @@ pub fn despawn_dead(
     mut died: Mut<Signal<Died>>,
     mut em: Mut<EntityManager>,
     mut log: Mut<Resource<CombatLog>>,
-    tick: Resource<Tick>,
+    tick: Tick,
 ) {
-    let tick = (*tick).0;
+    let tick = tick.get();
     for signal in died.receive() {
         em.despawn(signal.0);
         log.lines

@@ -6,12 +6,12 @@ use reacs_derive::{param, resource};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
-    Tick,
     bit_set::BitSet,
     hashed::Hashed,
     registry::get_registry_entry,
     resource::Resource,
     schedule::{CurrentSystem, Mode, Mut, ParamInit, ParamWorld, Read, WorldAccess, Write},
+    tick::TickCount,
     world::World,
 };
 
@@ -1297,7 +1297,7 @@ pub struct Signal<S: SignalType> {
     signals: Resource<Signals<S>>,
     data: Resource<SignalData<S>>,
     #[read]
-    tick: Resource<Tick>,
+    tick: Resource<TickCount>,
     #[read]
     current: Resource<CurrentSystem>,
     #[read]
@@ -1310,7 +1310,7 @@ pub struct Receiver<S: SignalType> {
     signals: Resource<Signals<S>>,
     data: Resource<SignalData<S>>,
     #[read]
-    tick: Resource<Tick>,
+    tick: Resource<TickCount>,
     #[read]
     current: Resource<CurrentSystem>,
     #[read]
@@ -1322,7 +1322,7 @@ pub struct Sender<S: SignalType> {
     signals: Resource<Signals<S>>,
     data: Resource<SignalData<S>>,
     #[read]
-    tick: Resource<Tick>,
+    tick: Resource<TickCount>,
 }
 
 impl<'w, S: SignalType> Signal<'w, S, Write> {
@@ -1522,7 +1522,7 @@ fn get_registered_signals() -> &'static [fn(&World)] {
 fn cleanup_in_world<S: SignalType>(world: &World) {
     let (Some(mut signals), Some(tick)) = (
         world.get_resource_mut::<Signals<S>>(),
-        world.get_resource::<Tick>(),
+        world.get_resource::<TickCount>(),
     ) else {
         return;
     };
@@ -1556,7 +1556,7 @@ impl World {
 
         self.init_resource::<Signals<S>>();
         self.init_resource::<SignalData<S>>();
-        self.init_resource::<Tick>();
+        self.init_resource::<TickCount>();
     }
 
     #[inline]
@@ -1583,7 +1583,8 @@ impl World {
 mod tests {
     use super::{IntoWindow, SWEEP_BUDGET, SignalData, Signals, SweepCursor};
     use crate::{
-        Tick, entity::Entity, prelude::*, registry::get_registry_entry, schedule::CurrentSystem,
+        entity::Entity, prelude::*, registry::get_registry_entry, schedule::CurrentSystem,
+        tick::TickCount,
     };
 
     #[signal]
@@ -1604,7 +1605,7 @@ mod tests {
 
     fn end_tick(world: &World) {
         world.cleanup_signals();
-        world.get_resource_mut::<Tick>().unwrap().0 += 1;
+        world.get_resource_mut::<TickCount>().unwrap().0 += 1;
     }
 
     fn receive(world: &World) -> Vec<u64> {
@@ -1614,7 +1615,7 @@ mod tests {
     fn peek(world: &World) -> Vec<u64> {
         let signals = world.get_resource::<Signals<NumSignal>>().unwrap();
         let mut data = world.get_resource_mut::<SignalData<NumSignal>>().unwrap();
-        let tick = world.get_resource::<Tick>().unwrap().0;
+        let tick = world.get_resource::<TickCount>().unwrap().0;
         let fresh = u128::MAX - data.cursors.len() as u128;
         signals
             .receive(&mut data, fresh, tick, |_| true)
@@ -1980,7 +1981,7 @@ mod tests {
                 if random(4) == 0 {
                     continue;
                 }
-                let now = world.get_resource::<Tick>().unwrap().0;
+                let now = world.get_resource::<TickCount>().unwrap().0;
                 let signals = world.get_resource::<Signals<NumSignal>>().unwrap();
                 let mut data = world.get_resource_mut::<SignalData<NumSignal>>().unwrap();
                 let pending = signals.pending(&data, receiver, now);
@@ -3673,7 +3674,7 @@ mod tests {
                 let signals = world.get_resource::<Signals<Tagged>>().unwrap();
                 run.loads_mid_lap += (signals.permanent_read > signals.permanent_write) as u64;
             }
-            assert_eq!(world.get_resource::<Tick>().unwrap().0, tick);
+            assert_eq!(world.get_resource::<TickCount>().unwrap().0, tick);
 
             let mut events: Vec<usize> = Vec::new();
             for receiver in 0..RECEIVERS {
