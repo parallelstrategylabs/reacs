@@ -134,6 +134,8 @@
 //! }
 //! ```
 
+#![warn(missing_docs)]
+
 extern crate self as reacs;
 
 pub mod bit_set;
