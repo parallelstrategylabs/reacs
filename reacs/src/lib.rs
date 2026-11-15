@@ -176,7 +176,7 @@ pub mod prelude {
     pub use crate::index_map::IndexMap;
     pub use crate::resource::{LocalResource, Resource};
     pub use crate::schedule::{
-        IntoSystem, Mut, SystemEntry, SystemGraph, SystemParam, WorldAccess, system_graph,
+        IntoSystem, Mut, Setup, SystemEntry, SystemGraph, SystemParam, WorldAccess, system_graph,
     };
     pub use crate::signal::{
         At, For, In, InputSignal, IntoWindow, Receiver, Sender, Signal, SignalType, To,

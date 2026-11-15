@@ -11,7 +11,7 @@ use std::cell::{Ref, RefMut};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fmt::Write as _;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 
 static SYSTEM_GRAPH: Registry<SystemGraph> = Registry::new();
 
@@ -581,15 +581,125 @@ pub trait WithMode<M: Mode> {
 /// since receiving moves the system's saved read position.
 pub type Mut<P> = <P as WithMode<Write>>::Out;
 
+/// Systems can't add or remove resources or storage: only [`World::build`]'s setup can.
+///
+/// ```compile_fail,E0624
+/// use reacs::prelude::*;
+///
+/// #[resource]
+/// struct Gold(u32);
+///
+/// #[component]
+/// struct Health(i32);
+///
+/// #[signal]
+/// struct Ping;
+///
+/// // `init_resource` mid-game would make saves fail to load in a fresh world.
+/// #[system]
+/// fn sneak(mut world: Mut<WorldAccess>) {
+///     world.init_resource::<Gold>();
+/// }
+///
+/// fn main() {}
+/// ```
+///
+/// ```compile_fail,E0624
+/// use reacs::prelude::*;
+///
+/// #[resource]
+/// struct Gold(u32);
+///
+/// #[component]
+/// struct Health(i32);
+///
+/// #[signal]
+/// struct Ping;
+///
+/// // `insert_resource` mid-game would make saves fail to load in a fresh world.
+/// #[system]
+/// fn sneak(mut world: Mut<WorldAccess>) {
+///     world.insert_resource(Gold(1));
+/// }
+///
+/// fn main() {}
+/// ```
+///
+/// ```compile_fail,E0624
+/// use reacs::prelude::*;
+///
+/// #[resource]
+/// struct Gold(u32);
+///
+/// #[component]
+/// struct Health(i32);
+///
+/// #[signal]
+/// struct Ping;
+///
+/// // `remove_resource` mid-game would make saves fail to load in a fresh world.
+/// #[system]
+/// fn sneak(mut world: Mut<WorldAccess>) {
+///     world.remove_resource::<Gold>();
+/// }
+///
+/// fn main() {}
+/// ```
+///
+/// ```compile_fail,E0624
+/// use reacs::prelude::*;
+///
+/// #[resource]
+/// struct Gold(u32);
+///
+/// #[component]
+/// struct Health(i32);
+///
+/// #[signal]
+/// struct Ping;
+///
+/// // `init_component` mid-game would make saves fail to load in a fresh world.
+/// #[system]
+/// fn sneak(mut world: Mut<WorldAccess>) {
+///     world.init_component::<Health>();
+/// }
+///
+/// fn main() {}
+/// ```
+///
+/// ```compile_fail,E0624
+/// use reacs::prelude::*;
+///
+/// #[resource]
+/// struct Gold(u32);
+///
+/// #[component]
+/// struct Health(i32);
+///
+/// #[signal]
+/// struct Ping;
+///
+/// // `init_signal` mid-game would make saves fail to load in a fresh world.
+/// #[system]
+/// fn sneak(mut world: Mut<WorldAccess>) {
+///     world.init_signal::<Ping>();
+/// }
+///
+/// fn main() {}
+/// ```
+#[cfg(doctest)]
+pub struct SystemsCantAddStorage;
+
 /// System param giving access to the whole [`World`].
 ///
 /// `WorldAccess` dereferences to `&World`, to read any resource beside the system's other params.
 /// A resource the same system holds for writing reads as `None`.
 ///
-/// `Mut<WorldAccess>` writes: it adds and removes resources, spawns entities, sets components and
-/// sends any signal. Since it borrows the whole world, it must be the system's only param. It's
-/// also what [`World::build`] passes to its setup closure. It never gives `&mut World`, so a
-/// system can't step, save or load the world it runs in.
+/// `Mut<WorldAccess>` writes: it writes resources, spawns entities, sets components and sends any
+/// signal. Since it borrows the whole world, it must be the system's only param. It never gives
+/// `&mut World`, so a system can't step, save or load the world it runs in. It can't add or remove
+/// resources, or the storage of components and signals: only [`World::build`]'s [`Setup`] can, so
+/// every world has the same resources and a save made at any tick loads into a fresh world.
 pub struct WorldAccess<'w, M: Mode = Read>(M::WorldGuard<'w>);
 
 impl<'w, M0: Mode, M: Mode> WithMode<M> for WorldAccess<'w, M0> {
@@ -604,40 +714,11 @@ impl<M: Mode> Deref for WorldAccess<'_, M> {
 }
 
 impl WorldAccess<'_, Write> {
-    /// Adds resource `R` with its default value, unless the world already has it.
-    #[inline]
-    pub fn init_resource<R: 'static + Default + Hashed>(&mut self) {
-        self.0.init_resource::<R>();
-    }
-
-    /// Adds resource `R`, replacing any value the world had.
-    #[inline]
-    pub fn insert_resource<R: 'static + Hashed>(&mut self, resource: R) {
-        self.0.insert_resource(resource);
-    }
-
-    /// Removes resource `R`. Returns `true` if the world had it.
-    #[inline]
-    pub fn remove_resource<R: 'static + Hashed>(&mut self) -> bool {
-        self.0.remove_resource::<R>()
-    }
-
     /// Returns resource `R` for writing, or `None` if the world doesn't have it or it's already
     /// borrowed.
     #[inline]
     pub fn get_resource_mut<R: 'static + Hashed>(&self) -> Option<RefMut<'_, R>> {
         self.0.get_resource_mut::<R>()
-    }
-
-    /// Creates the storage for component `C`, unless the world already has it. Only needed for a
-    /// component no system uses.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `C` isn't declared with `#[component]`.
-    #[inline]
-    pub fn init_component<C: 'static + Copy + Default + Hashed>(&mut self) {
-        self.0.init_component::<C>();
     }
 
     /// Gives `entity` component `C`, replacing any value it had. See [`Component::insert`].
@@ -647,7 +728,7 @@ impl WorldAccess<'_, Write> {
     /// # Panics
     ///
     /// Panics if the world has no storage for `C`: no system uses it and
-    /// [`init_component`](Self::init_component) wasn't called.
+    /// [`Setup::init_component`] wasn't called.
     #[inline]
     pub fn set_component<C: 'static + Copy + Default + Hashed>(
         &mut self,
@@ -685,6 +766,70 @@ impl WorldAccess<'_, Write> {
         self.0.entity_manager().spawn()
     }
 
+    /// Returns signal `S`, to send, modify, cancel or receive it. See [`Signal`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the world has no storage for `S` (no system uses it and
+    /// [`Setup::init_signal`] wasn't called), or if `S` is already borrowed, as by
+    /// calling this twice for the same `S` in one statement.
+    #[inline]
+    pub fn signal<S: SignalType>(&self) -> Mut<Signal<'_, S>> {
+        self.0.signal::<S>()
+    }
+}
+
+/// What [`World::build`] passes to its setup closure: a `Mut<WorldAccess>` that can also add and
+/// remove resources, and create the storage of components and signals no system uses.
+///
+/// Everything [`WorldAccess`] writes is available through it. Only setup can change which resources
+/// a world has: systems can't, so every world built the same way has the same resources, and a save
+/// made at any tick loads into it.
+pub struct Setup<'w>(WorldAccess<'w, Write>);
+
+impl<'w> Deref for Setup<'w> {
+    type Target = WorldAccess<'w, Write>;
+    fn deref(&self) -> &WorldAccess<'w, Write> {
+        &self.0
+    }
+}
+
+impl DerefMut for Setup<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Setup<'_> {
+    /// Adds resource `R` with its default value, unless the world already has it.
+    #[inline]
+    pub fn init_resource<R: 'static + Default + Hashed>(&mut self) {
+        self.0.0.init_resource::<R>();
+    }
+
+    /// Adds resource `R`, replacing any value the world had.
+    #[inline]
+    pub fn insert_resource<R: 'static + Hashed>(&mut self, resource: R) {
+        self.0.0.insert_resource(resource);
+    }
+
+    /// Removes resource `R`. Returns `true` if the world had it.
+    #[inline]
+    pub fn remove_resource<R: 'static + Hashed>(&mut self) -> bool {
+        self.0.0.remove_resource::<R>()
+    }
+
+    /// Creates the storage for component `C`, unless the world already has it. Only needed for a
+    /// component no system uses.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `C` isn't declared with `#[component]`.
+    #[inline]
+    pub fn init_component<C: 'static + Copy + Default + Hashed>(&mut self) {
+        self.0.0.init_component::<C>();
+    }
+
     /// Creates the storage for signal `S`, unless the world already has it. Only needed for a
     /// signal no system uses.
     ///
@@ -693,19 +838,7 @@ impl WorldAccess<'_, Write> {
     /// Panics if `S` isn't declared with `#[signal]`.
     #[inline]
     pub fn init_signal<S: SignalType>(&mut self) {
-        self.0.init_signal::<S>();
-    }
-
-    /// Returns signal `S`, to send, modify, cancel or receive it. See [`Signal`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if the world has no storage for `S` (no system uses it and
-    /// [`init_signal`](Self::init_signal) wasn't called), or if `S` is already borrowed, as by
-    /// calling this twice for the same `S` in one statement.
-    #[inline]
-    pub fn signal<S: SignalType>(&self) -> Mut<Signal<'_, S>> {
-        self.0.signal::<S>()
+        self.0.0.init_signal::<S>();
     }
 }
 
@@ -764,8 +897,8 @@ pub(crate) fn conflict<T>() -> ! {
 impl World {
     /// Creates a world and runs `setup` once to write its starting state.
     ///
-    /// `setup` gets a `Mut<WorldAccess>`: it can insert resources, spawn entities, set components
-    /// and send any signal. This is the only place the host writes into a world; afterwards the
+    /// `setup` gets a [`Setup`]: it can add resources, spawn entities, set components and send any
+    /// signal. This is the only place the host writes into a world; afterwards the
     /// only way in is input signals, sent with [`input`](Self::input). Signals sent in `setup`
     /// count as sent on tick 0, before any system runs.
     ///
@@ -799,9 +932,9 @@ impl World {
     ///     assert_eq!(world.get_component::<Gold>(players.list[1]).unwrap().0, 100);
     /// }
     /// ```
-    pub fn build(setup: impl FnOnce(&mut WorldAccess<'_, Write>)) -> Self {
+    pub fn build(setup: impl FnOnce(&mut Setup<'_>)) -> Self {
         let mut world = Self::new();
-        setup(&mut WorldAccess(&mut world));
+        setup(&mut Setup(WorldAccess(&mut world)));
         world
     }
 
@@ -1125,8 +1258,7 @@ mod tests {
 
         #[system]
         fn write_world(mut world: Mut<WorldAccess>) {
-            world.insert_resource(IntResource(9));
-            world.init_component::<Health>();
+            world.get_resource_mut::<IntResource>().unwrap().0 = 9;
 
             let entity = world.entity_manager().spawn();
             world.set_component(entity, Health(3));
@@ -1134,6 +1266,8 @@ mod tests {
         }
 
         let mut world = World::new();
+        world.init_resource::<IntResource>();
+        world.init_component::<Health>();
 
         write_world.into_system().run(&mut world);
 
