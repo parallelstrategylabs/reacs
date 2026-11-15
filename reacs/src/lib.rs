@@ -152,6 +152,11 @@ pub mod state_hash;
 pub mod tick;
 pub mod world;
 
+/// Runs the README's examples as doctests, so they can't drift from the API.
+#[cfg(doctest)]
+#[doc = include_str!("../../README.md")]
+pub struct ReadmeDoctests;
+
 #[doc(hidden)]
 pub mod __private {
     pub use crate::signal::{wake_init, wake_name, wake_pending};
