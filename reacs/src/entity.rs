@@ -12,6 +12,14 @@ use crate::{
     world::World,
 };
 
+/// A handle to an entity: an index plus a generation.
+///
+/// An entity is only an id; its data lives in components. Spawning takes the lowest free index,
+/// and despawning frees it and moves its generation on, so a handle kept after despawn never
+/// matches the entity that reuses its index.
+///
+/// Handles are plain data: store them in components, signals and resources.
+/// `Entity::default()` is never alive.
 #[derive(
     Clone, Copy, Default, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -26,14 +34,21 @@ impl Entity {
         }
     }
 
+    /// Returns the handle as one number: the generation in the high 32 bits, the index in the
+    /// low 32 bits.
     pub fn to_bits(&self) -> u64 {
         self.bits
     }
 
+    /// Returns the index, the entity's slot in every component's storage.
+    ///
+    /// Indexes are reused: after a despawn, the next spawn may get the same index with a newer
+    /// generation.
     pub fn index(&self) -> u32 {
         self.bits as u32
     }
 
+    /// Returns the generation, which tells apart entities that used the same index.
     pub fn generation(&self) -> u32 {
         (self.bits >> 32) as u32
     }
@@ -81,6 +96,50 @@ impl DerefMut for EntityGenerations {
     }
 }
 
+/// System param that spawns, despawns and checks entities.
+///
+/// `EntityManager` reads: [`is_alive`](Self::is_alive) and [`generation`](Self::generation).
+/// `Mut<EntityManager>` also [spawns](Self::spawn) and [despawns](Self::despawn). The host reads
+/// it with [`World::entities`].
+///
+/// # Examples
+///
+/// ```rust,standalone_crate
+/// use reacs::prelude::*;
+///
+/// #[signal(input)]
+/// struct SpawnWave {
+///     size: u32,
+/// }
+///
+/// #[resource]
+/// struct Army {
+///     units: Vec<Entity>,
+/// }
+///
+/// #[system]
+/// fn spawn_wave(
+///     mut waves: Mut<Receiver<SpawnWave>>,
+///     mut entities: Mut<EntityManager>,
+///     mut army: Mut<Resource<Army>>,
+/// ) {
+///     for wave in waves.receive() {
+///         for _ in 0..wave.size {
+///             army.units.push(entities.spawn());
+///         }
+///     }
+/// }
+///
+/// fn main() {
+///     let mut world = World::new();
+///     world.input(SpawnWave { size: 3 });
+///     world.step();
+///
+///     let army = world.get_resource::<Army>().unwrap();
+///     assert_eq!(army.units.len(), 3);
+///     assert!(army.units.iter().all(|&unit| world.entities().is_alive(unit)));
+/// }
+/// ```
 #[param]
 pub struct EntityManager {
     free_list: Resource<EntityFreeList>,
@@ -89,11 +148,14 @@ pub struct EntityManager {
 }
 
 impl<M: Mode> EntityManager<'_, M> {
+    /// Returns the generation of the entity at `index`, or the one the next entity spawned there
+    /// will get if the index is free.
     #[inline]
     pub fn generation(&self, index: u32) -> u32 {
         self.generations.read().current(index as usize)
     }
 
+    /// Returns `true` if `entity` was spawned and hasn't been despawned.
     #[inline]
     pub fn is_alive(&self, entity: Entity) -> bool {
         self.free_list.bitset.get(entity.index() as usize)
@@ -143,6 +205,10 @@ impl<S: EntitySignal> SignalFilter<S> for AliveFilter {
 }
 
 impl EntityManager<'_, Write> {
+    /// Spawns an entity and returns its handle.
+    ///
+    /// The entity takes the lowest free index, so the same spawns give the same handles on every
+    /// run. It has no components until they're inserted.
     #[inline]
     pub fn spawn(&mut self) -> Entity {
         let free_index = self.free_list.reserve();
@@ -150,6 +216,20 @@ impl EntityManager<'_, Write> {
         Entity::new(free_index as u32, generation)
     }
 
+    /// Despawns `entity` immediately. Does nothing if it's already despawned.
+    ///
+    /// Signals of `#[signal(entity)]` types naming it stop being delivered at once, even later in
+    /// a receive loop that is running. Its components aren't touched: their values stay as dead
+    /// data until an entity that reuses the index writes over them, and that entity can't see
+    /// them. A copy of the handle can still read them until then, so read what you need before
+    /// despawning, not after.
+    ///
+    /// # Limits
+    ///
+    /// Each despawn adds one to the index's generation, so after 2<sup>31</sup> despawns of one
+    /// index since a component was written there, inserting that component for the entity now at
+    /// that index is silently ignored. Spawning and despawning one throwaway entity after another
+    /// reuses the same index every time; spawn them in batches to reduce the risk.
     #[inline]
     pub fn despawn(&mut self, entity: Entity) {
         let index = entity.index() as usize;
@@ -171,6 +251,7 @@ impl World {
         self.fetch_param::<Mut<EntityManager>>()
     }
 
+    /// Returns the entity manager for reading, to check whether entities are alive.
     #[inline]
     pub fn entities(&self) -> EntityManager<'_> {
         self.fetch_param::<EntityManager>()

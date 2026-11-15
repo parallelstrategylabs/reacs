@@ -10,6 +10,47 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
+/// System param for a resource declared with `#[resource]`.
+///
+/// `Resource<T>` reads the resource and `Mut<Resource<T>>` writes it; both dereference to `T`.
+/// The resource exists in every world that has a system using it, starting from its `Default`
+/// value.
+///
+/// For a tuple resource, write `(*score).0` rather than `score.0`: `.0` names this param's own
+/// field.
+///
+/// # Panics
+///
+/// The system panics when it runs if another of its params also borrows `T` and one of them
+/// writes it, like `Resource<T>` with `Mut<Resource<T>>`.
+///
+/// # Examples
+///
+/// ```rust,standalone_crate
+/// use reacs::prelude::*;
+///
+/// #[resource]
+/// struct Rules {
+///     income: u32,
+/// }
+///
+/// #[resource]
+/// struct Bank {
+///     gold: u32,
+/// }
+///
+/// #[system]
+/// fn pay(rules: Resource<Rules>, mut bank: Mut<Resource<Bank>>) {
+///     bank.gold += rules.income;
+/// }
+///
+/// fn main() {
+///     let mut world = World::build(|setup| setup.insert_resource(Rules { income: 5 }));
+///     world.step();
+///     world.step();
+///     assert_eq!(world.get_resource::<Bank>().unwrap().gold, 10);
+/// }
+/// ```
 pub struct Resource<'w, T: 'static, M: Mode = Read>(pub M::Guard<'w, T>);
 
 impl<'w, T: 'static, M0: Mode, M: Mode> WithMode<M> for Resource<'w, T, M0> {
@@ -48,10 +89,20 @@ impl<T: 'static + Hashed + Default, M: Mode> SystemParam for Resource<'_, T, M> 
     message = "`{Self}` is not a local resource",
     note = "declare it with #[resource(local)]"
 )]
+/// A type declared with `#[resource(local)]`.
+///
+/// Implemented by the macro; game code doesn't implement it by hand.
 pub trait LocalResourceType: 'static + Default {
+    /// The hook set with `on_load = method`, run after every load.
     const ON_LOAD: Option<fn(&mut Self, &World)> = None;
 }
 
+/// System param for a local resource declared with `#[resource(local)]`.
+///
+/// `LocalResource<T>` reads it and `Mut<LocalResource<T>>` writes it, with the same borrow rules as
+/// [`Resource`]. Local resources aren't saved or hashed, so they may only hold caches that can be
+/// rebuilt from saved state: game logic that depends on one gives different results after a load
+/// or in a replay.
 pub struct LocalResource<'w, T: 'static, M: Mode = Read>(pub M::Guard<'w, T>);
 
 impl<'w, T: 'static, M0: Mode, M: Mode> WithMode<M> for LocalResource<'w, T, M0> {

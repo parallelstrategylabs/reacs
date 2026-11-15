@@ -21,6 +21,10 @@ pub fn register_system(system: SystemEntry) {
     SYSTEM_GRAPH.add(&name, |graph| graph.insert(system));
 }
 
+/// Returns every system in the program, in execution order.
+///
+/// Systems register themselves before `main`; the first call to this function, or to
+/// [`World::new`], closes registration.
 pub fn system_graph() -> &'static SystemGraph {
     SYSTEM_GRAPH.get()
 }
@@ -34,13 +38,23 @@ pub trait SystemId {
     const UUID: u128;
 }
 
+/// A registered system: its id, name, ordering and the function that runs it.
+///
+/// `#[system]` builds and registers these; read them through [`system_graph`].
 pub struct SystemEntry {
+    /// The system's id, a hash of its module path and name.
     pub uuid: u128,
+    /// The module path of the system's function.
     pub module: &'static str,
+    /// The name of the system's function.
     pub name: &'static str,
+    /// Ids of the systems this one runs before.
     pub before: Vec<u128>,
+    /// Ids of the systems this one runs after.
     pub after: Vec<u128>,
+    /// Id of the group this system belongs to, if any.
     pub groups: Vec<u128>,
+    /// Short names of the signal types that wake this system, if it sleeps.
     pub wakes_on: Vec<&'static str>,
     pub(crate) init_fn: Box<dyn Fn(&mut World) + Send + Sync>,
     pub(crate) run_fn: Box<dyn Fn(&mut World) + Send + Sync>,
@@ -48,6 +62,7 @@ pub struct SystemEntry {
 }
 
 impl SystemEntry {
+    /// Sets the system's module and name, and its id from them.
     pub fn named(mut self, module: &'static str, name: &'static str) -> Self {
         self.uuid = hash_path(module, name);
         self.module = module;
@@ -55,16 +70,19 @@ impl SystemEntry {
         self
     }
 
+    /// Makes the system run before the systems with these ids.
     pub fn run_before(mut self, targets: &[u128]) -> Self {
         self.before.extend_from_slice(targets);
         self
     }
 
+    /// Makes the system run after the systems with these ids.
     pub fn run_after(mut self, targets: &[u128]) -> Self {
         self.after.extend_from_slice(targets);
         self
     }
 
+    /// Makes the system a member of the group with this id.
     pub fn in_group(mut self, groups: &[u128]) -> Self {
         self.groups.extend_from_slice(groups);
         self
@@ -87,6 +105,9 @@ pub(crate) fn set_current_system(world: &World, uuid: u128) {
     }
 }
 
+/// Every system in the program, sorted in execution order.
+///
+/// Read it with [`system_graph`] or print it with [`World::print_system_order`].
 pub struct SystemGraph {
     nodes: Vec<SystemEntry>,
 }
@@ -98,10 +119,17 @@ impl Default for SystemGraph {
 }
 
 impl SystemGraph {
+    /// Creates an empty graph.
     pub const fn new() -> Self {
         Self { nodes: Vec::new() }
     }
 
+    /// Adds a system and sorts the graph again.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the system has no id or the same id as another system, if it's in more than one
+    /// group, if groups end up nested, or if the ordering has a cycle.
     pub fn insert(&mut self, system: SystemEntry) {
         assert!(
             system.uuid != ANONYMOUS_SYSTEM,
@@ -281,10 +309,12 @@ impl SystemGraph {
         }
     }
 
+    /// Returns an iterator over the systems, in execution order.
     pub fn iter(&self) -> impl Iterator<Item = &SystemEntry> {
         self.nodes.iter()
     }
 
+    /// Returns the execution order as text. See [`World::system_order`].
     pub fn tree(&self) -> String {
         let width = self.nodes.len().to_string().len();
         let mut tree = String::new();
@@ -321,6 +351,7 @@ impl SystemGraph {
         tree
     }
 
+    /// Prints the execution order. See [`World::print_system_order`].
     pub fn print_tree(&self) {
         print!("{}", self.tree());
     }
@@ -382,12 +413,23 @@ impl Wake {
     label = "not a system parameter",
     note = "signal params only exist with `Mut`: `Mut<Receiver<S>>`, `Mut<Sender<S>>` or `Mut<Signal<S>>`, since receiving moves a saved cursor"
 )]
+/// A type a system can take as an argument.
+///
+/// Implemented by [`Resource`](crate::resource::Resource),
+/// [`LocalResource`](crate::resource::LocalResource), [`Component`](crate::component::Component),
+/// [`EntityManager`], [`Tick`](crate::tick::Tick), [`WorldAccess`], the signal params
+/// [`Receiver`](crate::signal::Receiver), [`Sender`](crate::signal::Sender) and [`Signal`], their
+/// [`Mut`] forms (`Tick` has none, since it only reads), and `#[param]` structs.
+/// Game code doesn't implement it by hand: bundle existing params with `#[param]` instead.
 pub trait SystemParam {
+    /// The param as the system receives it, borrowing the world for one run.
     type Item<'w>;
     #[doc(hidden)]
     const WAKE: Wake = Wake::Neutral;
 
+    /// Creates whatever the param needs in a new world, like a resource's default value.
     fn init(world: ParamInit<'_>);
+    /// Borrows the param from the world for one run of the system.
     fn fetch<'w>(world: ParamWorld<'w>) -> Self::Item<'w>;
 
     #[doc(hidden)]
@@ -400,7 +442,12 @@ pub trait SystemParam {
     fn wakes_on(_names: &mut Vec<&'static str>) {}
 }
 
+/// A function that can be turned into a system.
+///
+/// Implemented for functions taking up to 8 [`SystemParam`]s, and for functions taking only a
+/// `Mut<WorldAccess>`. `#[system]` uses it; game code doesn't need to.
 pub trait IntoSystem<P> {
+    /// Builds the system's entry, without an id or a name.
     fn into_system(self) -> SystemEntry;
 }
 
@@ -526,8 +573,23 @@ pub trait WithMode<M: Mode> {
     type Out;
 }
 
+/// The writing form of a system param.
+///
+/// `Resource<T>` reads a resource and `Mut<Resource<T>>` writes it; the same goes for
+/// `Component<C>`, `EntityManager`, `LocalResource<T>`, `WorldAccess` and `#[param]` structs. The
+/// signal params only exist in this form (`Mut<Receiver<S>>`, `Mut<Sender<S>>`, `Mut<Signal<S>>`),
+/// since receiving moves the system's saved read position.
 pub type Mut<P> = <P as WithMode<Write>>::Out;
 
+/// System param giving access to the whole [`World`].
+///
+/// `WorldAccess` dereferences to `&World`, to read any resource beside the system's other params.
+/// A resource the same system holds for writing reads as `None`.
+///
+/// `Mut<WorldAccess>` writes: it adds and removes resources, spawns entities, sets components and
+/// sends any signal. Since it borrows the whole world, it must be the system's only param. It's
+/// also what [`World::build`] passes to its setup closure. It never gives `&mut World`, so a
+/// system can't step, save or load the world it runs in.
 pub struct WorldAccess<'w, M: Mode = Read>(M::WorldGuard<'w>);
 
 impl<'w, M0: Mode, M: Mode> WithMode<M> for WorldAccess<'w, M0> {
@@ -542,31 +604,50 @@ impl<M: Mode> Deref for WorldAccess<'_, M> {
 }
 
 impl WorldAccess<'_, Write> {
+    /// Adds resource `R` with its default value, unless the world already has it.
     #[inline]
     pub fn init_resource<R: 'static + Default + Hashed>(&mut self) {
         self.0.init_resource::<R>();
     }
 
+    /// Adds resource `R`, replacing any value the world had.
     #[inline]
     pub fn insert_resource<R: 'static + Hashed>(&mut self, resource: R) {
         self.0.insert_resource(resource);
     }
 
+    /// Removes resource `R`. Returns `true` if the world had it.
     #[inline]
     pub fn remove_resource<R: 'static + Hashed>(&mut self) -> bool {
         self.0.remove_resource::<R>()
     }
 
+    /// Returns resource `R` for writing, or `None` if the world doesn't have it or it's already
+    /// borrowed.
     #[inline]
     pub fn get_resource_mut<R: 'static + Hashed>(&self) -> Option<RefMut<'_, R>> {
         self.0.get_resource_mut::<R>()
     }
 
+    /// Creates the storage for component `C`, unless the world already has it. Only needed for a
+    /// component no system uses.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `C` isn't declared with `#[component]`.
     #[inline]
     pub fn init_component<C: 'static + Copy + Default + Hashed>(&mut self) {
         self.0.init_component::<C>();
     }
 
+    /// Gives `entity` component `C`, replacing any value it had. See [`Component::insert`].
+    ///
+    /// [`Component::insert`]: crate::component::Component::insert
+    ///
+    /// # Panics
+    ///
+    /// Panics if the world has no storage for `C`: no system uses it and
+    /// [`init_component`](Self::init_component) wasn't called.
     #[inline]
     pub fn set_component<C: 'static + Copy + Default + Hashed>(
         &mut self,
@@ -576,26 +657,52 @@ impl WorldAccess<'_, Write> {
         self.0.set_component(entity, value);
     }
 
+    /// Removes `entity`'s component `C`, if it has one.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the world has no storage for `C`, as [`set_component`](Self::set_component)
+    /// does.
     #[inline]
     pub fn remove_component<C: 'static + Copy + Default + Hashed>(&mut self, entity: Entity) {
         self.0.remove_component::<C>(entity);
     }
 
+    /// Returns the entity manager, to spawn and despawn entities.
+    ///
+    /// # Panics
+    ///
+    /// The manager stays borrowed until it's dropped, so calling this twice in one statement
+    /// panics. Use separate statements.
     #[inline]
     pub fn entity_manager(&self) -> Mut<EntityManager<'_>> {
         self.0.entity_manager()
     }
 
+    /// Spawns an entity and returns its handle. See [`EntityManager::spawn`].
     #[inline]
     pub fn spawn(&self) -> Entity {
         self.0.entity_manager().spawn()
     }
 
+    /// Creates the storage for signal `S`, unless the world already has it. Only needed for a
+    /// signal no system uses.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `S` isn't declared with `#[signal]`.
     #[inline]
     pub fn init_signal<S: SignalType>(&mut self) {
         self.0.init_signal::<S>();
     }
 
+    /// Returns signal `S`, to send, modify, cancel or receive it. See [`Signal`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the world has no storage for `S` (no system uses it and
+    /// [`init_signal`](Self::init_signal) wasn't called), or if `S` is already borrowed, as by
+    /// calling this twice for the same `S` in one statement.
     #[inline]
     pub fn signal<S: SignalType>(&self) -> Mut<Signal<'_, S>> {
         self.0.signal::<S>()
@@ -655,6 +762,43 @@ pub(crate) fn conflict<T>() -> ! {
 }
 
 impl World {
+    /// Creates a world and runs `setup` once to write its starting state.
+    ///
+    /// `setup` gets a `Mut<WorldAccess>`: it can insert resources, spawn entities, set components
+    /// and send any signal. This is the only place the host writes into a world; afterwards the
+    /// only way in is input signals, sent with [`input`](Self::input). Signals sent in `setup`
+    /// count as sent on tick 0, before any system runs.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,standalone_crate
+    /// use reacs::prelude::*;
+    ///
+    /// #[component]
+    /// struct Gold(u32);
+    ///
+    /// #[resource]
+    /// struct Players {
+    ///     list: Vec<Entity>,
+    /// }
+    ///
+    /// fn main() {
+    ///     let world = World::build(|setup| {
+    ///         // No system here uses Gold, so its storage is created by hand.
+    ///         setup.init_component::<Gold>();
+    ///         let mut players = Players::default();
+    ///         for _ in 0..2 {
+    ///             let player = setup.spawn();
+    ///             setup.set_component(player, Gold(100));
+    ///             players.list.push(player);
+    ///         }
+    ///         setup.insert_resource(players);
+    ///     });
+    ///
+    ///     let players = world.get_resource::<Players>().unwrap();
+    ///     assert_eq!(world.get_component::<Gold>(players.list[1]).unwrap().0, 100);
+    /// }
+    /// ```
     pub fn build(setup: impl FnOnce(&mut WorldAccess<'_, Write>)) -> Self {
         let mut world = Self::new();
         setup(&mut WorldAccess(&mut world));
@@ -676,6 +820,14 @@ impl World {
         system_graph().run(self);
     }
 
+    /// Advances the world by one tick.
+    ///
+    /// Runs every system once, in order, skipping sleeping systems with nothing to receive. Then
+    /// it cleans up the tick's signals and adds one to the [tick](Self::tick).
+    ///
+    /// # Panics
+    ///
+    /// Panics if a system panics, including on a borrow conflict between its params.
     pub fn step(&mut self) {
         self.steps += 1;
         self.run_systems();

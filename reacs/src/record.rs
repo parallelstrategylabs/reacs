@@ -268,6 +268,70 @@ impl Recorder {
 }
 
 impl World {
+    /// Starts recording this world into a file at `path`.
+    ///
+    /// Writes the current state, then the returned [`Recorder`] appends each tick's inputs and,
+    /// every 64 ticks by default, a hash of every resource. Each tick, send that tick's inputs,
+    /// then call [`record`](Self::record) right before [`step`](Self::step). End with
+    /// [`Recorder::finish`]. Replay the file with [`to_playback`](Self::to_playback).
+    ///
+    /// Recording a tick with no input and no hash costs well under a microsecond. A tick with a
+    /// hash visits the whole world, so it's a hitch that grows with the world's size; set how
+    /// often it happens with [`Recorder::with_hash_every`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file can't be created or written. Errors after this don't stop the
+    /// game: the recorder stops writing and reports them through [`Recorder::error`].
+    ///
+    /// # Examples
+    ///
+    /// ```rust,standalone_crate
+    /// use reacs::prelude::*;
+    ///
+    /// #[signal(input)]
+    /// struct Order {
+    ///     unit: u32,
+    /// }
+    ///
+    /// #[resource]
+    /// struct Orders {
+    ///     last: u32,
+    ///     count: u32,
+    /// }
+    ///
+    /// #[system]
+    /// fn obey(mut orders: Mut<Receiver<Order>>, mut total: Mut<Resource<Orders>>) {
+    ///     for order in orders.receive() {
+    ///         total.last = order.unit;
+    ///         total.count += 1;
+    ///     }
+    /// }
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let path = std::env::temp_dir().join("reacs-doc-recording.rec");
+    ///
+    ///     let mut world = World::new();
+    ///     let mut recorder = world.to_recorder(&path)?;
+    ///     for tick in 0..10 {
+    ///         if tick % 3 == 0 {
+    ///             world.input(Order { unit: tick });
+    ///         }
+    ///         world.record(&mut recorder).step();
+    ///     }
+    ///     recorder.finish(&world)?;
+    ///
+    ///     let mut replayed = World::new();
+    ///     let mut playback = replayed.to_playback(&path)?;
+    ///     while !playback.finished() {
+    ///         replayed.replay(&mut playback).step();
+    ///     }
+    ///
+    ///     assert!(playback.diverged().is_none());
+    ///     assert_eq!(replayed.save(), world.save());
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn to_recorder(&self, path: impl AsRef<Path>) -> io::Result<Recorder> {
         let mut out = BufWriter::new(File::create(path)?);
         let state = self.save();
@@ -295,6 +359,15 @@ impl World {
         })
     }
 
+    /// Records this tick's inputs into `recorder` and returns the world, for
+    /// `world.record(&mut recorder).step()`.
+    ///
+    /// Call it after sending the tick's inputs. A step taken without it loses that tick's inputs
+    /// from the recording. Same as calling [`Recorder::record`] before stepping.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `recorder` was made by another world.
     #[must_use = "call .step() on the returned world"]
     pub fn record(&mut self, recorder: &mut Recorder) -> &mut Self {
         recorder.record(self);
@@ -662,6 +735,18 @@ impl Playback {
 }
 
 impl World {
+    /// Opens the recording at `path` and puts this world in its start state.
+    ///
+    /// Then call `world.replay(&mut playback).step()` until [`Playback::finished`]. The replay
+    /// goes through every load the recorded session made, and compares the recorded hashes:
+    /// [`Playback::diverged`] reports the first tick where this run differs. Stop at any tick and
+    /// call [`Playback::to_recorder`] to keep playing from there, recording the whole history.
+    /// See [`to_recorder`](Self::to_recorder) for an example.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file can't be read, isn't a recording, is corrupted, or was made by
+    /// a different build of the program.
     pub fn to_playback(&mut self, path: impl AsRef<Path>) -> io::Result<Playback> {
         let recording = Recording::open(path)?;
         let start = &recording.sections[0];
@@ -681,6 +766,15 @@ impl World {
         })
     }
 
+    /// Applies the recording's next tick to this world and returns it, for
+    /// `world.replay(&mut playback).step()`.
+    ///
+    /// Restores a saved state where the recorded session loaded one, sends the tick's recorded
+    /// inputs, and compares the recorded hashes. Does nothing once the playback has finished.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `playback` was made by another world.
     #[must_use = "call .step() on the returned world"]
     pub fn replay(&mut self, playback: &mut Playback) -> &mut Self {
         playback.apply(self);

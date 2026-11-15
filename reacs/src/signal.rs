@@ -46,25 +46,52 @@ impl<S> SignalFilter<S> for NoFilter {
     }
 }
 
+/// A type declared with `#[signal]`.
+///
+/// Implemented by the macro; game code doesn't implement it by hand.
 pub trait SignalType: 'static + Copy + Default + Hashed + Serialize + DeserializeOwned {
+    /// Decides which signals are still delivered: none are dropped for a plain `#[signal]`, and
+    /// signals of a despawned entity are dropped for `#[signal(entity)]`.
     type Filter: SignalFilter<Self>;
 }
 
+/// A resolved window: the ticks `start..end` a signal is delivered on.
+///
+/// Produced by [`IntoWindow`]; game code writes windows with [`In`], [`At`], [`For`] and [`To`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignalWindow {
+    /// The first tick of the window.
     pub start: u64,
+    /// The tick after the last one, or `u64::MAX` for a window that lasts until cancelled.
     pub end: u64,
 }
 
+/// A window start: `n` ticks from now.
+///
+/// Alone, `In(n)` is a one-tick signal delivered `n` ticks from the current tick; `In(0)` is now.
+/// Pair it with an end for a longer window: `(In(2), For(3))`, or `(In(2), ..)` until cancelled.
+/// See [`IntoWindow`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct In(pub u64);
 
+/// A window start: an absolute tick.
+///
+/// Alone, `At(tick)` is a one-tick signal delivered on that tick. Pair it with an end for a longer
+/// window: `(At(40), To(50))`, or `(At(40), ..)` until cancelled. See [`IntoWindow`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct At(pub u64);
 
+/// A window end: `n` ticks long, counted from the start.
+///
+/// Alone, `For(n)` starts now: `For(5)` is this tick and the next 4. `For(0)` is an empty window,
+/// and `For(u64::MAX)` lasts until cancelled, like `..`. See [`IntoWindow`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct For(pub u64);
 
+/// A window end: an absolute tick, included.
+///
+/// Alone, `To(tick)` starts now: `To(50)` runs from this tick through tick 50. See
+/// [`IntoWindow`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct To(pub u64);
 
@@ -101,7 +128,37 @@ impl To {
     label = "a window is a start (`In(n)`, `At(tick)`), an end (`For(n)`, `To(tick)`), or a (start, end) pair",
     note = "for example `In(2)` (one tick, 2 from now), `For(5)`, `(In(2), For(3))`, `(At(40), To(50))`, `(In(2), ..)` or `..`"
 )]
+/// The ticks a signal is delivered on, given to [`Sender::send`] and [`Signal::send`].
+///
+/// A window has a start and an end. Starts are [`In(n)`](In) (`n` ticks from now) and
+/// [`At(tick)`](At) (an absolute tick); ends are [`For(n)`](For) (`n` ticks long) and
+/// [`To(tick)`](To) (an absolute tick, included). `In` and `For` are relative, `At` and `To`
+/// absolute.
+///
+/// | Window             | Delivered on                         |
+/// |--------------------|--------------------------------------|
+/// | `In(2)`            | one tick, 2 ticks from now           |
+/// | `At(40)`           | tick 40 only                         |
+/// | `For(5)`           | this tick and the next 4             |
+/// | `To(50)`           | this tick through tick 50            |
+/// | `(In(2), For(3))`  | 3 ticks, starting 2 ticks from now   |
+/// | `(At(40), To(50))` | ticks 40 through 50                  |
+/// | `(In(2), To(50))`  | 2 ticks from now through tick 50     |
+/// | `(At(40), For(3))` | 3 ticks, starting at tick 40         |
+/// | `(In(2), ..)`      | from 2 ticks from now until cancelled |
+/// | `..`               | from now until cancelled             |
+///
+/// Any start pairs with any end. Anything else, like `(For(3), In(2))` or `0..5`, doesn't compile.
+/// "Now" is the tick the sending system runs on.
+///
+/// A window that has already ended (`At(2)` on tick 3) or is empty (`For(0)`) is rejected: `send`
+/// returns `None` and sends nothing.
+///
+/// A window that lasts until cancelled stays in memory, and in saves, until it's cancelled, or
+/// until its entity is despawned for a `#[signal(entity)]` type. Long windows of plain signals
+/// that nothing cancels pile up.
 pub trait IntoWindow {
+    /// Resolves the window against the current tick, `now`.
     fn into_window(self, now: u64) -> SignalWindow;
 }
 
@@ -166,11 +223,13 @@ impl IntoWindow for RangeFull {
 }
 
 impl SignalWindow {
+    /// Returns `true` if `tick` is in the window.
     #[inline]
     pub fn contains(&self, tick: u64) -> bool {
         self.start <= tick && tick < self.end
     }
 
+    /// Returns `true` if the signal holding this window was cancelled.
     #[inline]
     pub fn is_cancelled(&self) -> bool {
         self.start == u64::MAX
@@ -1292,6 +1351,45 @@ pub fn wake_name<S: SignalType>(names: &mut Vec<&'static str>) {
     names.push(name.rsplit("::").next().unwrap_or(name));
 }
 
+/// System param that receives and sends signals of type `S`: `Mut<Signal<S>>`.
+///
+/// It has every method of [`Receiver`] and [`Sender`], for a system that both receives and sends
+/// the same type. A system holding a `Signal` runs every tick, even with nothing to receive, so
+/// prefer `Receiver` or `Sender` alone when the system only does one of the two.
+///
+/// # Examples
+///
+/// An alarm that rings every 3 ticks, each ring setting the next one:
+///
+/// ```rust,standalone_crate
+/// use reacs::prelude::*;
+///
+/// #[signal]
+/// struct Alarm;
+///
+/// #[resource]
+/// struct Rings {
+///     ticks: Vec<u64>,
+/// }
+///
+/// #[system]
+/// fn alarm(mut alarm: Mut<Signal<Alarm>>, mut rings: Mut<Resource<Rings>>) {
+///     if alarm.receive().next().is_some() {
+///         rings.ticks.push(alarm.tick());
+///         alarm.send(Alarm, In(3));
+///     }
+/// }
+///
+/// fn main() {
+///     let mut world = World::build(|setup| {
+///         setup.signal::<Alarm>().emit(Alarm);
+///     });
+///     for _ in 0..10 {
+///         world.step();
+///     }
+///     assert_eq!(world.get_resource::<Rings>().unwrap().ticks, [0, 3, 6, 9]);
+/// }
+/// ```
 #[param(write, wake = always)]
 pub struct Signal<S: SignalType> {
     signals: Resource<Signals<S>>,
@@ -1304,6 +1402,14 @@ pub struct Signal<S: SignalType> {
     world: WorldAccess,
 }
 
+/// System param that receives signals of type `S`: `Mut<Receiver<S>>`.
+///
+/// A system with a receiver sleeps: it's skipped on ticks where none of its receivers has anything
+/// new, so reacting to rare signals costs almost nothing. The whole system is skipped, so it
+/// shouldn't do work that doesn't come from its signals (see `#[system]`).
+///
+/// Receiving and sending the same type in one system needs [`Signal`]: a `Receiver<S>` and a
+/// `Sender<S>` in the same system is a borrow conflict.
 #[param(write, wake = __gate(S))]
 pub struct Receiver<S: SignalType> {
     #[read]
@@ -1317,6 +1423,56 @@ pub struct Receiver<S: SignalType> {
     world: WorldAccess,
 }
 
+/// System param that sends, modifies and cancels signals of type `S`: `Mut<Sender<S>>`.
+///
+/// A sender doesn't change when its system runs.
+///
+/// # Examples
+///
+/// A bite that poisons a unit for 3 ticks:
+///
+/// ```rust,standalone_crate
+/// use reacs::prelude::*;
+///
+/// #[component]
+/// struct Health(i32);
+///
+/// #[signal(input)]
+/// struct Bite(Entity);
+///
+/// #[signal(entity)]
+/// struct Poison(Entity);
+///
+/// #[system]
+/// fn bite(mut bites: Mut<Receiver<Bite>>, mut poison: Mut<Sender<Poison>>) {
+///     for &Bite(unit) in bites.receive() {
+///         poison.send(Poison(unit), For(3));
+///     }
+/// }
+///
+/// #[system(run_after(bite))]
+/// fn hurt(mut poison: Mut<Receiver<Poison>>, mut health: Mut<Component<Health>>) {
+///     for &Poison(unit) in poison.receive() {
+///         if let Some(hp) = health.get_mut(unit) {
+///             hp.0 -= 1;
+///         }
+///     }
+/// }
+///
+/// fn main() {
+///     let mut unit = Entity::default();
+///     let mut world = World::build(|setup| {
+///         unit = setup.spawn();
+///         setup.set_component(unit, Health(10));
+///     });
+///     world.input(Bite(unit));
+///     for _ in 0..5 {
+///         world.step();
+///     }
+///     // Poisoned on ticks 0, 1 and 2.
+///     assert_eq!(world.get_component::<Health>(unit).unwrap().0, 7);
+/// }
+/// ```
 #[param(write)]
 pub struct Sender<S: SignalType> {
     signals: Resource<Signals<S>>,
@@ -1326,6 +1482,14 @@ pub struct Sender<S: SignalType> {
 }
 
 impl<'w, S: SignalType> Signal<'w, S, Write> {
+    /// Sends `signal` over a window of ticks, and returns its id.
+    ///
+    /// The signal is delivered on every tick of its window (see [`IntoWindow`]). On its first
+    /// tick, systems that run after this one get it that same tick. Returns `None`, sending
+    /// nothing, if the window has already ended or is empty.
+    ///
+    /// The id works with [`modify`](Self::modify) and [`cancel`](Self::cancel). Ids are never
+    /// reused.
     #[inline]
     pub fn send(&mut self, signal: S, window: impl IntoWindow) -> Option<u64> {
         let tick = self.tick();
@@ -1333,21 +1497,46 @@ impl<'w, S: SignalType> Signal<'w, S, Write> {
             .send(&mut self.data, tick, signal, window.into_window(tick))
     }
 
+    /// Sends `signal` for one tick, and returns its id.
+    ///
+    /// Systems that run after this one get it this tick, the others next tick. The same as
+    /// `send(signal, In(0))`, but cheaper.
     #[inline]
     pub fn emit(&mut self, signal: S) -> u64 {
         self.signals.emit(&mut self.data, signal)
     }
 
+    /// Replaces the payload of the signal with id `id`.
+    ///
+    /// Returns `false`, changing nothing, if the signal doesn't exist, has ended or was
+    /// cancelled. Only the payload changes; to change a window, cancel the signal and send a new
+    /// one.
     #[inline]
     pub fn modify(&mut self, id: u64, payload: S) -> bool {
         self.signals.modify(id, |current| *current = payload)
     }
 
+    /// Cancels the signal with id `id`, so it isn't delivered again, starting with the systems
+    /// that run after this one.
+    ///
+    /// Returns `false` if the signal doesn't exist, has ended or was already cancelled.
     #[inline]
     pub fn cancel(&mut self, id: u64) -> bool {
         self.signals.cancel(id)
     }
 
+    /// Returns the signals this system hasn't received yet.
+    ///
+    /// The first call in a tick returns every signal sent since this system last received, plus
+    /// every windowed signal delivered this tick. A later call in the same tick only returns
+    /// one-tick signals sent since the call before. Signals of a despawned entity's
+    /// `#[signal(entity)]` type are skipped, even if it was despawned earlier in the same loop.
+    ///
+    /// Everything is marked as received when `receive` is called, even if the iterator is dropped
+    /// early, so don't call it just to peek. In hot loops, `for_each` is faster than `for`.
+    ///
+    /// The order is deterministic, but systems shouldn't rely on it. The iterator borrows the
+    /// param, so to send the same type while receiving, collect the signals first.
     #[inline]
     pub fn receive(&mut self) -> impl Iterator<Item = &S> {
         let context = S::Filter::fetch(&self.world);
@@ -1359,6 +1548,7 @@ impl<'w, S: SignalType> Signal<'w, S, Write> {
         )
     }
 
+    /// Returns the current tick.
     #[inline]
     pub fn tick(&self) -> u64 {
         (*self.tick).0
@@ -1366,6 +1556,18 @@ impl<'w, S: SignalType> Signal<'w, S, Write> {
 }
 
 impl<'w, S: SignalType> Receiver<'w, S, Write> {
+    /// Returns the signals this system hasn't received yet.
+    ///
+    /// The first call in a tick returns every signal sent since this system last received, plus
+    /// every windowed signal delivered this tick. A later call in the same tick only returns
+    /// one-tick signals sent since the call before. Signals of a despawned entity's
+    /// `#[signal(entity)]` type are skipped, even if it was despawned earlier in the same loop.
+    ///
+    /// Everything is marked as received when `receive` is called, even if the iterator is dropped
+    /// early, so don't call it just to peek. In hot loops, `for_each` is faster than `for`.
+    ///
+    /// The order is deterministic, but systems shouldn't rely on it. The iterator borrows the
+    /// param, so to send the same type while receiving, collect the signals first.
     #[inline]
     pub fn receive(&mut self) -> impl Iterator<Item = &S> {
         let context = S::Filter::fetch(&self.world);
@@ -1377,6 +1579,7 @@ impl<'w, S: SignalType> Receiver<'w, S, Write> {
         )
     }
 
+    /// Returns the current tick.
     #[inline]
     pub fn tick(&self) -> u64 {
         (*self.tick).0
@@ -1384,6 +1587,14 @@ impl<'w, S: SignalType> Receiver<'w, S, Write> {
 }
 
 impl<'w, S: SignalType> Sender<'w, S, Write> {
+    /// Sends `signal` over a window of ticks, and returns its id.
+    ///
+    /// The signal is delivered on every tick of its window (see [`IntoWindow`]). On its first
+    /// tick, systems that run after this one get it that same tick. Returns `None`, sending
+    /// nothing, if the window has already ended or is empty.
+    ///
+    /// The id works with [`modify`](Self::modify) and [`cancel`](Self::cancel). Ids are never
+    /// reused.
     #[inline]
     pub fn send(&mut self, signal: S, window: impl IntoWindow) -> Option<u64> {
         let tick = self.tick();
@@ -1391,21 +1602,35 @@ impl<'w, S: SignalType> Sender<'w, S, Write> {
             .send(&mut self.data, tick, signal, window.into_window(tick))
     }
 
+    /// Sends `signal` for one tick, and returns its id.
+    ///
+    /// Systems that run after this one get it this tick, the others next tick. The same as
+    /// `send(signal, In(0))`, but cheaper.
     #[inline]
     pub fn emit(&mut self, signal: S) -> u64 {
         self.signals.emit(&mut self.data, signal)
     }
 
+    /// Replaces the payload of the signal with id `id`.
+    ///
+    /// Returns `false`, changing nothing, if the signal doesn't exist, has ended or was
+    /// cancelled. Only the payload changes; to change a window, cancel the signal and send a new
+    /// one.
     #[inline]
     pub fn modify(&mut self, id: u64, payload: S) -> bool {
         self.signals.modify(id, |current| *current = payload)
     }
 
+    /// Cancels the signal with id `id`, so it isn't delivered again, starting with the systems
+    /// that run after this one.
+    ///
+    /// Returns `false` if the signal doesn't exist, has ended or was already cancelled.
     #[inline]
     pub fn cancel(&mut self, id: u64) -> bool {
         self.signals.cancel(id)
     }
 
+    /// Returns the current tick.
     #[inline]
     pub fn tick(&self) -> u64 {
         (*self.tick).0
@@ -1457,6 +1682,7 @@ pub fn register_signal<S: SignalType>() {
     message = "`{Self}` is not an input signal",
     note = "declare it with #[signal(input)]; other signals are sent from systems or World::build"
 )]
+/// A signal the host may send with [`World::input`]. Declared with `#[signal(input)]`.
 pub trait InputSignal: SignalType {}
 
 fn get_registered_sweeps() -> &'static [(u128, SweepFn)] {
@@ -1564,6 +1790,13 @@ impl World {
         self.fetch_param::<Mut<Signal<S>>>()
     }
 
+    /// Sends an input signal to the world.
+    ///
+    /// Every system receiving `S` gets it during the next [`step`](Self::step). Inputs are the
+    /// only way the host affects a running world, apart from replacing its state with
+    /// [`load`](Self::load). A recording stores them tick by tick, along with the starting state
+    /// and a full save after each `load`. Only `#[signal(input)]` types can be sent this way; any
+    /// other is a compile error.
     #[inline]
     pub fn input<S: InputSignal>(&mut self, signal: S) {
         self.signal::<S>().emit(signal);

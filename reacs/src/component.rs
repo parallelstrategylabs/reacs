@@ -17,21 +17,29 @@ struct Slot<C> {
     value: C,
 }
 
+/// The storage of one component type: one slot per entity index.
+///
+/// Systems use it through [`Component`]. The host reads it with [`World::get_component_map`].
 #[derive(Default, Hashed, Serialize, Deserialize)]
 pub struct ComponentMap<C: Copy + Default> {
     slots: Vec<Slot<C>>,
 }
 
 impl<C: Copy + Default> ComponentMap<C> {
+    /// Creates an empty storage.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Returns `true` if `entity` has this component. See [`Component::get`] about despawned
+    /// entities.
     #[inline]
     pub fn has(&self, entity: Entity) -> bool {
         self.get(entity).is_some()
     }
 
+    /// Returns `entity`'s component, or `None` if it has none. See [`Component::get`] about
+    /// despawned entities.
     #[inline]
     pub fn get(&self, entity: Entity) -> Option<&C> {
         let generation = entity.generation();
@@ -41,6 +49,7 @@ impl<C: Copy + Default> ComponentMap<C> {
             .map(|slot| &slot.value)
     }
 
+    /// Returns `entity`'s component for writing, or `None` if it has none.
     #[inline]
     pub fn get_mut(&mut self, entity: Entity) -> Option<&mut C> {
         let generation = entity.generation();
@@ -91,6 +100,61 @@ impl<C: Copy + Default> ComponentMap<C> {
 // held for the param's whole life, so nothing else can write the map meanwhile (a second `Write`
 // borrow panics at fetch; host writes need `&mut World`). A `Read` param only reads through the
 // pointer; writes exist only on `Component<_, _, Write>`, whose pointer comes from `guard_mut`.
+/// System param that reads and writes one component type, by entity.
+///
+/// `Component<C>` reads; `Mut<Component<C>>` also writes, inserts and removes. Every access is
+/// O(1): the entity's index points straight at its slot.
+///
+/// Components are never iterated. A system gets entities from signals, and reads or writes only
+/// the components of those entities.
+///
+/// # Examples
+///
+/// ```rust,standalone_crate
+/// use reacs::prelude::*;
+///
+/// #[component]
+/// struct Position(i32, i32);
+///
+/// #[component]
+/// struct Velocity(i32, i32);
+///
+/// #[signal(entity)]
+/// struct Move(Entity);
+///
+/// #[system]
+/// fn movement(
+///     mut moves: Mut<Receiver<Move>>,
+///     velocity: Component<Velocity>,
+///     mut position: Mut<Component<Position>>,
+/// ) {
+///     moves.receive().for_each(|&Move(unit)| {
+///         if let Some(Velocity(dx, dy)) = velocity.get(unit) {
+///             if let Some(position) = position.get_mut(unit) {
+///                 position.0 += dx;
+///                 position.1 += dy;
+///             }
+///         }
+///     });
+/// }
+///
+/// fn main() {
+///     let mut unit = Entity::default();
+///     let mut world = World::build(|setup| {
+///         unit = setup.spawn();
+///         setup.set_component(unit, Position(0, 0));
+///         setup.set_component(unit, Velocity(2, 1));
+///         // Move every tick until cancelled or the unit is despawned.
+///         setup.signal::<Move>().send(Move(unit), ..);
+///     });
+///
+///     for _ in 0..3 {
+///         world.step();
+///     }
+///     let position = world.get_component::<Position>(unit).unwrap();
+///     assert_eq!((position.0, position.1), (6, 3));
+/// }
+/// ```
 pub struct Component<'w, C: 'static + Copy + Default, M: Mode = Read> {
     slots: *mut Slot<C>,
     len: usize,
@@ -114,11 +178,23 @@ impl<C: 'static + Copy + Default, M: Mode> Component<'_, C, M> {
         (unsafe { (*slot).generation } == generation).then_some(slot)
     }
 
+    /// Returns `true` if `entity` has this component. See [`get`](Self::get) about despawned
+    /// entities.
     #[inline]
     pub fn has(&self, entity: Entity) -> bool {
         self.slot(entity).is_some()
     }
 
+    /// Returns a copy of `entity`'s component, or `None` if it has none.
+    ///
+    /// It returns a copy rather than a reference because that keeps loops fast that read one
+    /// component and write another: with a reference to each, the compiler must reload the read
+    /// after every write. Write through [`get_mut`](Self::get_mut).
+    ///
+    /// It doesn't check that `entity` is alive. A despawned entity's components stay readable
+    /// through its old handle until an entity reusing the index writes over them; check
+    /// [`EntityManager::is_alive`] when that matters. An entity can never read another entity's
+    /// components.
     #[inline]
     pub fn get(&self, entity: Entity) -> Option<C> {
         self.slot(entity).map(|slot| unsafe { (*slot).value })
@@ -126,6 +202,7 @@ impl<C: 'static + Copy + Default, M: Mode> Component<'_, C, M> {
 }
 
 impl<C: 'static + Copy + Default> Component<'_, C, Write> {
+    /// Returns `entity`'s component for writing, or `None` if it has none.
     #[inline]
     pub fn get_mut(&mut self, entity: Entity) -> Option<&mut C> {
         // SAFETY: the `&mut C` borrows `self` mutably, so no other access through this param
@@ -133,6 +210,10 @@ impl<C: 'static + Copy + Default> Component<'_, C, Write> {
         self.slot(entity).map(|slot| unsafe { &mut (*slot).value })
     }
 
+    /// Gives `entity` this component, replacing any value it had.
+    ///
+    /// Does nothing for `Entity::default()`, or for an old handle whose index now holds a newer
+    /// entity's component: an old handle never changes a newer entity's data.
     #[inline]
     pub fn insert(&mut self, entity: Entity, value: C) {
         self.map.insert(entity, value);
@@ -140,6 +221,7 @@ impl<C: 'static + Copy + Default> Component<'_, C, Write> {
         self.len = self.map.slots.len();
     }
 
+    /// Removes `entity`'s component, if it has one.
     #[inline]
     pub fn remove(&mut self, entity: Entity) {
         if let Some(slot) = self.slot(entity) {
@@ -180,6 +262,12 @@ impl World {
         }
     }
 
+    /// Returns the storage of component `C`, to read many entities' components with one borrow.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the world has no storage for `C`: no system uses it, and `World::build` didn't
+    /// create it with `init_component`.
     #[inline]
     pub fn get_component_map<C: 'static + Copy + Default + Hashed>(
         &self,
@@ -222,11 +310,25 @@ impl World {
         self.get_component_map_mut::<C>().remove(entity);
     }
 
+    /// Returns a copy of `entity`'s component `C`, or `None` if it has none. Like
+    /// [`Component::get`], it doesn't check that `entity` is alive.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the world has no storage for `C`, as [`get_component_map`](Self::get_component_map)
+    /// does.
     #[inline]
     pub fn get_component<C: 'static + Copy + Default + Hashed>(&self, entity: Entity) -> Option<C> {
         self.get_component_map().get(entity).copied()
     }
 
+    /// Returns `true` if `entity` has component `C`. Like [`Component::get`], it doesn't check that
+    /// `entity` is alive.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the world has no storage for `C`, as [`get_component_map`](Self::get_component_map)
+    /// does.
     #[inline]
     pub fn has_component<C: 'static + Copy + Default + Hashed>(&self, entity: Entity) -> bool {
         self.get_component_map::<C>().has(entity)

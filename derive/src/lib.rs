@@ -1,3 +1,8 @@
+//! Procedural macros for [reacs](https://crates.io/crates/reacs).
+//!
+//! Use them through `reacs::prelude`, which re-exports every macro here. A crate using reacs
+//! doesn't need this one as a dependency.
+
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
@@ -111,6 +116,28 @@ fn reject_data(attrs: &[syn::Attribute], macro_name: &str) -> Option<TokenStream
     )
 }
 
+/// Creates a new `World`, making sure every plugin crate is linked.
+///
+/// Systems and types register themselves before `main` from every crate linked into the
+/// program, but a crate that no code names isn't linked, and its registrations never run. Every
+/// reacs macro names all the crates the current crate depends on, so `World::new()` is enough
+/// when the app crate uses at least one reacs macro. An app crate that uses none, like a
+/// `main.rs` that only builds and steps a world made of plugins, should create its world with
+/// `world!()` instead, or name each plugin with `use plugin as _;`. Without either, the systems
+/// of plugins the code never names are silently missing.
+///
+/// In every other respect, `world!()` is the same as `World::new()`.
+///
+/// # Examples
+///
+/// ```rust,standalone_crate
+/// use reacs::prelude::*;
+///
+/// fn main() {
+///     let mut world = world!();
+///     world.step();
+/// }
+/// ```
 #[proc_macro]
 pub fn world(input: TokenStream) -> TokenStream {
     parse_macro_input!(input as syn::parse::Nothing);
@@ -124,6 +151,32 @@ pub fn world(input: TokenStream) -> TokenStream {
     })
 }
 
+/// Derives `Hashed`, giving a type a stable 128-bit id.
+///
+/// The id is a hash of the type's module path and name, so it's the same on every build and
+/// machine as long as the type keeps its name and module. Saves, recordings and the type registry
+/// identify types by it. For a generic type, the ids of its type parameters and the values of its
+/// const parameters are mixed in, so `Foo<A>` and `Foo<B>` get different ids.
+///
+/// `#[resource]`, `#[component]` and `#[signal]` already derive it, so game code rarely needs this
+/// derive. The prelude exports it as `DeriveHashed`, next to the `Hashed` trait.
+///
+/// Renaming a type or moving it to another module changes its id, so saves made before the change
+/// can't load it.
+///
+/// # Examples
+///
+/// ```
+/// use reacs::prelude::*;
+///
+/// #[derive(DeriveHashed)]
+/// struct Faction;
+///
+/// #[derive(DeriveHashed)]
+/// struct Unit;
+///
+/// assert_ne!(Faction::TYPE_UUID, Unit::TYPE_UUID);
+/// ```
 #[proc_macro_derive(Hashed)]
 pub fn derive_hashed_def(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -167,6 +220,94 @@ pub fn derive_hashed_def(input: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
+/// Declares a resource: a single value shared by the whole world.
+///
+/// Resources hold state that doesn't belong to one entity: scores, settings, the current wave, or
+/// variable-size data keyed by entity, like inventories. Systems read a resource with a
+/// `Resource<T>` param and write it with `Mut<Resource<T>>`. A resource starts with its `Default`
+/// value in every world that has a system using it, so systems never find it missing.
+///
+/// The macro derives `Default`, `Hashed`, `Serialize` and `Deserialize`, so don't derive them
+/// yourself, and registers the type, so the resource is saved, loaded and hashed with the world.
+/// Every field must implement `Default`, `Serialize` and `Deserialize`; declare your own field
+/// types, like an enum, with `#[data]` (or `#[data(no_copy)]`). Store maps as `IndexMap`,
+/// never `std::collections::HashMap`: a `HashMap`'s iteration order changes after a save and load,
+/// which breaks determinism.
+///
+/// # Local resources
+///
+/// `#[resource(local)]` declares a resource that belongs to one world and is never saved, hashed or
+/// registered. Only `Default` is derived, so it needs no serde support and can hold types like
+/// `Rc`. Systems use it through `LocalResource<T>` and `Mut<LocalResource<T>>`.
+///
+/// Local resources are for caches, and game logic must not depend on them: whatever the
+/// simulation reads from a local resource must be rebuildable from saved state. Otherwise loading
+/// a save or replaying a recording gives different results.
+///
+/// `#[resource(local, on_load = method)]` calls `method(&mut self, world: &World)` once after
+/// every `World::load` or `World::restore`, to rebuild the cache from the loaded state. Hooks run
+/// in an order that can change between builds, so a hook should only read saved resources, not
+/// other local ones.
+///
+/// # Compile errors
+///
+/// Generic resources aren't supported, and `on_load` requires `local`. Deriving a trait the macro
+/// derives, or adding `#[data]`, is an error.
+///
+/// # Examples
+///
+/// ```rust,standalone_crate
+/// use reacs::prelude::*;
+///
+/// #[resource]
+/// struct Score {
+///     points: u64,
+/// }
+///
+/// #[system]
+/// fn score_a_point(mut score: Mut<Resource<Score>>) {
+///     score.points += 1;
+/// }
+///
+/// fn main() {
+///     let mut world = World::new();
+///     world.step();
+///     world.step();
+///     assert_eq!(world.get_resource::<Score>().unwrap().points, 2);
+/// }
+/// ```
+///
+/// A local cache, rebuilt after every load:
+///
+/// ```rust,standalone_crate
+/// use reacs::prelude::*;
+///
+/// #[resource]
+/// struct Score {
+///     points: u64,
+/// }
+///
+/// #[resource(local, on_load = rebuild)]
+/// struct ScoreText {
+///     text: String,
+/// }
+///
+/// impl ScoreText {
+///     fn rebuild(&mut self, world: &World) {
+///         let points = world.get_resource::<Score>().unwrap().points;
+///         self.text = format!("{points} points");
+///     }
+/// }
+///
+/// fn main() {
+///     let mut world = World::build(|setup| setup.insert_resource(Score { points: 3 }));
+///     world.init_local_resource::<ScoreText>();
+///
+///     let save = world.save();
+///     world.load(&save);
+///     assert_eq!(world.get_local_resource::<ScoreText>().unwrap().text, "3 points");
+/// }
+/// ```
 #[proc_macro_attribute]
 pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut local = false;
@@ -272,6 +413,63 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
+/// Declares a component: a small piece of plain data attached to an entity.
+///
+/// Systems reach components by `Entity`, usually one named by a signal: `Component<T>` reads them,
+/// and `Mut<Component<T>>` also writes, inserts and removes them. Components are never iterated:
+/// there's no way to visit every entity that has one.
+///
+/// Every component type keeps one slot per entity index, which makes access O(1) but costs memory
+/// for every index, so keep components small. Variable-size data per entity, like an inventory,
+/// belongs in a resource keyed by `Entity`.
+///
+/// The macro derives `Clone`, `Copy`, `Default`, `Hashed`, `Serialize` and `Deserialize`, so don't
+/// derive them yourself, and registers the type, so components are saved and loaded with the
+/// world. Every field must implement `Copy`, `Default`, `Serialize` and `Deserialize`; declare
+/// your own field types, like an enum, with `#[data]`.
+///
+/// # Compile errors
+///
+/// Generic components aren't supported, and neither is deriving a trait the macro derives, or
+/// adding `#[data]`.
+///
+/// # Examples
+///
+/// ```rust,standalone_crate
+/// use reacs::prelude::*;
+///
+/// #[component]
+/// struct Health(i32);
+///
+/// #[signal(entity)]
+/// struct Damage {
+///     target: Entity,
+///     amount: i32,
+/// }
+///
+/// #[system]
+/// fn apply_damage(mut damage: Mut<Receiver<Damage>>, mut health: Mut<Component<Health>>) {
+///     for hit in damage.receive() {
+///         if let Some(health) = health.get_mut(hit.target) {
+///             health.0 -= hit.amount;
+///         }
+///     }
+/// }
+///
+/// fn main() {
+///     let mut ship = Entity::default();
+///     let mut world = World::build(|setup| {
+///         ship = setup.spawn();
+///         setup.set_component(ship, Health(10));
+///         setup.signal::<Damage>().send(Damage { target: ship, amount: 3 }, For(2));
+///     });
+///
+///     world.step();
+///     world.step();
+///     world.step();
+///     assert_eq!(world.get_component::<Health>(ship).unwrap().0, 4);
+/// }
+/// ```
 #[proc_macro_attribute]
 pub fn component(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as DeriveInput);
@@ -363,7 +561,7 @@ pub fn component(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// # Examples
 ///
-/// ```standalone_crate
+/// ```rust,standalone_crate
 /// use reacs::prelude::*;
 ///
 /// #[data]
@@ -427,7 +625,7 @@ pub fn component(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// A type holding a `Vec`, used in a resource:
 ///
-/// ```standalone_crate
+/// ```rust,standalone_crate
 /// use reacs::prelude::*;
 ///
 /// #[data(no_copy)]
@@ -521,6 +719,86 @@ pub fn data(attr: TokenStream, item: TokenStream) -> TokenStream {
     })
 }
 
+/// Registers a function as a system.
+///
+/// A system is a plain function whose arguments are system params: `Resource<T>`, `Component<T>`,
+/// `EntityManager`, `LocalResource<T>`, `WorldAccess`, the signal params `Receiver<S>`, `Sender<S>`
+/// and `Signal<S>`, or a `#[param]` bundle of those. Wrap a param in `Mut<...>` to write through
+/// it. A system takes at most 8 params; group more in a `#[param]` struct.
+///
+/// Every `#[system]` in every crate linked into the program registers itself before `main`.
+/// `World::step` runs them one after another, each finishing before the next starts, in an order
+/// fixed when the program starts. Systems are stateless: keep state in resources.
+///
+/// # Ordering
+///
+/// - `run_before(a, b)` and `run_after(a, b)` order the system against other systems, named by
+///   path, including systems from other crates (`run_after(plugin::apply_damage)`).
+/// - `in_group(g)` makes the system a member of the group `g`. A group is an ordinary system,
+///   usually with no params. A member runs after `g` and before everything ordered after `g`, so
+///   `run_after(g)` means "after the whole group". A group and its members run as one block, so
+///   nothing outside the group can run between them.
+///
+/// Systems with no order between them run in a fixed but unspecified order. Add `run_before` or
+/// `run_after` whenever one system must see another's work in the same tick.
+/// `World::print_system_order` prints the final order.
+///
+/// # Waking
+///
+/// A system with at least one `Mut<Receiver<S>>` param, and no `Mut<Signal<S>>` or other param
+/// that forces it to run, sleeps: it's skipped on ticks where none of its receivers has anything
+/// new. The whole system is skipped, not only its receive loop, so work that doesn't come from
+/// signals, like a timer counted down every tick, doesn't belong in a sleeping system. Systems
+/// without a receiver run every tick.
+///
+/// # Panics
+///
+/// When the program starts, if the ordering has a cycle, a system is in more than one group, or a
+/// group is a member of another group.
+///
+/// When the system runs, if two of its params borrow the same data and one of them writes it: for
+/// example `Resource<Score>` with `Mut<Resource<Score>>`, or `Mut<Receiver<S>>` with
+/// `Mut<Sender<S>>` for the same `S` (use `Mut<Signal<S>>` to do both).
+///
+/// # Compile errors
+///
+/// Methods taking `self`, and arguments that aren't system params, including a signal param
+/// without `Mut`.
+///
+/// # Examples
+///
+/// ```rust,standalone_crate
+/// use reacs::prelude::*;
+///
+/// #[resource]
+/// struct Log {
+///     lines: Vec<String>,
+/// }
+///
+/// #[system]
+/// fn combat() {}
+///
+/// #[system(in_group(combat))]
+/// fn shoot(mut log: Mut<Resource<Log>>) {
+///     log.lines.push("shoot".into());
+/// }
+///
+/// #[system(in_group(combat), run_after(shoot))]
+/// fn hit(mut log: Mut<Resource<Log>>) {
+///     log.lines.push("hit".into());
+/// }
+///
+/// #[system(run_after(combat))]
+/// fn report(mut log: Mut<Resource<Log>>) {
+///     log.lines.push("report".into());
+/// }
+///
+/// fn main() {
+///     let mut world = World::new();
+///     world.step();
+///     assert_eq!(world.get_resource::<Log>().unwrap().lines, ["shoot", "hit", "report"]);
+/// }
+/// ```
 #[proc_macro_attribute]
 pub fn system(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut run_before: Vec<Path> = Vec::new();
@@ -597,6 +875,91 @@ pub fn system(attr: TokenStream, item: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
+/// Bundles system params into one struct, used as a single param.
+///
+/// Write each field's type without a lifetime or mode, like `Component<Health>` or
+/// `Resource<Log>`; the macro adds both. The bundle is then a param like any other: `Combat` reads
+/// through every field, and `Mut<Combat>` writes through them. Bundles share a set of params
+/// between systems and get past the limit of 8 params per system.
+///
+/// # Modes
+///
+/// - `#[param]`: usable as `Combat` and as `Mut<Combat>`.
+/// - `#[param(read)]`: only as `Combat`.
+/// - `#[param(write)]`: only as `Mut<Combat>`. Needed when a field only exists for writing, like a
+///   `Receiver<S>`.
+///
+/// Mark a field `#[read]` or `#[write]` to keep that mode whatever the bundle's mode, like a
+/// `#[read] Resource<Rules>` in a bundle that is otherwise written. At least one field must stay
+/// unmarked. A bundle with a single field dereferences to that field's target.
+///
+/// # Waking
+///
+/// A bundle wakes its system like its fields would: one holding a `Receiver<S>` lets its system
+/// sleep when there's nothing to receive, and one holding a `Signal<S>` makes it run every tick
+/// (see `#[system]`). `#[param(wake = always)]` makes the system run every tick anyway, and combines
+/// with a mode: `#[param(write, wake = always)]`.
+///
+/// # Generics
+///
+/// Type and const parameters are allowed, and type parameters get a `'static` bound. `M` is
+/// reserved for the mode. Lifetimes aren't allowed: the macro adds `'w` itself.
+///
+/// # Compile errors
+///
+/// A field that isn't a system param, a struct with no fields, a struct whose fields are all
+/// marked `#[read]` or `#[write]`, a lifetime parameter, or a type parameter named `M`.
+///
+/// # Examples
+///
+/// ```rust,standalone_crate
+/// use reacs::prelude::*;
+///
+/// #[component]
+/// struct Health(i32);
+///
+/// #[resource]
+/// struct Log {
+///     lines: Vec<String>,
+/// }
+///
+/// #[param]
+/// struct Combat {
+///     health: Component<Health>,
+///     log: Resource<Log>,
+///     tick: Tick,
+/// }
+///
+/// #[signal(entity)]
+/// struct Damage {
+///     target: Entity,
+///     amount: i32,
+/// }
+///
+/// #[system]
+/// fn apply_damage(mut damage: Mut<Receiver<Damage>>, mut combat: Mut<Combat>) {
+///     let tick = combat.tick.get();
+///     for hit in damage.receive() {
+///         if let Some(health) = combat.health.get_mut(hit.target) {
+///             health.0 -= hit.amount;
+///             combat.log.lines.push(format!("tick {tick}: {} damage", hit.amount));
+///         }
+///     }
+/// }
+///
+/// fn main() {
+///     let mut ship = Entity::default();
+///     let mut world = World::build(|setup| {
+///         ship = setup.spawn();
+///         setup.set_component(ship, Health(10));
+///         setup.signal::<Damage>().emit(Damage { target: ship, amount: 3 });
+///     });
+///
+///     world.step();
+///     assert_eq!(world.get_component::<Health>(ship).unwrap().0, 7);
+///     assert_eq!(world.get_resource::<Log>().unwrap().lines, ["tick 0: 3 damage"]);
+/// }
+/// ```
 #[proc_macro_attribute]
 pub fn param(attr: TokenStream, item: TokenStream) -> TokenStream {
     param_impl::expand(attr.into(), item.into())
@@ -630,6 +993,86 @@ fn find_entity_field(input: &DeriveInput) -> syn::Result<Member> {
     }
 }
 
+/// Declares a signal: a message systems send to each other.
+///
+/// Signals drive everything in reacs, and they're the only thing it iterates: a system runs
+/// because of the signals it receives, and touches the entities they name. A signal lasts one tick
+/// or a window of ticks (see `IntoWindow`). Systems use a signal type through one of three params:
+///
+/// - `Mut<Receiver<S>>` receives. Its system sleeps on ticks with nothing to receive (see
+///   `#[system]`).
+/// - `Mut<Sender<S>>` sends, modifies and cancels.
+/// - `Mut<Signal<S>>` does both, and its system runs every tick.
+///
+/// A signal reaches every system that receives its type: in the same tick if the receiver runs
+/// after the sender, otherwise in the next tick. Signals are queued, not callbacks: each receiver
+/// handles them at its own place in the system order.
+///
+/// The macro derives `Clone`, `Copy`, `Default`, `Hashed`, `Serialize` and `Deserialize`, so don't
+/// derive them yourself, and registers the type. Keep payloads small and plain. Every field must
+/// implement `Copy`, `Default`, `Serialize` and `Deserialize`; declare your own field types, like an
+/// enum, with `#[data]`.
+///
+/// # Entity signals
+///
+/// `#[signal(entity)]` ties each signal to the life of an entity: once the entity is despawned, its
+/// signals are never delivered again, and open-ended ones are dropped from memory. The macro uses
+/// the struct's only `Entity` field. With several, or with a type alias for `Entity`, name the
+/// field: `entity = target`, or `entity = 1` for a tuple struct. Use entity signals for work on a
+/// living entity, like `Burn` or `Move`.
+///
+/// News about an entity must stay a plain `#[signal]`. A `#[signal(entity)] struct Died(Entity)`
+/// never arrives, because its entity is already dead when it's sent, and nothing reports it.
+/// Receivers of a plain signal check `EntityManager::is_alive` when it matters.
+///
+/// # Input signals
+///
+/// `#[signal(input)]` lets the host send the signal with `World::input`, the only way input gets
+/// into a running world. Every input signal exists in every world, so sending one that no system
+/// uses is fine. Systems use input signals like any other. `input` combines with `entity`:
+/// `#[signal(input, entity)]`.
+///
+/// # Compile errors
+///
+/// Generic signals aren't supported, and neither is deriving a trait the macro derives, or adding
+/// `#[data]`. `entity` needs a struct with exactly one `Entity` field, or the field named with
+/// `entity = field`.
+///
+/// # Examples
+///
+/// ```rust,standalone_crate
+/// use reacs::prelude::*;
+///
+/// #[signal(input)]
+/// struct Clicked {
+///     x: i32,
+///     y: i32,
+/// }
+///
+/// #[resource]
+/// struct Clicks {
+///     last: (i32, i32),
+///     count: u32,
+/// }
+///
+/// #[system]
+/// fn count_clicks(mut clicks: Mut<Receiver<Clicked>>, mut total: Mut<Resource<Clicks>>) {
+///     for click in clicks.receive() {
+///         total.last = (click.x, click.y);
+///         total.count += 1;
+///     }
+/// }
+///
+/// fn main() {
+///     let mut world = World::new();
+///     world.input(Clicked { x: 3, y: 4 });
+///     world.input(Clicked { x: 5, y: 1 });
+///     world.step();
+///
+///     let clicks = world.get_resource::<Clicks>().unwrap();
+///     assert_eq!((clicks.count, clicks.last), (2, (5, 1)));
+/// }
+/// ```
 #[proc_macro_attribute]
 pub fn signal(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut entity: Option<Option<Member>> = None;

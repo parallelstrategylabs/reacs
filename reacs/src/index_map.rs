@@ -84,6 +84,39 @@ const EMPTY_SLOT: Slot = Slot {
     tag: 0,
 };
 
+/// A hash map that iterates in insertion order, the same on every run.
+///
+/// Use it instead of `std::collections::HashMap` in resources. A `HashMap` iterates in an order
+/// that depends on its seed, capacity and history, and that order changes after a save and load,
+/// so code iterating one gives different results on a loaded world. An `IndexMap` iterates in the
+/// order entries were inserted, which a save and load keep.
+///
+/// Entries live in one dense list, so iterating is as fast as iterating a slice. Lookups take a
+/// key's hash to its position through a separate table. Every operation costs about the same at
+/// any size; removing an entry moves the last one into its place
+/// ([`swap_remove`](Self::swap_remove)), so it's O(1) but changes the order.
+///
+/// A typical use is data keyed by [`Entity`](crate::entity::Entity) that doesn't fit a component,
+/// like an inventory. Reserve with [`with_capacity`](Self::with_capacity) when the size is known:
+/// growing is the slow part.
+///
+/// # Examples
+///
+/// ```
+/// use reacs::prelude::*;
+///
+/// let mut stock = IndexMap::new();
+/// stock.insert("wood", 40);
+/// stock.insert("stone", 25);
+/// stock.insert("gold", 3);
+///
+/// *stock.get_mut(&"wood").unwrap() -= 10;
+/// assert_eq!(stock[&"wood"], 30);
+///
+/// stock.swap_remove(&"wood");
+/// let order: Vec<_> = stock.iter().map(|(name, _)| *name).collect();
+/// assert_eq!(order, ["gold", "stone"]);
+/// ```
 #[derive(Clone)]
 pub struct IndexMap<K, V> {
     entries: Vec<(K, V)>,
@@ -100,68 +133,88 @@ impl<K, V> Default for IndexMap<K, V> {
 }
 
 impl<K: Hash + Eq, V> IndexMap<K, V> {
+    /// Creates an empty map. It allocates nothing until the first insert.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Creates an empty map with room for `capacity` entries before it grows.
     pub fn with_capacity(capacity: usize) -> Self {
         let mut map = Self::new();
         map.reserve(capacity);
         map
     }
 
+    /// Makes room for at least `additional` more entries.
     pub fn reserve(&mut self, additional: usize) {
         self.entries.reserve(additional);
         self.grow_for(self.entries.len() + additional);
     }
 
+    /// Returns the number of entries.
     #[inline]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    /// Returns `true` if the map has no entries.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
+    /// Returns every entry as a slice, in order.
     #[inline]
     pub fn as_slice(&self) -> &[(K, V)] {
         &self.entries
     }
 
+    /// Returns an iterator over the entries, in order.
     #[inline]
     pub fn iter(&self) -> slice::Iter<'_, (K, V)> {
         self.entries.iter()
     }
 
+    /// Returns an iterator over the entries with mutable values, in order.
     #[inline]
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&K, &mut V)> {
         self.entries.iter_mut().map(|(key, value)| (&*key, value))
     }
 
+    /// Removes every entry, keeping the allocated memory.
     pub fn clear(&mut self) {
         self.entries.clear();
         self.slots.fill(EMPTY_SLOT);
     }
 
+    /// Returns `true` if the map has an entry for `key`.
     #[inline]
     pub fn contains_key(&self, key: &K) -> bool {
         self.index_of(key).is_some()
     }
 
+    /// Returns the value for `key`, or `None` if there's none.
     #[inline]
     pub fn get(&self, key: &K) -> Option<&V> {
         let index = self.index_of(key)?;
         Some(&self.entries[index].1)
     }
 
+    /// Returns the value for `key` for writing, or `None` if there's none.
     #[inline]
     pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
         let index = self.index_of(key)?;
         Some(&mut self.entries[index].1)
     }
 
+    /// Inserts `value` for `key`, and returns the value it replaces, if any.
+    ///
+    /// A new key goes at the end of the order. Replacing an existing key's value keeps its
+    /// position.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the map already holds `u32::MAX` entries and `key` is new.
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         self.grow_for(self.entries.len() + 1);
         let tag = tag_of(&key);
@@ -180,6 +233,10 @@ impl<K: Hash + Eq, V> IndexMap<K, V> {
         }
     }
 
+    /// Removes the entry for `key` and returns its value, or `None` if there's none.
+    ///
+    /// The last entry moves into the removed one's position, so this is O(1) but changes the
+    /// order. Code that relies on insertion order after removals must sort the entries itself.
     pub fn swap_remove(&mut self, key: &K) -> Option<V> {
         let pos = self.find(key)?;
         let index = self.slot(pos).index as usize;

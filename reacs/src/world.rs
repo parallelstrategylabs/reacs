@@ -36,6 +36,50 @@ fn run_on_load<R: LocalResourceType>(resource: &mut dyn Any, world: &World) {
     }
 }
 
+/// A simulation: every resource, entity, component and signal, advanced one tick at a time.
+///
+/// Create one with [`World::new`], or with [`World::build`] to set up its starting state, then
+/// call [`step`](World::step) once per tick. Between steps, the host (the game loop, renderer and
+/// UI around the world) can read anything, send input signals with [`input`](World::input), and
+/// save, load, record and replay. It has no other way to write, which keeps every run
+/// reproducible from its start state and inputs.
+///
+/// # Examples
+///
+/// ```rust,standalone_crate
+/// use reacs::prelude::*;
+///
+/// #[signal(input)]
+/// struct Build {
+///     cost: u32,
+/// }
+///
+/// #[resource]
+/// struct Treasury {
+///     gold: u32,
+/// }
+///
+/// #[system]
+/// fn build(mut orders: Mut<Receiver<Build>>, mut treasury: Mut<Resource<Treasury>>) {
+///     for order in orders.receive() {
+///         treasury.gold = treasury.gold.saturating_sub(order.cost);
+///     }
+/// }
+///
+/// fn main() {
+///     let mut world = World::build(|setup| setup.insert_resource(Treasury { gold: 500 }));
+///
+///     for tick in 0..60 {
+///         if tick == 10 {
+///             world.input(Build { cost: 150 });
+///         }
+///         world.step();
+///         // A renderer would read the world here.
+///     }
+///
+///     assert_eq!(world.get_resource::<Treasury>().unwrap().gold, 350);
+/// }
+/// ```
 pub struct World {
     pub(crate) resources: Vec<(u128, Box<RefCell<dyn Any>>)>,
     local_resources: Vec<LocalEntry>,
@@ -56,6 +100,11 @@ impl Default for World {
 }
 
 impl World {
+    /// Creates a world at tick 0 with every registered system, and every resource, component and
+    /// signal those systems use, at its default value.
+    ///
+    /// An app crate that uses no reacs macro should call `world!()` instead, so plugins it never
+    /// names are still linked. See `world!` in the prelude.
     #[inline]
     pub fn new() -> Self {
         let mut world = Self {
@@ -108,12 +157,15 @@ impl World {
         search_result.is_ok()
     }
 
+    /// Returns `true` if the world has resource `R`.
     #[inline]
     pub fn has_resource<R: 'static + Hashed>(&self) -> bool {
         let id = R::TYPE_UUID;
         self.resources.binary_search_by(|x| x.0.cmp(&id)).is_ok()
     }
 
+    /// Returns resource `R`, or `None` if the world doesn't have it or it's borrowed for writing,
+    /// as it can be from a system holding `WorldAccess`.
     #[inline]
     pub fn get_resource<R: 'static + Hashed>(&self) -> Option<Ref<'_, R>> {
         let id = R::TYPE_UUID;
@@ -141,6 +193,7 @@ impl World {
         self.local_resources.binary_search_by(|x| x.id.cmp(&id))
     }
 
+    /// Adds local resource `R` with its default value, unless the world already has it.
     #[inline]
     pub fn init_local_resource<R: LocalResourceType>(&mut self) {
         if !self.has_local_resource::<R>() {
@@ -148,6 +201,7 @@ impl World {
         }
     }
 
+    /// Adds local resource `R`, replacing any value the world had.
     #[inline]
     pub fn insert_local_resource<R: LocalResourceType>(&mut self, resource: R) {
         let cell = Box::new(RefCell::new(resource));
@@ -165,6 +219,7 @@ impl World {
         }
     }
 
+    /// Removes local resource `R`. Returns `true` if the world had it.
     #[inline]
     pub fn remove_local_resource<R: LocalResourceType>(&mut self) -> bool {
         let search_result = self.find_local_resource::<R>();
@@ -176,11 +231,14 @@ impl World {
         search_result.is_ok()
     }
 
+    /// Returns `true` if the world has local resource `R`.
     #[inline]
     pub fn has_local_resource<R: LocalResourceType>(&self) -> bool {
         self.find_local_resource::<R>().is_ok()
     }
 
+    /// Returns local resource `R`, or `None` if the world doesn't have it or it's borrowed for
+    /// writing.
     #[inline]
     pub fn get_local_resource<R: LocalResourceType>(&self) -> Option<Ref<'_, R>> {
         let i = self.find_local_resource::<R>().ok()?;
@@ -188,6 +246,8 @@ impl World {
         Ref::filter_map(resource, |any| any.downcast_ref::<R>()).ok()
     }
 
+    /// Returns local resource `R` for writing, or `None` if the world doesn't have it or it's
+    /// already borrowed.
     #[inline]
     pub fn get_local_resource_mut<R: LocalResourceType>(&self) -> Option<RefMut<'_, R>> {
         let i = self.find_local_resource::<R>().ok()?;
@@ -195,24 +255,80 @@ impl World {
         RefMut::filter_map(resource, |any| any.downcast_mut::<R>()).ok()
     }
 
+    /// Sets the app version written into saves.
+    ///
+    /// A save only loads into a world with the same app version, so raise it in every release
+    /// that changes saved data, including releases that upgrade reacs. Without that, an old save
+    /// can fail to decode or load wrong values. The default is 0.
     #[inline]
     pub fn set_app_version(&mut self, version: u32) {
         self.app_version = version;
     }
 
+    /// Returns the app version written into saves.
     #[inline]
     pub fn app_version(&self) -> u32 {
         self.app_version
     }
 
+    /// Returns the execution order of every system as text.
+    ///
+    /// One numbered line per system, with each group's members under it. Sleeping systems show
+    /// the signals that wake them:
+    ///
+    /// ```text
+    /// 1 game::spawn_waves
+    /// 2 game::combat
+    /// 3 ├─ game::shoot
+    /// 4 └─ game::apply_damage (wakes on Damage, Heal)
+    /// 5 game::report
+    /// ```
+    ///
+    /// Systems register themselves from every linked crate, so this is the one place to see
+    /// everything that runs.
     pub fn system_order(&self) -> String {
         system_graph().tree()
     }
 
+    /// Prints the execution order of every system. See [`system_order`](Self::system_order).
     pub fn print_system_order(&self) {
         system_graph().print_tree();
     }
 
+    /// Serializes the whole world into bytes.
+    ///
+    /// The save holds every resource, which includes components, entities, signals and the [tick](Self::tick),
+    /// plus the [app version](Self::set_app_version). Local resources aren't saved. Restore it
+    /// with [`load`](Self::load).
+    ///
+    /// # Examples
+    ///
+    /// ```rust,standalone_crate
+    /// use reacs::prelude::*;
+    ///
+    /// #[resource]
+    /// struct Turns {
+    ///     count: u32,
+    /// }
+    ///
+    /// #[system]
+    /// fn take_turn(mut turns: Mut<Resource<Turns>>) {
+    ///     turns.count += 1;
+    /// }
+    ///
+    /// fn main() {
+    ///     let mut world = World::new();
+    ///     world.step();
+    ///     let save = world.save();
+    ///
+    ///     world.step();
+    ///     world.step();
+    ///     world.load(&save);
+    ///
+    ///     assert_eq!(world.get_resource::<Turns>().unwrap().count, 1);
+    ///     assert_eq!(world.tick(), 1);
+    /// }
+    /// ```
     pub fn save(&self) -> Vec<u8> {
         let saved: Vec<(u128, Vec<u8>)> = self
             .resources
@@ -237,6 +353,11 @@ impl World {
         bincode::serialize(&(header, saved)).expect("failed to encode save")
     }
 
+    /// Returns a hash of every resource, as `(type UUID, hash)` pairs sorted by type UUID.
+    ///
+    /// Two worlds in the same state give the same list, so comparing lists shows which resources
+    /// differ between two runs. Local resources aren't included. It visits every value in the
+    /// world, so it costs as much as the world is large.
     pub fn resource_hashes(&self) -> Vec<(u128, u64)> {
         self.resources
             .iter()
@@ -255,6 +376,15 @@ impl World {
             .collect()
     }
 
+    /// Replaces the world's state with a save made by [`save`](Self::save).
+    ///
+    /// The world then runs exactly as the saved one would have. Local resources are kept, and
+    /// each one's `on_load` hook runs once afterwards.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the bytes are corrupted, the save has a different app version, or the save and
+    /// the world don't hold the same resources. The world is unchanged when it panics.
     pub fn load(&mut self, bytes: &[u8]) {
         let mut body = bytes;
         let header: SaveHeader = bincode::deserialize_from(&mut body)
@@ -297,6 +427,10 @@ impl World {
         self.finish_load();
     }
 
+    /// Like [`load`](Self::load), but returns `None` instead of panicking when the bytes aren't a
+    /// save of this program, and takes the save's resources and app version as they are.
+    ///
+    /// Meant for tools built on recordings; games should use `load`.
     pub fn restore(&mut self, bytes: &[u8]) -> Option<()> {
         let mut body = bytes;
         let header: SaveHeader = bincode::deserialize_from(&mut body).ok()?;
