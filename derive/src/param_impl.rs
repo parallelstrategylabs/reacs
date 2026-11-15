@@ -134,7 +134,7 @@ fn rewrite_path(ty: &Type, lt: &Lifetime, mode: &Type) -> syn::Result<Type> {
 pub fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> {
     let ParamArgs { modes, wake } = syn::parse2(attr)?;
     let mut input: ItemStruct = syn::parse2(item)?;
-    let name = input.ident.clone();
+    let name = crate::generated_name(&input.ident);
 
     if input.generics.lifetimes().next().is_some() {
         return Err(syn::Error::new(

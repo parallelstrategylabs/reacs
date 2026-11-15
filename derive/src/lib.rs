@@ -36,6 +36,15 @@ fn linked_crates() -> proc_macro2::TokenStream {
     quote! { #( use #names as _; )* }
 }
 
+/// Returns a copy of a type's name for the code a macro generates around the type.
+///
+/// rust-analyzer shows one hover for each token in a macro's output that points at the hovered
+/// name, so reusing the name token in generated impls repeats the type's hover. The copy points at
+/// the macro call instead, and `mixed_site` resolves an item name exactly as the source name would.
+fn generated_name(ident: &syn::Ident) -> syn::Ident {
+    syn::Ident::new(&ident.to_string(), proc_macro2::Span::mixed_site())
+}
+
 fn attr_named<'a>(attrs: &'a [syn::Attribute], names: &[&str]) -> Option<&'a syn::Attribute> {
     attrs.iter().find(|attr| {
         attr.path()
@@ -182,7 +191,7 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     let input = parse_macro_input!(item as DeriveInput);
-    let name = &input.ident;
+    let name = generated_name(&input.ident);
 
     if let Some(attr) = attr_named(&input.attrs, &["data"]) {
         let message = if local {
@@ -266,7 +275,7 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn component(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as DeriveInput);
-    let name = &input.ident;
+    let name = generated_name(&input.ident);
 
     if let Some(error) = reject_data(&input.attrs, "#[component]")
         .or_else(|| reject_derives(&input.attrs, "#[component]", TYPE_DERIVES))
@@ -646,7 +655,7 @@ pub fn signal(attr: TokenStream, item: TokenStream) -> TokenStream {
     parse_macro_input!(attr with attr_parser);
 
     let input = parse_macro_input!(item as DeriveInput);
-    let name = &input.ident;
+    let name = generated_name(&input.ident);
 
     if let Some(error) = reject_data(&input.attrs, "#[signal]")
         .or_else(|| reject_derives(&input.attrs, "#[signal]", TYPE_DERIVES))
