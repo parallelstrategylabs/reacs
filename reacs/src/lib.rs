@@ -138,6 +138,7 @@
 
 extern crate self as reacs;
 
+mod before_main;
 pub mod bit_set;
 pub(crate) mod codec;
 pub mod component;
@@ -163,7 +164,6 @@ pub struct ReadmeDoctests;
 #[doc(hidden)]
 pub mod __private {
     pub use crate::signal::{wake_init, wake_name, wake_pending};
-    pub use ctor;
     pub use serde;
 }
 
