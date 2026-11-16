@@ -272,17 +272,6 @@ reacs is young: the API will change before 1.0. A save only loads into the same 
 across versions isn't designed yet. CI runs on Linux, Windows and macOS on the latest stable Rust.
 The minimum supported Rust version is 1.88.
 
-## How reacs is built
-
-reacs is designed by me: its principles (signals instead of queries, direct maps for O(1)
-access by entity, inputs as the only way in, determinism, and the cost rules), its algorithms,
-and every tradeoff, often after measuring the alternatives.
-
-Most of the implementation is written with an AI assistant working under my direction. I set
-the design and constraints, review the results, and decide what stays. Nothing is accepted on
-the assistant's word: behaviour is checked by tests, performance by benchmarks against a plain
-`Vec`, and memory safety by Miri and by random tests checked against a model.
-
 ## License
 
 Licensed under the [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0).
