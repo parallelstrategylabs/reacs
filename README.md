@@ -111,7 +111,7 @@ Add reacs to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-reacs = "0.2"
+reacs = "0.3"
 ```
 
 `reacs` is the only dependency you need: the macros reach serde and the rest through it.
@@ -183,7 +183,7 @@ pub fn poison_ticks(mut poison: Mut<Receiver<Poison>>, mut health: Mut<Component
 
 ```toml
 [dependencies]
-reacs = "0.2"
+reacs = "0.3"
 poison = { path = "plugins/poison" }
 ```
 
