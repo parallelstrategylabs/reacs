@@ -348,6 +348,111 @@ impl World {
         system_graph().print_tree();
     }
 
+    /// Measures how long each resource takes to save and load, slowest first.
+    ///
+    /// Every resource is saved, and its bytes loaded into a separate value, 5 times; the report
+    /// keeps the median of each. The world isn't changed. Print the report for a table with each
+    /// resource's share of the time, its size, the [rule](crate::save) its values are saved by,
+    /// what it stores and the path of its type; resources under 1% of the time share one line:
+    ///
+    /// ```text
+    /// save report: 49.3 MB, save 0.65 ms, load 6.23 ms
+    ///
+    ///   #  share       save       load      size  rule            type
+    ///   1    84%    0.11 ms    5.70 ms    8.0 MB  field by field  resource        game::Units
+    ///   2     6%    0.20 ms    0.20 ms   16.0 MB  plain           signal          game::Move
+    ///   3     5%    0.18 ms    0.18 ms   12.6 MB  plain           component       game::Velocity
+    ///   4     5%    0.16 ms    0.15 ms   12.6 MB  plain           component       game::Position
+    ///        <1%    0.00 ms    0.00 ms    0.1 MB                  9 others
+    /// ```
+    ///
+    /// The values are measured warm, one at a time, so the totals come out somewhat below
+    /// [`save`](Self::save) and [`load`](Self::load), which also allocate the whole save and
+    /// free the old world. Use it to find which resources are slow and why, not for exact totals.
+    ///
+    /// # Panics
+    ///
+    /// Panics like [`save`](Self::save): if a resource isn't registered or is borrowed for writing.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,standalone_crate
+    /// use reacs::prelude::*;
+    ///
+    /// #[component]
+    /// struct Position {
+    ///     x: i32,
+    ///     y: i32,
+    /// }
+    ///
+    /// #[system]
+    /// fn moves(position: Component<Position>) {}
+    ///
+    /// fn main() {
+    ///     let world = World::new();
+    ///     let report = world.save_report();
+    ///     let position = report.resources.iter().find(|r| r.path.ends_with("Position")).unwrap();
+    ///     assert_eq!(position.rule, reacs::save::Rule::Plain);
+    ///     println!("{report}");
+    /// }
+    /// ```
+    pub fn save_report(&self) -> crate::save::SaveReport {
+        fn median(mut times: [std::time::Duration; 5]) -> std::time::Duration {
+            times.sort();
+            times[2]
+        }
+        let mut resources: Vec<_> = self
+            .resources
+            .iter()
+            .map(|(id, cell)| {
+                let entry = get_registry_entry(*id).unwrap_or_else(|| {
+                    panic!("Can't save resource {id:#034x}: it isn't registered, use #[resource]")
+                });
+                let resource = cell.try_borrow().unwrap_or_else(|_| {
+                    panic!(
+                        "Can't save resource `{}` while it's borrowed for writing",
+                        entry.type_name
+                    )
+                });
+                let mut bytes = Vec::new();
+                (entry.save)(&*resource, &mut bytes);
+                let save = median(std::array::from_fn(|_| {
+                    bytes.clear();
+                    let start = std::time::Instant::now();
+                    (entry.save)(&*resource, &mut bytes);
+                    start.elapsed()
+                }));
+                let load = median(std::array::from_fn(|_| {
+                    let start = std::time::Instant::now();
+                    let value = (entry.deserialize)(&bytes);
+                    let elapsed = start.elapsed();
+                    drop(value);
+                    elapsed
+                }));
+                crate::save::ResourceReport {
+                    kind: entry.kind,
+                    path: entry.path,
+                    rule: entry.rule,
+                    bytes: bytes.len() as u64,
+                    save,
+                    load,
+                }
+            })
+            .collect();
+        resources.sort_by(|a, b| {
+            (b.save + b.load)
+                .cmp(&(a.save + a.load))
+                .then_with(|| a.path.cmp(b.path))
+        });
+        crate::save::SaveReport { resources }
+    }
+
+    /// Prints how long each resource takes to save and load. See
+    /// [`save_report`](Self::save_report).
+    pub fn print_save_report(&self) {
+        println!("{}", self.save_report());
+    }
+
     /// Serializes the whole world into bytes.
     ///
     /// The save holds every resource, which includes components, entities, signals and the [tick](Self::tick),
@@ -779,6 +884,56 @@ mod tests {
             crate::codec::take(&world.save()[SAVE_MAGIC.len()..]).unwrap();
 
         assert_eq!(header.app_version, 3);
+    }
+
+    #[test]
+    fn save_report_covers_every_resource_once() {
+        #[component]
+        struct Spot(u32);
+
+        /// Padded on every target: a `u8` after the signal's `u64` id.
+        #[signal]
+        struct Tock(u8);
+
+        let world = World::build(|setup| {
+            setup.insert_resource(IntResource(5));
+            setup.init_component::<Spot>();
+            setup.init_signal::<Tock>();
+            let entity = setup.spawn();
+            setup.set_component(entity, Spot(1));
+            setup.signal::<Tock>().emit(Tock(2));
+        });
+        let report = world.save_report();
+        let save = world.save();
+        let (_, saved) = parse_save(&save).unwrap();
+
+        assert_eq!(report.resources.len(), saved.len());
+        assert_eq!(
+            report.bytes(),
+            saved
+                .iter()
+                .map(|(_, bytes)| bytes.len() as u64)
+                .sum::<u64>()
+        );
+        assert!(
+            report
+                .resources
+                .windows(2)
+                .all(|w| w[0].save + w[0].load >= w[1].save + w[1].load)
+        );
+        let find = |kind, path: &str| {
+            report
+                .resources
+                .iter()
+                .find(|r| r.kind == kind && r.path.ends_with(path))
+                .unwrap_or_else(|| panic!("no {kind} {path}"))
+        };
+        use crate::{registry::Kind, save::Rule};
+        assert_eq!(find(Kind::Resource, "::IntResource").rule, Rule::Plain);
+        assert_eq!(find(Kind::Component, "::Spot").rule, Rule::Plain);
+        assert_eq!(find(Kind::Signal, "::Tock").rule, Rule::FieldByField);
+        assert_eq!(find(Kind::SignalCursors, "::Tock").rule, Rule::Plain);
+        assert_eq!(world.save(), save, "the report changed the world");
     }
 
     #[test]

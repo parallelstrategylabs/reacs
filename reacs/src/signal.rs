@@ -313,6 +313,19 @@ impl<S: SignalType> SignalData<S> {
     }
 }
 
+impl<S: SignalType> Signals<S> {
+    /// The slower rule of the two ways a signal is stored: alone and with its window.
+    #[doc(hidden)]
+    pub const STORAGE_RULE: crate::save::Rule = crate::save::Rule::of::<SignalInstance<S>>()
+        .slower(crate::save::Rule::of::<WindowEntry<S>>());
+}
+
+impl<S: SignalType> SignalData<S> {
+    /// The rule each receive cursor is saved by.
+    #[doc(hidden)]
+    pub const CURSOR_RULE: crate::save::Rule = crate::save::Rule::of::<ReceiveCursor>();
+}
+
 pub(crate) const WINDOW_CHUNK_TICKS: u64 = 64;
 const _: () = assert!(WINDOW_CHUNK_TICKS > 0 && WINDOW_CHUNK_TICKS <= 64);
 

@@ -506,7 +506,10 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
             fn #ctor_fn() {
                 #link
                 ::reacs::registry::register_entry::<#name>(
-                    <#name as ::reacs::hashed::Hashed>::TYPE_UUID
+                    <#name as ::reacs::hashed::Hashed>::TYPE_UUID,
+                    ::reacs::registry::Kind::Resource,
+                    ::core::any::type_name::<#name>(),
+                    ::reacs::save::Rule::of::<#name>(),
                 );
             }
         }
@@ -622,6 +625,9 @@ pub fn component(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 type Map = ::reacs::component::ComponentMap<#name>;
                 ::reacs::registry::register_entry::<Map>(
                     <Map as ::reacs::hashed::Hashed>::TYPE_UUID,
+                    ::reacs::registry::Kind::Component,
+                    ::core::any::type_name::<#name>(),
+                    Map::SLOT_RULE,
                 );
             }
         }
@@ -1298,9 +1304,15 @@ pub fn signal(attr: TokenStream, item: TokenStream) -> TokenStream {
                 type Data = ::reacs::signal::SignalData<#name>;
                 ::reacs::registry::register_entry::<Signals>(
                     <Signals as ::reacs::hashed::Hashed>::TYPE_UUID,
+                    ::reacs::registry::Kind::Signal,
+                    ::core::any::type_name::<#name>(),
+                    Signals::STORAGE_RULE,
                 );
                 ::reacs::registry::register_entry::<Data>(
                     <Data as ::reacs::hashed::Hashed>::TYPE_UUID,
+                    ::reacs::registry::Kind::SignalCursors,
+                    ::core::any::type_name::<#name>(),
+                    Data::CURSOR_RULE,
                 );
                 ::reacs::signal::register_signal::<#name>();
                 #input_register

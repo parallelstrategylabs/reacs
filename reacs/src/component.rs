@@ -31,6 +31,12 @@ pub struct ComponentMap<C: Copy + Default> {
     slots: Vec<Slot<C>>,
 }
 
+impl<C: Copy + Default + crate::save::Save> ComponentMap<C> {
+    /// The rule each slot (the value and its generation) is saved by.
+    #[doc(hidden)]
+    pub const SLOT_RULE: crate::save::Rule = crate::save::Rule::of::<Slot<C>>();
+}
+
 impl<C: Copy + Default> ComponentMap<C> {
     /// Creates an empty storage.
     pub fn new() -> Self {

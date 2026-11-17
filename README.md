@@ -204,7 +204,8 @@ The app never names `poison_ticks`: listing the crate is enough.
   replay with a hash check per resource, and take over a replay at any tick.
 - **Fast, portable saves:** Plain data, like most components and signals, is saved and loaded by
   copying memory, a whole component map at once. The same state saves the same bytes on every
-  platform, so a save loads anywhere the same app version runs.
+  platform, so a save loads anywhere the same app version runs. `world.print_save_report()` shows
+  which resources take the time, and the rule each one is saved by.
 - **Tested determinism:** CI compares the state hashes of every tick of a scripted session, saves and
   loads included, across Linux, Windows and macOS, on x86 (32 and 64 bit) and ARM64, in debug and
   release.

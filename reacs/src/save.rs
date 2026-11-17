@@ -624,6 +624,176 @@ impl Save for String {
     }
 }
 
+/// Which rule a type is saved by (see the [module docs](self)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Rule {
+    /// Copied as memory.
+    Plain,
+    /// Copied as memory after its `bool`, `char` and enum fields are checked.
+    PlainChecked,
+    /// Written field by field.
+    FieldByField,
+}
+
+impl Rule {
+    /// Returns the rule `T` is saved by.
+    pub const fn of<T: Save>() -> Rule {
+        if !T::PLAIN {
+            Rule::FieldByField
+        } else if T::CHECKED {
+            Rule::PlainChecked
+        } else {
+            Rule::Plain
+        }
+    }
+
+    /// Returns the slower of two rules.
+    pub const fn slower(self, other: Rule) -> Rule {
+        if self as u8 >= other as u8 {
+            self
+        } else {
+            other
+        }
+    }
+}
+
+impl std::fmt::Display for Rule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(match self {
+            Rule::Plain => "plain",
+            Rule::PlainChecked => "plain, checked",
+            Rule::FieldByField => "field by field",
+        })
+    }
+}
+
+/// How long one resource takes to save and load, from
+/// [`World::save_report`](crate::world::World::save_report).
+#[derive(Clone, Debug)]
+pub struct ResourceReport {
+    /// What the resource stores.
+    pub kind: crate::registry::Kind,
+    /// The path of the type declared in game code: the resource, component or signal.
+    pub path: &'static str,
+    /// The rule its values are saved by. For components and signals, the rule of each stored
+    /// value with reacs's bookkeeping around it.
+    pub rule: Rule,
+    /// The size of its saved bytes.
+    pub bytes: u64,
+    /// The median time to save it.
+    pub save: std::time::Duration,
+    /// The median time to load it.
+    pub load: std::time::Duration,
+}
+
+/// How long each resource takes to save and load, slowest first, from
+/// [`World::save_report`](crate::world::World::save_report).
+///
+/// Printing it shows a table. Resources under 1% of the total time are counted on one last line.
+#[derive(Clone, Debug, Default)]
+pub struct SaveReport {
+    /// Every saved resource, by save and load time together, slowest first.
+    pub resources: Vec<ResourceReport>,
+}
+
+impl SaveReport {
+    /// Returns the size of every resource's saved bytes together.
+    pub fn bytes(&self) -> u64 {
+        self.resources.iter().map(|r| r.bytes).sum()
+    }
+
+    /// Returns the time to save every resource, one after another.
+    pub fn save(&self) -> std::time::Duration {
+        self.resources.iter().map(|r| r.save).sum()
+    }
+
+    /// Returns the time to load every resource, one after another.
+    pub fn load(&self) -> std::time::Duration {
+        self.resources.iter().map(|r| r.load).sum()
+    }
+}
+
+fn milliseconds(time: std::time::Duration) -> String {
+    format!("{:.2} ms", time.as_secs_f64() * 1e3)
+}
+
+fn size(bytes: u64) -> String {
+    match bytes {
+        0..1_000 => format!("{bytes} B"),
+        1_000..1_000_000 => format!("{:.1} KB", bytes as f64 / 1e3),
+        _ => format!("{:.1} MB", bytes as f64 / 1e6),
+    }
+}
+
+fn share(part: f64) -> String {
+    if part < 0.01 {
+        "<1%".into()
+    } else {
+        format!("{:.0}%", part * 100.0)
+    }
+}
+
+impl std::fmt::Display for SaveReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let total = (self.save() + self.load()).as_secs_f64();
+        let part = |r: &ResourceReport| {
+            if total > 0.0 {
+                (r.save + r.load).as_secs_f64() / total
+            } else {
+                0.0
+            }
+        };
+        writeln!(
+            f,
+            "save report: {}, save {}, load {}",
+            size(self.bytes()),
+            milliseconds(self.save()),
+            milliseconds(self.load())
+        )?;
+        writeln!(f)?;
+        writeln!(
+            f,
+            "{:>3}  {:>5}  {:>9}  {:>9}  {:>8}  {:<14}  type",
+            "#", "share", "save", "load", "size", "rule"
+        )?;
+        let (shown, others): (Vec<_>, Vec<_>) =
+            self.resources.iter().partition(|r| part(r) >= 0.01);
+        for (rank, r) in shown.iter().enumerate() {
+            writeln!(
+                f,
+                "{:>3}  {:>5}  {:>9}  {:>9}  {:>8}  {:<14}  {:<14}  {}",
+                rank + 1,
+                share(part(r)),
+                milliseconds(r.save),
+                milliseconds(r.load),
+                size(r.bytes),
+                r.rule,
+                r.kind,
+                r.path
+            )?;
+        }
+        if !others.is_empty() {
+            let save: std::time::Duration = others.iter().map(|r| r.save).sum();
+            let load: std::time::Duration = others.iter().map(|r| r.load).sum();
+            let bytes: u64 = others.iter().map(|r| r.bytes).sum();
+            let part: f64 = others.iter().map(|r| part(r)).sum();
+            let label = if others.len() == 1 { "other" } else { "others" };
+            writeln!(
+                f,
+                "{:>3}  {:>5}  {:>9}  {:>9}  {:>8}  {:<14}  {} {label}",
+                "",
+                share(part),
+                milliseconds(save),
+                milliseconds(load),
+                size(bytes),
+                "",
+                others.len()
+            )?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -991,6 +1161,79 @@ mod tests {
                 other: 0,
                 ..value
             }
+        );
+    }
+
+    #[test]
+    fn rules() {
+        assert_eq!(Rule::of::<u32>(), Rule::Plain);
+        assert_eq!(Rule::of::<bool>(), Rule::PlainChecked);
+        assert_eq!(Rule::of::<String>(), Rule::FieldByField);
+        assert_eq!(Rule::Plain.slower(Rule::PlainChecked), Rule::PlainChecked);
+        assert_eq!(Rule::FieldByField.slower(Rule::Plain), Rule::FieldByField);
+    }
+
+    fn row(
+        kind: crate::registry::Kind,
+        path: &'static str,
+        rule: Rule,
+        bytes: u64,
+        save_us: u64,
+        load_us: u64,
+    ) -> ResourceReport {
+        ResourceReport {
+            kind,
+            path,
+            rule,
+            bytes,
+            save: std::time::Duration::from_micros(save_us),
+            load: std::time::Duration::from_micros(load_us),
+        }
+    }
+
+    #[test]
+    fn report_table_folds_resources_under_one_percent() {
+        use crate::registry::Kind;
+        let report = SaveReport {
+            resources: vec![
+                row(
+                    Kind::Resource,
+                    "game::Units",
+                    Rule::FieldByField,
+                    8_000_000,
+                    110,
+                    5_700,
+                ),
+                row(
+                    Kind::Signal,
+                    "game::Move",
+                    Rule::Plain,
+                    16_000_104,
+                    200,
+                    200,
+                ),
+                row(
+                    Kind::Component,
+                    "game::Position",
+                    Rule::Plain,
+                    12_582_920,
+                    160,
+                    150,
+                ),
+                row(Kind::SignalCursors, "game::Move", Rule::Plain, 40, 0, 1),
+                row(Kind::Resource, "game::Rng", Rule::Plain, 8, 1, 0),
+            ],
+        };
+        assert_eq!(
+            report.to_string(),
+            "save report: 36.6 MB, save 0.47 ms, load 6.05 ms
+
+  #  share       save       load      size  rule            type
+  1    89%    0.11 ms    5.70 ms    8.0 MB  field by field  resource        game::Units
+  2     6%    0.20 ms    0.20 ms   16.0 MB  plain           signal          game::Move
+  3     5%    0.16 ms    0.15 ms   12.6 MB  plain           component       game::Position
+       <1%    0.00 ms    0.00 ms      48 B                  2 others
+"
         );
     }
 

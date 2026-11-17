@@ -12,6 +12,30 @@ use crate::{
     state_hash::hash_value,
 };
 
+/// What a registered type stores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Kind {
+    /// A `#[resource]`.
+    Resource,
+    /// Every value of a `#[component]`.
+    Component,
+    /// The signals of a `#[signal]` type waiting to be delivered.
+    Signal,
+    /// Where each system is in receiving a `#[signal]` type.
+    SignalCursors,
+}
+
+impl std::fmt::Display for Kind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(match self {
+            Kind::Resource => "resource",
+            Kind::Component => "component",
+            Kind::Signal => "signal",
+            Kind::SignalCursors => "signal cursors",
+        })
+    }
+}
+
 /// What reacs knows about a registered type, found by its id with [`get_registry_entry`].
 ///
 /// `#[resource]`, `#[component]` and `#[signal]` register their types before `main`. Tools built on
@@ -20,6 +44,14 @@ use crate::{
 pub struct RegistryEntry {
     /// The type's full name, as [`std::any::type_name`] gives it.
     pub type_name: &'static str,
+    /// What the type stores.
+    pub kind: Kind,
+    /// The path of the type declared in game code: the resource itself, or the component or
+    /// signal type whose storage this is.
+    pub path: &'static str,
+    /// The rule each stored value is saved by: the resource's, or for components and signals,
+    /// each value's with reacs's bookkeeping around it.
+    pub rule: crate::save::Rule,
     /// Encodes a value of the type, passed as `&dyn Any`, the way saves store it.
     ///
     /// # Panics
@@ -87,8 +119,11 @@ impl<T: Default> Registry<T> {
 
 static REGISTRY: Registry<IndexMap<u128, RegistryEntry>> = Registry::new();
 
+/// Registers a type stored in worlds. Called by the code the reacs macros generate.
+///
+/// `kind`, `path` and `rule` describe it in [`World::save_report`](crate::world::World::save_report).
 #[doc(hidden)]
-pub fn register_entry<T>(id: u128)
+pub fn register_entry<T>(id: u128, kind: Kind, path: &'static str, rule: crate::save::Rule)
 where
     T: Save + serde::Serialize + 'static,
 {
@@ -104,6 +139,9 @@ where
             id,
             RegistryEntry {
                 type_name,
+                kind,
+                path,
+                rule,
                 serialize: |v| {
                     let mut out = Vec::new();
                     v.downcast_ref::<T>().unwrap().save(&mut out);
