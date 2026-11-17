@@ -202,6 +202,9 @@ The app never names `poison_ticks`: listing the crate is enough.
   despawned. No checks for dead entities in your loops.
 - **Saves, recordings and replays:** `world.save()` / `load()` for the world state. Record inputs,
   replay with a hash check per resource, and take over a replay at any tick.
+- **Fast, portable saves:** Plain data, like most components and signals, is saved and loaded by
+  copying memory, a whole component map at once. The same state saves the same bytes on every
+  platform, so a save loads anywhere the same app version runs.
 - **Tested determinism:** CI compares the state hashes of every tick of a scripted session, saves and
   loads included, across Linux, Windows and macOS, on x86 (32 and 64 bit) and ARM64, in debug and
   release.
@@ -252,6 +255,11 @@ If you need queries, parallel systems or a full engine, [Bevy](https://bevy.org)
 - **A sleeping system skips everything it does,** not just its receive loop: a timer counted down in
   a system with a `Receiver` stops on quiet ticks. Use `Mut<Signal<S>>`, a `..` signal or
   `#[param(wake = always)]` for work that must run every tick.
+- **Field order sets save speed:** A type whose fields are numbers, `bool`, `Entity` or enums without
+  data, with no padding between them, is saved and loaded by copying memory. Anything else is saved
+  field by field, which is slower but gives the same bytes. The macros add `#[repr(C)]`, so fields
+  stay in the order you write: put the largest first. Prefer `u32` or `u64` to `usize`, which is
+  saved as 64-bit everywhere. See `reacs::save` for the rules.
 - **Long signals stay until they end:** A signal with no end, or a long window, keeps being delivered,
   and stays in memory and saves, until it's cancelled. Only `#[signal(entity)]` signals are cleaned up
   when their entity dies.

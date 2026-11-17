@@ -56,7 +56,8 @@
 //! - Check that dependencies, like a physics crate, follow the same rules.
 //!
 //! [`World::save`](world::World::save) and [`World::load`](world::World::load) store and restore a
-//! whole world. [`World::to_recorder`](world::World::to_recorder) records a session's inputs, and
+//! whole world, the same bytes for the same state on every platform; [`save`] says how each type
+//! is saved, and how to make it a memory copy. [`World::to_recorder`](world::World::to_recorder) records a session's inputs, and
 //! [`World::to_playback`](world::World::to_playback) replays it, checking that every tick matches.
 //!
 //! # Examples
