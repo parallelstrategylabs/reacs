@@ -150,6 +150,7 @@ pub mod index_map;
 pub mod record;
 pub mod registry;
 pub mod resource;
+pub mod save;
 pub mod schedule;
 pub mod signal;
 pub mod state_hash;
