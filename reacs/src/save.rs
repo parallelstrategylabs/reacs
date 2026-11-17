@@ -25,6 +25,8 @@
 use serde::{Serialize, de::DeserializeOwned};
 use std::mem::{size_of, size_of_val};
 
+pub use reacs_derive::Save;
+
 /// A type that can be stored in a save.
 ///
 /// A type's bytes are its canonical encoding (see the [module docs](self)): the same state gives
@@ -124,15 +126,17 @@ fn memory_of_slice<T: Save>(values: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), size_of_val(values)) }
 }
 
-/// The memory of `value`: its bytes as they are, padding included.
+/// The memory of `value`, for `#[derive(Save)]`.
 ///
-/// For [`save_plain`] and enums without data, whose memory has no padding.
+/// Only for types without padding: plain types, enums without data (just their tag) and
+/// `#[save(plain)]` fields.
 #[doc(hidden)]
 #[inline]
-pub fn memory_of<T: Copy>(value: &T) -> &[u8] {
+pub fn memory_of<T>(value: &T) -> &[u8] {
     // SAFETY: `value`'s `size_of` bytes are live for the returned borrow. Callers pass types
-    // without padding: enums without data (just their tag) and `#[save(plain)]` fields, whose
-    // author promises plain data.
+    // without padding, so every byte is initialized: plain types (`PLAIN` checks the layout),
+    // enums without data (just their tag) and `#[save(plain)]` fields, whose author promises
+    // plain data.
     unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
 }
 
@@ -413,7 +417,7 @@ impl<T: ?Sized> Save for std::marker::PhantomData<T> {
 /// Saves an enum without data, for `#[derive(Save)]`: its tag, little-endian.
 #[doc(hidden)]
 #[inline]
-pub fn save_tag<T: Copy>(value: &T, out: &mut Vec<u8>) {
+pub fn save_tag<T>(value: &T, out: &mut Vec<u8>) {
     let start = out.len();
     out.extend_from_slice(memory_of(value));
     if !LITTLE_ENDIAN {
@@ -421,25 +425,29 @@ pub fn save_tag<T: Copy>(value: &T, out: &mut Vec<u8>) {
     }
 }
 
-/// Loads an enum without data saved by [`save_tag`], for `#[derive(Save)]`: the tag must be one of
-/// `variants`.
+/// Reads an enum without data saved by [`save_tag`], for `#[derive(Save)]`: returns the index of
+/// the variant in `variants` whose tag it is.
+///
+/// # Panics
+///
+/// Panics if the tag is none of `variants`.
 #[doc(hidden)]
 #[inline]
-pub fn load_tag<T: Copy>(reader: &mut Reader<'_>, variants: &[T]) -> T {
+pub fn load_tag<T>(reader: &mut Reader<'_>, variants: &[T]) -> usize {
     let mut bytes = reader.take(size_of::<T>()).to_vec();
     if !LITTLE_ENDIAN {
         bytes.reverse();
     }
-    *variants
+    variants
         .iter()
-        .find(|variant| memory_of(*variant) == bytes.as_slice())
+        .position(|variant| memory_of(variant) == bytes.as_slice())
         .unwrap_or_else(|| corrupted(std::any::type_name::<T>()))
 }
 
 /// Checks the tags of enums without data, for `#[derive(Save)]`: each must be one of `variants`.
 #[doc(hidden)]
 #[inline]
-pub fn check_tags<T: Copy>(
+pub fn check_tags<T>(
     variants: &[T],
     bytes: &[u8],
     count: usize,
@@ -773,5 +781,222 @@ mod tests {
     #[should_panic(expected = "trailing bytes")]
     fn trailing_bytes_panic() {
         load::<u8>(&[1, 2]);
+    }
+
+    #[derive(Save, Clone, Copy, Default, PartialEq, Debug)]
+    #[repr(C)]
+    struct Plain {
+        a: u32,
+        b: i16,
+        c: u16,
+    }
+
+    /// Small fields first: padded, and Rust may reorder it.
+    #[derive(Save, Default, PartialEq, Debug)]
+    struct Unordered {
+        small: u8,
+        big: u64,
+        mid: u16,
+    }
+
+    #[derive(Save, Clone, Copy, Default, PartialEq, Debug)]
+    #[repr(u8)]
+    enum Team {
+        #[default]
+        Red,
+        Green = 5,
+        Blue,
+    }
+
+    #[derive(Save, Clone, Copy, Default, PartialEq, Debug)]
+    #[repr(C)]
+    struct Checked {
+        team: Team,
+        alive: bool,
+        level: u16,
+    }
+
+    #[derive(Save, Clone, Copy, Default, PartialEq, Debug)]
+    enum Order {
+        #[default]
+        Idle,
+        Move {
+            x: i32,
+            y: i32,
+        },
+        Attack(u64),
+    }
+
+    #[derive(Save, Default, PartialEq, Debug)]
+    struct Nested {
+        id: u32,
+        points: Vec<Plain>,
+        name: String,
+        order: Option<Order>,
+    }
+
+    #[derive(Save, Default, PartialEq, Debug)]
+    #[repr(C)]
+    struct Generic<T> {
+        count: u32,
+        value: T,
+    }
+
+    #[derive(Save, Default, PartialEq, Debug, Serialize, serde::Deserialize)]
+    struct Attributes {
+        #[save(plain)]
+        wrapped: std::num::Wrapping<u32>,
+        #[save(serde)]
+        timeout: std::time::Duration,
+        #[save(skip)]
+        cache: u32,
+        #[serde(skip)]
+        other: u32,
+        kept: u16,
+    }
+
+    #[derive(Save, Default, PartialEq, Debug)]
+    struct Unit;
+
+    #[test]
+    fn plain_structs_save_their_fields_in_order() {
+        const { assert!(<Plain as Save>::PLAIN == LITTLE_ENDIAN) };
+        let value = Plain { a: 1, b: -2, c: 3 };
+        assert_eq!(round_trip(value), [1, 0, 0, 0, 0xfe, 0xff, 3, 0]);
+
+        let mut by_field = Vec::new();
+        write_len(&mut by_field, 2);
+        for _ in 0..2 {
+            value.a.save(&mut by_field);
+            value.b.save(&mut by_field);
+            value.c.save(&mut by_field);
+        }
+        assert_eq!(round_trip(vec![value; 2]), by_field);
+    }
+
+    #[test]
+    fn padded_or_reordered_structs_save_their_fields_in_order() {
+        const { assert!(!<Unordered as Save>::PLAIN) };
+        let value = Unordered {
+            small: 1,
+            big: 2,
+            mid: 3,
+        };
+        assert_eq!(round_trip(value), [1, 2, 0, 0, 0, 0, 0, 0, 0, 3, 0]);
+    }
+
+    #[test]
+    fn generic_structs_are_plain_only_without_padding() {
+        const { assert!(<Generic<u32> as Save>::PLAIN == LITTLE_ENDIAN) };
+        const { assert!(!<Generic<u8> as Save>::PLAIN) };
+        assert_eq!(
+            round_trip(Generic {
+                count: 1,
+                value: 2u8
+            }),
+            [1, 0, 0, 0, 2]
+        );
+    }
+
+    #[test]
+    fn enums_without_data_are_checked_plain() {
+        const { assert!(<Team as Save>::PLAIN && <Team as Save>::CHECKED) };
+        assert_eq!(round_trip(Team::Green), [5]);
+        assert_eq!(round_trip(Team::Blue), [6]);
+
+        const { assert!(<Checked as Save>::PLAIN == LITTLE_ENDIAN && <Checked as Save>::CHECKED) };
+        let value = Checked {
+            team: Team::Blue,
+            alive: true,
+            level: 0x0102,
+        };
+        assert_eq!(round_trip(value), [6, 1, 2, 1]);
+        assert_eq!(
+            round_trip(vec![value; 3])[8..],
+            [6, 1, 2, 1, 6, 1, 2, 1, 6, 1, 2, 1]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "corrupted")]
+    fn bad_enum_tag_panics() {
+        load::<Team>(&[1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "corrupted")]
+    fn bad_enum_tag_in_a_plain_vector_panics() {
+        load::<Vec<Checked>>(&[1, 0, 0, 0, 0, 0, 0, 0, 7, 1, 0, 0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "corrupted")]
+    fn bad_bool_in_a_plain_struct_panics() {
+        load::<Checked>(&[5, 2, 0, 0]);
+    }
+
+    #[test]
+    fn enums_with_data_save_the_variant_index_then_its_fields() {
+        const { assert!(!<Order as Save>::PLAIN) };
+        assert_eq!(round_trip(Order::Idle), [0, 0, 0, 0]);
+        assert_eq!(
+            round_trip(Order::Move { x: 1, y: -1 }),
+            [1, 0, 0, 0, 1, 0, 0, 0, 0xff, 0xff, 0xff, 0xff]
+        );
+        assert_eq!(
+            round_trip(Order::Attack(7)),
+            [2, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "corrupted")]
+    fn bad_variant_index_panics() {
+        load::<Order>(&[3, 0, 0, 0]);
+    }
+
+    #[test]
+    fn nested_types_round_trip() {
+        let value = Nested {
+            id: 9,
+            points: vec![Plain { a: 1, b: 2, c: 3 }; 4],
+            name: "squad".into(),
+            order: Some(Order::Attack(3)),
+        };
+        let encoded = round_trip(value);
+        assert_eq!(encoded.len(), 4 + (8 + 4 * 8) + (8 + 5) + (1 + 4 + 8));
+    }
+
+    #[test]
+    fn field_attributes() {
+        const { assert!(!<Attributes as Save>::PLAIN) };
+        let value = Attributes {
+            wrapped: std::num::Wrapping(0x0102_0304),
+            timeout: std::time::Duration::from_secs(2),
+            cache: 5,
+            other: 6,
+            kept: 7,
+        };
+        let encoded = bytes(&value);
+        let mut serde = Vec::new();
+        save_serde(&value.timeout, &mut serde);
+        assert_eq!(encoded[..4], [4, 3, 2, 1]);
+        assert_eq!(encoded[4..encoded.len() - 2], serde);
+        assert_eq!(encoded[encoded.len() - 2..], [7, 0]);
+        let loaded: Attributes = load(&encoded);
+        assert_eq!(
+            loaded,
+            Attributes {
+                cache: 0,
+                other: 0,
+                ..value
+            }
+        );
+    }
+
+    #[test]
+    fn unit_structs_save_nothing() {
+        const { assert!(<Unit as Save>::PLAIN) };
+        assert_eq!(round_trip(Unit), []);
     }
 }

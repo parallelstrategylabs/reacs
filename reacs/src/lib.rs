@@ -179,6 +179,7 @@ pub mod prelude {
     pub use crate::hashed::Hashed;
     pub use crate::index_map::IndexMap;
     pub use crate::resource::{LocalResource, Resource};
+    pub use crate::save::Save;
     pub use crate::schedule::{
         IntoSystem, Mut, Setup, SystemEntry, SystemGraph, SystemParam, WorldAccess, system_graph,
     };

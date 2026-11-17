@@ -11,6 +11,7 @@ use syn::{
 };
 
 mod param_impl;
+mod save_impl;
 
 fn linked_crates() -> proc_macro2::TokenStream {
     let mut args = Vec::new();
@@ -177,6 +178,70 @@ pub fn world(input: TokenStream) -> TokenStream {
 ///
 /// assert_ne!(Faction::TYPE_UUID, Unit::TYPE_UUID);
 /// ```
+/// Derives `Save`, which saves and loads the type with the world.
+///
+/// `#[resource]`, `#[component]`, `#[signal]` and `#[data]` derive it already; use the derive for
+/// your own types inside resources, like a struct in a `Vec`. Every field type must implement
+/// `Save`: numbers, `bool`, `char`, `Entity`, arrays, tuples, `Option`, `Vec`, `String`,
+/// `IndexMap` and types declared with reacs macros or this derive do.
+///
+/// The derive picks how the type is saved from its fields. A struct whose fields are all plain
+/// (numbers, `bool`, `char`, `Entity`, enums without data and plain structs), laid out in
+/// declaration order with no padding, is plain: values, and whole `Vec`s of them, are saved and
+/// loaded by copying memory. `bool`, `char` and enum fields are checked on load, so a corrupted
+/// save panics instead of making an invalid value. Any other type is saved field by field. Every
+/// type saves the same bytes on every platform, whichever way it's saved. Add `#[repr(C)]` to keep
+/// fields in declaration order (the reacs macros add it), and order them from largest to smallest
+/// to leave no padding. Prefer fixed-size integers to `usize`, which is saved as 64-bit.
+///
+/// # Field attributes
+///
+/// - `#[save(plain)]` copies the field's memory as it is: for a `Copy` type from another crate that
+///   can't implement `Save`, holding only numbers, with every bit pattern valid. The bytes are the
+///   type's own layout, so they match across platforms only if its layout does.
+/// - `#[save(serde)]` encodes the field with serde: for any other type from another crate.
+/// - `#[save(skip)]` (or `#[serde(skip)]`) doesn't save the field: it loads as its `Default`.
+///
+/// Enums with data save the variant's index as a `u32`, then the variant's fields.
+///
+/// # Examples
+///
+/// ```rust,standalone_crate
+/// use reacs::prelude::*;
+///
+/// #[derive(Save, Clone, Copy, Default, PartialEq, Debug)]
+/// #[repr(C)]
+/// struct Waypoint {
+///     x: i32,
+///     y: i32,
+/// }
+///
+/// #[derive(Save, Default, PartialEq, Debug)]
+/// struct Route {
+///     name: String,
+///     points: Vec<Waypoint>,
+/// }
+///
+/// fn main() {
+///     // Waypoints are plain: a `Vec` of them is one memory copy.
+///     assert!(<Waypoint as Save>::PLAIN);
+///     assert!(!<Route as Save>::PLAIN);
+///
+///     let route = Route { name: "patrol".into(), points: vec![Waypoint { x: 1, y: 2 }] };
+///     let mut bytes = Vec::new();
+///     route.save(&mut bytes);
+///     let loaded = Route::load(&mut reacs::save::Reader::new(&bytes));
+///     assert_eq!(loaded, route);
+/// }
+/// ```
+#[proc_macro_derive(Save, attributes(save))]
+pub fn derive_save(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    save_impl::derive(input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
 #[proc_macro_derive(Hashed)]
 pub fn derive_hashed_def(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
