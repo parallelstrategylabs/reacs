@@ -13,11 +13,14 @@ use std::cell::{Ref, RefMut};
 
 const EMPTY: u32 = NO_GENERATION;
 
+/// Value first: with the generation first, ticks reading components ran up to 60% slower (an
+/// `Entity` component: 0.59 to 0.93 ms for 1M updates). `repr(C)` keeps this order, so slots of
+/// plain components without padding are saved by copying memory.
 #[derive(Clone, Copy, Serialize, Deserialize, crate::save::Save)]
 #[repr(C)]
 struct Slot<C> {
-    generation: u32,
     value: C,
+    generation: u32,
 }
 
 /// The storage of one component type: one slot per entity index.
