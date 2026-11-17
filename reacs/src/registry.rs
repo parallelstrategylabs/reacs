@@ -6,7 +6,11 @@ use std::{
     sync::{Mutex, OnceLock, PoisonError},
 };
 
-use crate::{index_map::IndexMap, state_hash::hash_value};
+use crate::{
+    index_map::IndexMap,
+    save::{Reader, Save},
+    state_hash::hash_value,
+};
 
 /// What reacs knows about a registered type, found by its id with [`get_registry_entry`].
 ///
@@ -28,17 +32,17 @@ pub struct RegistryEntry {
     ///
     /// Panics if the bytes don't decode as the type.
     pub deserialize: fn(&[u8]) -> Box<dyn Any>,
+    pub(crate) save: fn(&dyn Any, &mut Vec<u8>),
     pub(crate) restore: fn(&[u8]) -> Box<RefCell<dyn Any>>,
     pub(crate) hash: fn(&dyn Any) -> u64,
 }
 
-fn decode<T: for<'de> serde::Deserialize<'de>>(bytes: &[u8]) -> T {
-    crate::codec::from_slice(bytes).unwrap_or_else(|error| {
-        panic!(
-            "Failed to deserialize `{}`: {error}",
-            std::any::type_name::<T>()
-        )
-    })
+/// Reads a value that must fill `bytes` exactly.
+fn load_all<T: Save>(bytes: &[u8]) -> T {
+    let mut reader = Reader::new(bytes);
+    let value = T::load(&mut reader);
+    reader.finish();
+    value
 }
 
 pub(crate) struct Registry<T> {
@@ -86,7 +90,7 @@ static REGISTRY: Registry<IndexMap<u128, RegistryEntry>> = Registry::new();
 #[doc(hidden)]
 pub fn register_entry<T>(id: u128)
 where
-    T: serde::Serialize + for<'de> serde::Deserialize<'de> + 'static,
+    T: Save + serde::Serialize + 'static,
 {
     let type_name = std::any::type_name::<T>();
     REGISTRY.add(type_name, |map| {
@@ -100,9 +104,14 @@ where
             id,
             RegistryEntry {
                 type_name,
-                serialize: |v| crate::codec::to_vec(v.downcast_ref::<T>().unwrap()).unwrap(),
-                deserialize: |b| Box::new(decode::<T>(b)),
-                restore: |b| Box::new(RefCell::new(decode::<T>(b))),
+                serialize: |v| {
+                    let mut out = Vec::new();
+                    v.downcast_ref::<T>().unwrap().save(&mut out);
+                    out
+                },
+                deserialize: |b| Box::new(load_all::<T>(b)),
+                save: |v, out| v.downcast_ref::<T>().unwrap().save(out),
+                restore: |b| Box::new(RefCell::new(load_all::<T>(b))),
                 hash: |v| hash_value(v.downcast_ref::<T>().unwrap()),
             },
         );

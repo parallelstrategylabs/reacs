@@ -74,7 +74,9 @@ impl<S> SignalFilter<S> for NoFilter {
 /// A type declared with `#[signal]`.
 ///
 /// Implemented by the macro; game code doesn't implement it by hand.
-pub trait SignalType: 'static + Copy + Default + Hashed + Serialize + DeserializeOwned {
+pub trait SignalType:
+    'static + Copy + Default + Hashed + Serialize + DeserializeOwned + crate::save::Save
+{
     /// Decides which signals are still delivered: none are dropped for a plain `#[signal]`, and
     /// signals of a despawned entity are dropped for `#[signal(entity)]`.
     type Filter: SignalFilter<Self>;

@@ -2,7 +2,7 @@
 
 use std::{
     any::{Any, TypeId},
-    cell::{Ref, RefCell, RefMut},
+    cell::{Cell, Ref, RefCell, RefMut},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -20,11 +20,55 @@ use serde::{Deserialize, Serialize};
 
 /// The first bytes of every save, so garbage or a save in another format is reported as corrupted
 /// instead of being decoded as a header.
-const SAVE_MAGIC: &[u8; 8] = b"REACSSV1";
+const SAVE_MAGIC: &[u8; 8] = b"REACSSV2";
 
 #[derive(Serialize, Deserialize)]
 struct SaveHeader {
     app_version: u32,
+}
+
+/// A save's resources: `(resource id, bytes)`, borrowed from the save.
+type SavedResources<'a> = Vec<(u128, &'a [u8])>;
+
+/// Splits a save into its header and its resources.
+///
+/// After the magic: the postcard header, the entry count as a little-endian `u32`, then per entry
+/// the id as a little-endian `u128`, the length as a little-endian `u64`, and the resource's bytes.
+fn parse_save(bytes: &[u8]) -> Option<(SaveHeader, SavedResources<'_>)> {
+    fn take<'a>(body: &mut &'a [u8], len: usize) -> Option<&'a [u8]> {
+        let head = body.get(..len)?;
+        *body = &body[len..];
+        Some(head)
+    }
+    let body = bytes.strip_prefix(SAVE_MAGIC)?;
+    let (header, mut body): (SaveHeader, &[u8]) = crate::codec::take(body).ok()?;
+    let count = u32::from_le_bytes(take(&mut body, 4)?.try_into().ok()?);
+    let mut entries = Vec::new();
+    for _ in 0..count {
+        let id = u128::from_le_bytes(take(&mut body, 16)?.try_into().ok()?);
+        let len = u64::from_le_bytes(take(&mut body, 8)?.try_into().ok()?);
+        entries.push((id, take(&mut body, usize::try_from(len).ok()?)?));
+    }
+    body.is_empty().then_some((header, entries))
+}
+
+/// Starts a save: the magic, the header and the entry count.
+fn begin_save(header: &SaveHeader, count: usize, capacity: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(capacity);
+    out.extend_from_slice(SAVE_MAGIC);
+    out.extend_from_slice(&crate::codec::to_vec(header).expect("failed to encode the save header"));
+    out.extend_from_slice(&(count as u32).to_le_bytes());
+    out
+}
+
+/// Appends one entry, with `write` writing its bytes in place.
+fn save_entry(out: &mut Vec<u8>, id: u128, write: impl FnOnce(&mut Vec<u8>)) {
+    out.extend_from_slice(&id.to_le_bytes());
+    let len_at = out.len();
+    out.extend_from_slice(&0u64.to_le_bytes());
+    write(out);
+    let len = (out.len() - len_at - 8) as u64;
+    out[len_at..len_at + 8].copy_from_slice(&len.to_le_bytes());
 }
 
 struct LocalEntry {
@@ -93,6 +137,8 @@ pub struct World {
     pub(crate) loads: u64,
     pub(crate) steps: u64,
     pub(crate) instance: u64,
+    /// The last save's size, so the next save allocates once.
+    last_save_len: Cell<usize>,
 }
 
 static WORLDS: AtomicU64 = AtomicU64::new(0);
@@ -120,6 +166,7 @@ impl World {
             loads: 0,
             steps: 0,
             instance: WORLDS.fetch_add(1, Ordering::Relaxed),
+            last_save_len: Cell::new(0),
         };
 
         world.init_resource::<CurrentSystem>();
@@ -307,6 +354,10 @@ impl World {
     /// plus the [app version](Self::set_app_version). Local resources aren't saved. Restore it
     /// with [`load`](Self::load).
     ///
+    /// Each resource is written by its [`Save`](crate::save::Save) impl, so two worlds in the same
+    /// state give the same bytes on every platform. Plain data, like most components and signals,
+    /// is copied straight from memory.
+    ///
     /// # Examples
     ///
     /// ```rust,standalone_crate
@@ -336,27 +387,24 @@ impl World {
     /// }
     /// ```
     pub fn save(&self) -> Vec<u8> {
-        let saved: Vec<(u128, Vec<u8>)> = self
-            .resources
-            .iter()
-            .map(|(id, cell)| {
-                let entry = get_registry_entry(*id).unwrap_or_else(|| {
-                    panic!("Can't save resource {id:#034x}: it isn't registered, use #[resource]")
-                });
-                let resource = cell.try_borrow().unwrap_or_else(|_| {
-                    panic!(
-                        "Can't save resource `{}` while it's borrowed for writing",
-                        entry.type_name
-                    )
-                });
-                (*id, (entry.serialize)(&*resource))
-            })
-            .collect();
-
         let header = SaveHeader {
             app_version: self.app_version,
         };
-        crate::codec::to_vec_after(SAVE_MAGIC, &(header, saved)).expect("failed to encode save")
+        let mut out = begin_save(&header, self.resources.len(), self.last_save_len.get());
+        for (id, cell) in &self.resources {
+            let entry = get_registry_entry(*id).unwrap_or_else(|| {
+                panic!("Can't save resource {id:#034x}: it isn't registered, use #[resource]")
+            });
+            let resource = cell.try_borrow().unwrap_or_else(|_| {
+                panic!(
+                    "Can't save resource `{}` while it's borrowed for writing",
+                    entry.type_name
+                )
+            });
+            save_entry(&mut out, *id, |out| (entry.save)(&*resource, out));
+        }
+        self.last_save_len.set(out.len());
+        out
     }
 
     /// Returns a hash of every resource, as `(type UUID, hash)` pairs sorted by type UUID.
@@ -392,11 +440,8 @@ impl World {
     /// Panics if the bytes are corrupted, the save has a different app version, or the save and
     /// the world don't hold the same resources. The world is unchanged when it panics.
     pub fn load(&mut self, bytes: &[u8]) {
-        let body = bytes
-            .strip_prefix(SAVE_MAGIC)
+        let (header, saved) = parse_save(bytes)
             .unwrap_or_else(|| panic!("Failed to load save, it's corrupted or not a reacs save"));
-        let (header, body): (SaveHeader, &[u8]) = crate::codec::take(body)
-            .unwrap_or_else(|error| panic!("Failed to load save, it's corrupted: {error}"));
 
         if header.app_version != self.app_version {
             panic!(
@@ -404,9 +449,6 @@ impl World {
                 header.app_version, self.app_version
             );
         }
-
-        let saved: Vec<(u128, Vec<u8>)> = crate::codec::from_slice(body)
-            .unwrap_or_else(|error| panic!("Failed to load save, it's corrupted: {error}"));
 
         for (id, _) in &self.resources {
             if !saved.iter().any(|(saved_id, _)| saved_id == id) {
@@ -440,9 +482,7 @@ impl World {
     ///
     /// Meant for tools built on recordings; games should use `load`.
     pub fn restore(&mut self, bytes: &[u8]) -> Option<()> {
-        let body = bytes.strip_prefix(SAVE_MAGIC)?;
-        let (header, body): (SaveHeader, &[u8]) = crate::codec::take(body).ok()?;
-        let saved: Vec<(u128, Vec<u8>)> = crate::codec::from_slice(body).ok()?;
+        let (header, saved) = parse_save(bytes)?;
 
         let mut resources = Vec::with_capacity(saved.len());
         for (id, bytes) in &saved {
@@ -467,7 +507,7 @@ impl World {
 
 #[cfg(test)]
 mod tests {
-    use super::{SAVE_MAGIC, SaveHeader};
+    use super::{SAVE_MAGIC, SaveHeader, begin_save, parse_save, save_entry};
     use crate::prelude::*;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -475,10 +515,14 @@ mod tests {
     struct IntResource(pub u64);
 
     fn save_with_unknown_resource(world: &World) -> Vec<u8> {
-        let (header, mut saved): (SaveHeader, Vec<(u128, Vec<u8>)>) =
-            crate::codec::from_slice(&world.save()[SAVE_MAGIC.len()..]).unwrap();
-        saved.push((1, Vec::new()));
-        crate::codec::to_vec_after(SAVE_MAGIC, &(header, saved)).unwrap()
+        let save = world.save();
+        let (header, mut saved) = parse_save(&save).unwrap();
+        saved.push((1, &[]));
+        let mut out = begin_save(&header, saved.len(), 0);
+        for (id, bytes) in saved {
+            save_entry(&mut out, id, |out| out.extend_from_slice(bytes));
+        }
+        out
     }
 
     #[test]

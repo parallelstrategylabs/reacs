@@ -11,14 +11,6 @@ pub(crate) fn to_vec<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, Error>
     postcard::to_allocvec(value)
 }
 
-/// Encodes `value` after `prefix`, in one buffer.
-pub(crate) fn to_vec_after<T: Serialize + ?Sized>(
-    prefix: &[u8],
-    value: &T,
-) -> Result<Vec<u8>, Error> {
-    postcard::to_extend(value, prefix.to_vec())
-}
-
 /// Decodes a value that must fill `bytes` exactly.
 pub(crate) fn from_slice<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, Error> {
     let (value, rest) = postcard::take_from_bytes(bytes)?;
