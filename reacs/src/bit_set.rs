@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 /// assert_eq!(set.next_set(4, 100), 70);
 /// assert_eq!(set.next_set(71, 100), 100);
 /// ```
-#[derive(Default, Clone, Serialize, Deserialize, Debug)]
+#[derive(Default, Clone, Serialize, Deserialize, Debug, crate::save::Save)]
 pub struct BitSet {
     /// The bits, 64 indexes per word: index `i` is bit `i % 64` of `words[i / 64]`.
     pub words: Vec<u64>,

@@ -500,6 +500,33 @@ where
     }
 }
 
+/// Saves the entries in order, each by its own rule (one memory copy when they're plain), and
+/// rebuilds the table on load at its final size: the table is never saved.
+impl<K, V> crate::save::Save for IndexMap<K, V>
+where
+    K: crate::save::Save + Hash + Eq,
+    V: crate::save::Save,
+{
+    const PLAIN: bool = false;
+
+    fn save(&self, out: &mut Vec<u8>) {
+        <(K, V)>::save_slice(&self.entries, out);
+    }
+
+    fn load(reader: &mut crate::save::Reader<'_>) -> Self {
+        let entries = <(K, V)>::load_vec(reader);
+        let mut map = Self::with_capacity(entries.len());
+        for (key, value) in entries {
+            if map.insert(key, value).is_some() {
+                panic!("Failed to load save, it's corrupted: duplicate key in IndexMap");
+            }
+        }
+        #[cfg(any(test, feature = "invariants"))]
+        map.check_invariants();
+        map
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,7 +542,7 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, crate::save::Save)]
     struct Weak(u32);
 
     impl Hash for Weak {
@@ -645,6 +672,54 @@ mod tests {
                 crate::codec::to_vec(&original).unwrap()
             );
         }
+    }
+
+    fn saved<T: crate::save::Save>(value: &T) -> Vec<u8> {
+        let mut out = Vec::new();
+        value.save(&mut out);
+        out
+    }
+
+    fn loaded<T: crate::save::Save>(bytes: &[u8]) -> T {
+        let mut reader = crate::save::Reader::new(bytes);
+        let value = T::load(&mut reader);
+        reader.finish();
+        value
+    }
+
+    #[test]
+    fn save_trait_keeps_order_and_bytes() {
+        let count = crate::test_size(30_000, 600);
+        let all = ops(4321, count, 400);
+        let (before, after) = all.split_at(count / 3);
+        let mut original = IndexMap::new();
+        for &op in before {
+            apply(&mut original, op, Weak);
+        }
+        assert!(original.len() > 10);
+
+        let bytes = saved(&original);
+        let mut restored: IndexMap<Weak, u64> = loaded(&bytes);
+        assert_eq!(restored.as_slice(), original.as_slice());
+        assert_eq!(saved(&restored), bytes);
+
+        for &op in after {
+            apply(&mut original, op, Weak);
+            apply(&mut restored, op, Weak);
+            assert_eq!(saved(&restored), saved(&original));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate key in IndexMap")]
+    fn save_trait_load_rejects_duplicate_keys() {
+        let mut bytes = Vec::new();
+        crate::save::write_len(&mut bytes, 2);
+        for _ in 0..2 {
+            bytes.extend_from_slice(&7u32.to_le_bytes());
+            bytes.extend_from_slice(&1u64.to_le_bytes());
+        }
+        loaded::<IndexMap<Weak, u64>>(&bytes);
     }
 
     #[test]

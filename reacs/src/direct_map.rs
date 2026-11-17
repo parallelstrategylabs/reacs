@@ -25,7 +25,7 @@ use crate::bit_set::BitSet;
 /// ages.remove(3);
 /// assert_eq!(ages.get(3), None);
 /// ```
-#[derive(Default, Hashed, Serialize, Deserialize)]
+#[derive(Default, Hashed, Serialize, Deserialize, crate::save::Save)]
 pub struct DirectMap<T: Copy + Default> {
     /// The keys that hold a value.
     pub active: BitSet,

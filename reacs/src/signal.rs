@@ -83,7 +83,8 @@ pub trait SignalType: 'static + Copy + Default + Hashed + Serialize + Deserializ
 /// A resolved window: the ticks `start..end` a signal is delivered on.
 ///
 /// Produced by [`IntoWindow`]; game code writes windows with [`In`], [`At`], [`For`] and [`To`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, crate::save::Save)]
+#[repr(C)]
 pub struct SignalWindow {
     /// The first tick of the window.
     pub start: u64,
@@ -266,14 +267,16 @@ impl SignalWindow {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, crate::save::Save)]
 #[serde(bound = "S: SignalType")]
+#[repr(C)]
 pub(crate) struct SignalInstance<S> {
     pub(crate) id: u64,
     pub(crate) payload: S,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, crate::save::Save)]
+#[repr(C)]
 pub(crate) struct ReceiveCursor {
     pub(crate) system: u128,
     pub(crate) next: u64,
@@ -285,7 +288,7 @@ pub(crate) struct ReceiveCursor {
 ///
 /// One of the two resources a signal type is stored in, with [`Signals`]. Systems use it through
 /// [`Receiver`], [`Sender`] and [`Signal`]; its contents are private.
-#[derive(Default, Hashed, Serialize, Deserialize)]
+#[derive(Default, Hashed, Serialize, Deserialize, crate::save::Save)]
 #[serde(bound = "")]
 pub struct SignalData<S: SignalType> {
     pub(crate) cursors: Vec<ReceiveCursor>,
@@ -328,7 +331,7 @@ fn chunk_bits_through(tick: u64) -> u64 {
     u64::MAX >> (63 - tick % WINDOW_CHUNK_TICKS)
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, crate::save::Save)]
 #[serde(bound = "S: SignalType")]
 pub(crate) struct WindowChunk<S> {
     pub(crate) key: u64,
@@ -475,7 +478,7 @@ enum WindowSlot {
 /// One of the two resources a signal type is stored in, with [`SignalData`]. Its id is the one
 /// recordings name input signals by ([`RecordedInputs::signal`](crate::record::RecordedInputs)).
 /// Systems use it through [`Receiver`], [`Sender`] and [`Signal`]; its contents are private.
-#[derive(Default, Hashed, Serialize, Deserialize)]
+#[derive(Default, Hashed, Serialize, Deserialize, crate::save::Save)]
 #[serde(bound = "")]
 pub struct Signals<S: SignalType> {
     pub(crate) transient: Vec<SignalInstance<S>>,

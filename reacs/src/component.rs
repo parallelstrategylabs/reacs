@@ -13,7 +13,8 @@ use std::cell::{Ref, RefMut};
 
 const EMPTY: u32 = NO_GENERATION;
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Serialize, Deserialize, crate::save::Save)]
+#[repr(C)]
 struct Slot<C> {
     generation: u32,
     value: C,
@@ -22,7 +23,7 @@ struct Slot<C> {
 /// The storage of one component type: one slot per entity index.
 ///
 /// Systems use it through [`Component`]. The host reads it with [`World::get_component_map`].
-#[derive(Default, Hashed, Serialize, Deserialize)]
+#[derive(Default, Hashed, Serialize, Deserialize, crate::save::Save)]
 pub struct ComponentMap<C: Copy + Default> {
     slots: Vec<Slot<C>>,
 }

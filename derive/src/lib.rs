@@ -60,7 +60,14 @@ fn attr_named<'a>(attrs: &'a [syn::Attribute], names: &[&str]) -> Option<&'a syn
     })
 }
 
-const DATA_DERIVES: &[&str] = &["Clone", "Copy", "Default", "Serialize", "Deserialize"];
+const DATA_DERIVES: &[&str] = &[
+    "Clone",
+    "Copy",
+    "Default",
+    "Serialize",
+    "Deserialize",
+    "Save",
+];
 const TYPE_DERIVES: &[&str] = &[
     "Clone",
     "Copy",
@@ -69,6 +76,7 @@ const TYPE_DERIVES: &[&str] = &[
     "DeriveHashed",
     "Serialize",
     "Deserialize",
+    "Save",
 ];
 const RESOURCE_DERIVES: &[&str] = &[
     "Default",
@@ -76,7 +84,31 @@ const RESOURCE_DERIVES: &[&str] = &[
     "DeriveHashed",
     "Serialize",
     "Deserialize",
+    "Save",
 ];
+
+/// The `repr` reacs gives saved types, so their memory follows their declaration and `Save` can copy
+/// it: `#[repr(C)]` on structs, `#[repr(u8)]` on enums without data (up to 256 variants, without
+/// explicit discriminants). Nothing if the type already has a `repr`.
+fn save_repr(input: &DeriveInput) -> proc_macro2::TokenStream {
+    if input.attrs.iter().any(|attr| attr.path().is_ident("repr")) {
+        return quote!();
+    }
+    match &input.data {
+        Data::Struct(_) => quote!(#[repr(C)]),
+        Data::Enum(data)
+            if !data.variants.is_empty()
+                && data.variants.len() <= 256
+                && data
+                    .variants
+                    .iter()
+                    .all(|v| matches!(v.fields, syn::Fields::Unit) && v.discriminant.is_none()) =>
+        {
+            quote!(#[repr(u8)])
+        }
+        _ => quote!(),
+    }
+}
 
 fn derived_path(attrs: &[syn::Attribute], names: &[&str]) -> Option<Path> {
     let parser = syn::punctuated::Punctuated::<Path, syn::Token![,]>::parse_terminated;
@@ -292,10 +324,11 @@ pub fn derive_hashed_def(input: TokenStream) -> TokenStream {
 /// `Resource<T>` param and write it with `Mut<Resource<T>>`. A resource starts with its `Default`
 /// value in every world that has a system using it, so systems never find it missing.
 ///
-/// The macro derives `Default`, `Hashed`, `Serialize` and `Deserialize`, so don't derive them
-/// yourself, and registers the type, so the resource is saved, loaded and hashed with the world.
-/// Every field must implement `Default`, `Serialize` and `Deserialize`; declare your own field
-/// types, like an enum, with `#[data]` (or `#[data(no_copy)]`). Store maps as `IndexMap`,
+/// The macro derives `Default`, `Hashed`, `Serialize`, `Deserialize` and `Save`, so don't derive
+/// them yourself, and registers the type, so the resource is saved, loaded and hashed with the world.
+/// Every field must implement `Default`, `Serialize`, `Deserialize` and `Save`; declare your own
+/// field types, like an enum, with `#[data]` (or `#[data(no_copy)]`). It also adds `#[repr(C)]`, so
+/// the fields stay in declaration order; see `Save` for how that makes saving copy memory. Store maps as `IndexMap`,
 /// never `std::collections::HashMap`: a `HashMap`'s iteration order changes after a save and load,
 /// which breaks determinism.
 ///
@@ -456,14 +489,17 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
         });
     }
 
+    let save_repr = save_repr(&input);
     let expanded = quote! {
         #[derive(
             ::core::default::Default,
             ::reacs::hashed::Hashed,
             ::reacs::__private::serde::Serialize,
             ::reacs::__private::serde::Deserialize,
+            ::reacs::save::Save,
         )]
         #[serde(crate = "::reacs::__private::serde")]
+        #save_repr
         #input
 
         ::reacs::__before_main! {
@@ -489,10 +525,14 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// for every index, so keep components small. Variable-size data per entity, like an inventory,
 /// belongs in a resource keyed by `Entity`.
 ///
-/// The macro derives `Clone`, `Copy`, `Default`, `Hashed`, `Serialize` and `Deserialize`, so don't
-/// derive them yourself, and registers the type, so components are saved and loaded with the
-/// world. Every field must implement `Copy`, `Default`, `Serialize` and `Deserialize`; declare
-/// your own field types, like an enum, with `#[data]`.
+/// The macro derives `Clone`, `Copy`, `Default`, `Hashed`, `Serialize`, `Deserialize` and `Save`, so
+/// don't derive them yourself, and registers the type, so components are saved and loaded with the
+/// world. Every field must implement `Copy`, `Default`, `Serialize`, `Deserialize` and `Save`;
+/// declare your own field types, like an enum, with `#[data]`.
+///
+/// It also adds `#[repr(C)]`, so the fields stay in declaration order. Order them from largest to
+/// smallest to leave no padding: a component of plain fields with no padding is saved and loaded
+/// by copying its whole map's memory (see `Save`). Prefer fixed-size integers to `usize`.
 ///
 /// # Compile errors
 ///
@@ -560,6 +600,7 @@ pub fn component(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let ctor_fn = format_ident!("__register_type_{}", snake_name);
     let link = linked_crates();
 
+    let save_repr = save_repr(&input);
     let expanded = quote! {
         #[derive(
             ::core::default::Default,
@@ -568,8 +609,10 @@ pub fn component(_attr: TokenStream, item: TokenStream) -> TokenStream {
             ::core::marker::Copy,
             ::reacs::__private::serde::Serialize,
             ::reacs::__private::serde::Deserialize,
+            ::reacs::save::Save,
         )]
         #[serde(crate = "::reacs::__private::serde")]
+        #save_repr
         #input
 
         ::reacs::__before_main! {
@@ -594,10 +637,14 @@ pub fn component(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// types they declare, but a type used as a field, like an enum or a small struct, needs them too.
 /// `#[data]` derives both through reacs, so your crate doesn't need serde as a dependency.
 ///
-/// The macro derives `Clone`, `Copy`, `Default`, `Serialize` and `Deserialize`, like `#[component]`
-/// and `#[signal]`, so don't derive them yourself; other derives, like `PartialEq` or `Debug`, are
-/// fine. An enum needs `#[default]` on one variant. Generic types are supported, and so are serde's
-/// field attributes.
+/// The macro derives `Clone`, `Copy`, `Default`, `Serialize`, `Deserialize` and `Save`, like
+/// `#[component]` and `#[signal]`, so don't derive them yourself; other derives, like `PartialEq` or
+/// `Debug`, are fine. An enum needs `#[default]` on one variant. Generic types are supported, and so
+/// are serde's field attributes and `Save`'s (`#[save(plain)]`, `#[save(serde)]`, `#[save(skip)]`).
+///
+/// It also adds `#[repr(C)]` to structs, so the fields stay in declaration order, and `#[repr(u8)]`
+/// to enums without data and without explicit discriminants, unless the type has a `repr` already.
+/// See `Save` for how a type with no padding is saved by copying memory.
 ///
 /// A field marked `#[serde(skip)]` isn't saved or hashed: after a load it holds its `Default`
 /// value. Like a local resource, it may only hold a cache the simulation can rebuild. If game logic
@@ -609,8 +656,9 @@ pub fn component(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// Types declared with `#[component]`, `#[signal]` or `#[resource]` are already serializable and
 /// can be used as fields without `#[data]`. A type from another crate, like a math library's
-/// vector, can't take `#[data]`; it works as a field when that crate implements serde, usually
-/// behind a `serde` feature you enable in your `Cargo.toml`.
+/// vector, can't take `#[data]`. It works as a field marked `#[save(plain)]` when it's `Copy` and
+/// holds only numbers (it's saved by copying its memory), or `#[save(serde)]` when that crate
+/// implements serde, usually behind a `serde` feature you enable in your `Cargo.toml`.
 ///
 /// Changing a `#[data]` type, like adding or reordering enum variants, changes what saved data
 /// means, just as changing a component does: raise the app version (`World::set_app_version`) in
@@ -756,7 +804,7 @@ pub fn data(attr: TokenStream, item: TokenStream) -> TokenStream {
             reject_derives(
                 &input.attrs,
                 "#[data(no_copy)]",
-                &["Clone", "Default", "Serialize", "Deserialize"],
+                &["Clone", "Default", "Serialize", "Deserialize", "Save"],
             )
         })
     } else {
@@ -769,6 +817,7 @@ pub fn data(attr: TokenStream, item: TokenStream) -> TokenStream {
     let copy = (!no_copy).then(|| quote! { ::core::marker::Copy, });
     let link = linked_crates();
 
+    let save_repr = save_repr(&input);
     TokenStream::from(quote! {
         #[derive(
             ::core::clone::Clone,
@@ -776,8 +825,10 @@ pub fn data(attr: TokenStream, item: TokenStream) -> TokenStream {
             ::core::default::Default,
             ::reacs::__private::serde::Serialize,
             ::reacs::__private::serde::Deserialize,
+            ::reacs::save::Save,
         )]
         #[serde(crate = "::reacs::__private::serde")]
+        #save_repr
         #input
 
         const _: () = {
@@ -1076,10 +1127,10 @@ fn find_entity_field(input: &DeriveInput) -> syn::Result<Member> {
 /// after the sender, otherwise in the next tick. Signals are queued, not callbacks: each receiver
 /// handles them at its own place in the system order.
 ///
-/// The macro derives `Clone`, `Copy`, `Default`, `Hashed`, `Serialize` and `Deserialize`, so don't
-/// derive them yourself, and registers the type. Keep payloads small and plain. Every field must
-/// implement `Copy`, `Default`, `Serialize` and `Deserialize`; declare your own field types, like an
-/// enum, with `#[data]`.
+/// The macro derives `Clone`, `Copy`, `Default`, `Hashed`, `Serialize`, `Deserialize` and `Save`, so
+/// don't derive them yourself, and registers the type. Keep payloads small and plain. Every field
+/// must implement `Copy`, `Default`, `Serialize`, `Deserialize` and `Save`; declare your own field
+/// types, like an enum, with `#[data]`. It also adds `#[repr(C)]`, like `#[component]`.
 ///
 /// # Entity signals
 ///
@@ -1220,6 +1271,7 @@ pub fn signal(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     };
 
+    let save_repr = save_repr(&input);
     let expanded = quote! {
         #[derive(
             ::core::default::Default,
@@ -1228,8 +1280,10 @@ pub fn signal(attr: TokenStream, item: TokenStream) -> TokenStream {
             ::core::marker::Copy,
             ::reacs::__private::serde::Serialize,
             ::reacs::__private::serde::Deserialize,
+            ::reacs::save::Save,
         )]
         #[serde(crate = "::reacs::__private::serde")]
+        #save_repr
         #input
 
         #filter

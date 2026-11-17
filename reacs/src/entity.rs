@@ -23,7 +23,18 @@ use crate::{
 /// Handles are plain data: store them in components, signals and resources.
 /// `Entity::default()` is never alive.
 #[derive(
-    Clone, Copy, Default, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+    Clone,
+    Copy,
+    Default,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    crate::save::Save,
 )]
 pub struct Entity {
     bits: u64,

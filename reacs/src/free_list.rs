@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bit_set::BitSet;
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize, crate::save::Save)]
 pub struct FreeList {
     pub bitset: BitSet,
     pub frees: u64,
