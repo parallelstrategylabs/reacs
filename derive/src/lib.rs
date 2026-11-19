@@ -858,10 +858,10 @@ pub fn data(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// - `run_before(a, b)` and `run_after(a, b)` order the system against other systems, named by
 ///   path, including systems from other crates (`run_after(plugin::apply_damage)`).
-/// - `in_group(g)` makes the system a member of the group `g`. A group is an ordinary system,
-///   usually with no params. A member runs after `g` and before everything ordered after `g`, so
-///   `run_after(g)` means "after the whole group". A group and its members run as one block, so
-///   nothing outside the group can run between them.
+/// - `in_group(g)` makes the system a member of the group `g`, declared with `#[group]`. A member
+///   runs after `g` and before everything ordered after `g`, so `run_after(g)` means "after the
+///   whole group". A group and its members run as one block, so nothing outside the group can run
+///   between them. A system belongs to at most one group.
 ///
 /// Systems with no order between them run in a fixed but unspecified order. Add `run_before` or
 /// `run_after` whenever one system must see another's work in the same tick.
@@ -877,8 +877,7 @@ pub fn data(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// # Panics
 ///
-/// When the program starts, if the ordering has a cycle, a system is in more than one group, or a
-/// group is a member of another group.
+/// When the program starts, if the ordering has a cycle.
 ///
 /// When the system runs, if two of its params borrow the same data and one of them writes it: for
 /// example `Resource<Score>` with `Mut<Resource<Score>>`, or `Mut<Receiver<S>>` with
@@ -887,7 +886,8 @@ pub fn data(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// # Compile errors
 ///
 /// Methods taking `self`, and arguments that aren't system params, including a signal param
-/// without `Mut`.
+/// without `Mut`. `in_group(...)` naming something that isn't a `#[group]`, or more than one
+/// group.
 ///
 /// # Examples
 ///
@@ -899,8 +899,8 @@ pub fn data(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///     lines: Vec<String>,
 /// }
 ///
-/// #[system]
-/// fn combat() {}
+/// #[group]
+/// fn combat();
 ///
 /// #[system(in_group(combat))]
 /// fn shoot(mut log: Mut<Resource<Log>>) {
@@ -927,14 +927,24 @@ pub fn data(attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn system(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut run_before: Vec<Path> = Vec::new();
     let mut run_after: Vec<Path> = Vec::new();
-    let mut in_group: Vec<Path> = Vec::new();
+    let mut in_group: Option<Path> = None;
     let attr_parser = syn::meta::parser(|meta| {
         let targets = if meta.path.is_ident("run_before") {
             &mut run_before
         } else if meta.path.is_ident("run_after") {
             &mut run_after
         } else if meta.path.is_ident("in_group") {
-            &mut in_group
+            return meta.parse_nested_meta(|target| {
+                if let Some(first) = &in_group
+                    && quote!(#first).to_string() != { let path = &target.path; quote!(#path) }.to_string()
+                {
+                    return Err(target.error(
+                        "a system can only belong to one group: keep one `in_group` target and use `run_after` or `run_before` to order it against the others",
+                    ));
+                }
+                in_group = Some(target.path);
+                Ok(())
+            });
         } else {
             return Err(
                 meta.error("expected `run_before(...)`, `run_after(...)` or `in_group(...)`")
@@ -946,6 +956,8 @@ pub fn system(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
     });
     parse_macro_input!(attr with attr_parser);
+
+    let in_group: Vec<Path> = in_group.into_iter().collect();
 
     let input = parse_macro_input!(item as ItemFn);
     let vis = &input.vis;
@@ -983,21 +995,183 @@ pub fn system(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[allow(non_snake_case)]
             fn #ctor_fn() {
                 #link
-                #( let _ = #run_before; )*
-                #( let _ = #run_after; )*
-                #( let _ = #in_group; )*
                 let f: for<'w> fn(#(<#param_types as ::reacs::schedule::SystemArg>::Item<'w>),*) = #name;
                 let system = ::reacs::schedule::IntoSystem::into_system(f)
                     .named(::core::module_path!(), #name_str)
                     .run_before(&[#(<#run_before as ::reacs::schedule::SystemId>::UUID),*])
                     .run_after(&[#(<#run_after as ::reacs::schedule::SystemId>::UUID),*])
-                    .in_group(&[#(<#in_group as ::reacs::schedule::SystemId>::UUID),*]);
+                    .in_group(&[#(::reacs::schedule::group_id::<#in_group>()),*]);
                 ::reacs::schedule::register_system(system);
             }
         }
     };
 
     TokenStream::from(expanded)
+}
+
+/// Declares a group: a named point in the system order that systems join with `in_group(...)`.
+///
+/// A group is written as a function with no params and no body, like `pub fn combat();`. It runs
+/// no code; it only takes a place in the order. Its members run right after it, as one block, and
+/// everything ordered after the group with `run_after(combat)` waits for the whole block. So a
+/// game's phases are a few groups chained with `run_after`, and each feature adds its systems to a
+/// phase with `in_group(...)`, wherever they're declared.
+///
+/// A group takes `run_before(...)` and `run_after(...)`, like a system, and is named the same way
+/// from other systems and crates. Groups can't be nested, so `in_group(...)` isn't accepted here.
+///
+/// `World::print_system_order` lists each group with its members under it.
+///
+/// # Compile errors
+///
+/// A body, params, generics or a return type; `in_group(...)` on a group. On a system,
+/// `in_group(x)` where `x` isn't a group.
+///
+/// # Panics
+///
+/// When the program starts, if the ordering has a cycle, including one through a group's block.
+///
+/// # Examples
+///
+/// ```rust,standalone_crate
+/// use reacs::prelude::*;
+///
+/// #[resource]
+/// struct Log {
+///     lines: Vec<String>,
+/// }
+///
+/// /// Everything that moves units.
+/// #[group]
+/// pub fn movement();
+///
+/// /// Everything that hurts units, once they've moved.
+/// #[group(run_after(movement))]
+/// pub fn combat();
+///
+/// #[system(in_group(combat))]
+/// fn shoot(mut log: Mut<Resource<Log>>) {
+///     log.lines.push("shoot".into());
+/// }
+///
+/// #[system(in_group(movement))]
+/// fn walk(mut log: Mut<Resource<Log>>) {
+///     log.lines.push("walk".into());
+/// }
+///
+/// fn main() {
+///     let mut world = World::new();
+///     world.step();
+///     assert_eq!(world.get_resource::<Log>().unwrap().lines, ["walk", "shoot"]);
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn group(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let mut run_before: Vec<Path> = Vec::new();
+    let mut run_after: Vec<Path> = Vec::new();
+    let attr_parser = syn::meta::parser(|meta| {
+        let targets = if meta.path.is_ident("run_before") {
+            &mut run_before
+        } else if meta.path.is_ident("run_after") {
+            &mut run_after
+        } else if meta.path.is_ident("in_group") {
+            return Err(meta.error(
+                "a group can't be in another group: nested groups aren't supported, so order it with `run_after(...)` or `run_before(...)`",
+            ));
+        } else {
+            return Err(meta.error("expected `run_before(...)` or `run_after(...)`"));
+        };
+        meta.parse_nested_meta(|target| {
+            targets.push(target.path);
+            Ok(())
+        })
+    });
+    parse_macro_input!(attr with attr_parser);
+
+    let GroupItem { attrs, vis, sig } = parse_macro_input!(item as GroupItem);
+    let name = &sig.ident;
+    let name_str = name.to_string();
+    let ctor_fn = format_ident!("__register_group_{}", name);
+    let id_name = generated_name(name);
+    let link = linked_crates();
+
+    TokenStream::from(quote! {
+        #(#attrs)*
+        #[allow(non_camel_case_types, dead_code)]
+        #vis enum #name {}
+
+        impl ::reacs::schedule::SystemId for #id_name {
+            const UUID: u128 = ::reacs::hashed::hash_path(::core::module_path!(), #name_str);
+        }
+
+        impl ::reacs::schedule::SystemGroup for #id_name {}
+
+        ::reacs::__before_main! {
+            #[allow(non_snake_case)]
+            fn #ctor_fn() {
+                #link
+                let group = ::reacs::schedule::SystemEntry::new_group()
+                    .named(::core::module_path!(), #name_str)
+                    .run_before(&[#(<#run_before as ::reacs::schedule::SystemId>::UUID),*])
+                    .run_after(&[#(<#run_after as ::reacs::schedule::SystemId>::UUID),*]);
+                ::reacs::schedule::register_system(group);
+            }
+        }
+    })
+}
+
+/// `#[group]`'s input: attributes, visibility and a function signature ending in `;`.
+struct GroupItem {
+    attrs: Vec<syn::Attribute>,
+    vis: syn::Visibility,
+    sig: syn::Signature,
+}
+
+impl syn::parse::Parse for GroupItem {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let attrs = input.call(syn::Attribute::parse_outer)?;
+        let vis = input.parse()?;
+        let sig: syn::Signature = input.parse()?;
+        let name = &sig.ident;
+        if input.peek(syn::token::Brace) {
+            let body: syn::Block = input.parse()?;
+            return Err(syn::Error::new(
+                body.span(),
+                format!(
+                    "a group runs no code: remove the body and end it with `;`, as in `fn {name}();`"
+                ),
+            ));
+        }
+        input.parse::<syn::Token![;]>()?;
+        if !sig.inputs.is_empty() {
+            return Err(syn::Error::new(
+                sig.inputs.span(),
+                "a group takes no params: put the work in a `#[system(in_group(...))]` instead",
+            ));
+        }
+        if !sig.generics.params.is_empty() || sig.generics.where_clause.is_some() {
+            return Err(syn::Error::new(
+                sig.generics.span(),
+                "a group can't be generic",
+            ));
+        }
+        if let syn::ReturnType::Type(arrow, _) = &sig.output {
+            return Err(syn::Error::new(arrow.span(), "a group returns nothing"));
+        }
+        if let Some(token) = sig
+            .constness
+            .map(|t| t.span)
+            .or(sig.asyncness.map(|t| t.span))
+            .or(sig.unsafety.map(|t| t.span))
+            .or(sig.abi.as_ref().map(|abi| abi.extern_token.span))
+        {
+            return Err(syn::Error::new(
+                token,
+                format!("a group is declared as a plain `fn {name}();`"),
+            ));
+        }
+        Ok(Self { attrs, vis, sig })
+    }
 }
 
 /// Bundles system params into one struct, used as a single param.

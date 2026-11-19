@@ -122,15 +122,13 @@ const EMPTY_SLOT: Slot = Slot {
 /// ```
 #[derive(Clone)]
 pub struct IndexMap<K, V> {
-    entries: Vec<(K, V)>,
-    slots: Vec<Slot>,
+    table: Table<(K, V), MapKey>,
 }
 
 impl<K, V> Default for IndexMap<K, V> {
     fn default() -> Self {
         Self {
-            entries: Vec::new(),
-            slots: Vec::new(),
+            table: Table::default(),
         }
     }
 }
@@ -150,64 +148,65 @@ impl<K: Hash + Eq, V> IndexMap<K, V> {
 
     /// Makes room for at least `additional` more entries.
     pub fn reserve(&mut self, additional: usize) {
-        self.entries.reserve(additional);
-        self.grow_for(self.entries.len() + additional);
+        self.table.reserve(additional);
     }
 
     /// Returns the number of entries.
     #[inline]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.table.entries().len()
     }
 
     /// Returns `true` if the map has no entries.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.table.entries().is_empty()
     }
 
     /// Returns every entry as a slice, in order.
     #[inline]
     pub fn as_slice(&self) -> &[(K, V)] {
-        &self.entries
+        self.table.entries()
     }
 
     /// Returns an iterator over the entries, in order.
     #[inline]
     pub fn iter(&self) -> slice::Iter<'_, (K, V)> {
-        self.entries.iter()
+        self.table.entries().iter()
     }
 
     /// Returns an iterator over the entries with mutable values, in order.
     #[inline]
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&K, &mut V)> {
-        self.entries.iter_mut().map(|(key, value)| (&*key, value))
+        self.table
+            .entries_mut()
+            .iter_mut()
+            .map(|(key, value)| (&*key, value))
     }
 
     /// Removes every entry, keeping the allocated memory.
     pub fn clear(&mut self) {
-        self.entries.clear();
-        self.slots.fill(EMPTY_SLOT);
+        self.table.clear();
     }
 
     /// Returns `true` if the map has an entry for `key`.
     #[inline]
     pub fn contains_key(&self, key: &K) -> bool {
-        self.index_of(key).is_some()
+        self.table.index_of(key).is_some()
     }
 
     /// Returns the value for `key`, or `None` if there's none.
     #[inline]
     pub fn get(&self, key: &K) -> Option<&V> {
-        let index = self.index_of(key)?;
-        Some(&self.entries[index].1)
+        let index = self.table.index_of(key)?;
+        Some(&self.table.entries()[index].1)
     }
 
     /// Returns the value for `key` for writing, or `None` if there's none.
     #[inline]
     pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
-        let index = self.index_of(key)?;
-        Some(&mut self.entries[index].1)
+        let index = self.table.index_of(key)?;
+        Some(&mut self.table.entries_mut()[index].1)
     }
 
     /// Inserts `value` for `key`, and returns the value it replaces, if any.
@@ -219,21 +218,8 @@ impl<K: Hash + Eq, V> IndexMap<K, V> {
     ///
     /// Panics if the map already holds `u32::MAX` entries and `key` is new.
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
-        self.grow_for(self.entries.len() + 1);
-        let tag = tag_of(&key);
-        match self.probe(tag, &key) {
-            Ok(pos) => {
-                let index = self.slot(pos).index as usize;
-                Some(mem::replace(&mut self.entries[index].1, value))
-            }
-            Err(pos) => {
-                let index = self.entries.len();
-                assert!(index < EMPTY as usize, "IndexMap can't hold more entries");
-                self.entries.push((key, value));
-                self.set_slot(pos, Slot::new(index, tag));
-                None
-            }
-        }
+        let (index, (_, value)) = self.table.insert((key, value))?;
+        Some(mem::replace(&mut self.table.entries_mut()[index].1, value))
     }
 
     /// Removes the entry for `key` and returns its value, or `None` if there's none.
@@ -241,25 +227,141 @@ impl<K: Hash + Eq, V> IndexMap<K, V> {
     /// The last entry moves into the removed one's position, so this is O(1) but changes the
     /// order. Code that relies on insertion order after removals must sort the entries itself.
     pub fn swap_remove(&mut self, key: &K) -> Option<V> {
+        Some(self.table.swap_remove(key)?.1)
+    }
+
+    #[cfg(any(test, feature = "invariants"))]
+    pub(crate) fn check_invariants(&self) {
+        self.table.check_invariants();
+    }
+}
+
+/// Finds the key in a table's entry: [`MapKey`] for [`IndexMap`]'s `(K, V)` pairs, the entry
+/// itself for [`IndexSet`](crate::index_set::IndexSet).
+pub(crate) trait KeyOf<E> {
+    type Key: Hash + Eq;
+    /// The type's name, for panic messages.
+    const NAME: &'static str;
+
+    fn key(entry: &E) -> &Self::Key;
+}
+
+pub(crate) struct MapKey;
+
+impl<K: Hash + Eq, V> KeyOf<(K, V)> for MapKey {
+    type Key = K;
+    const NAME: &'static str = "IndexMap";
+
+    #[inline(always)]
+    fn key(entry: &(K, V)) -> &K {
+        &entry.0
+    }
+}
+
+/// What [`IndexMap`] and [`IndexSet`](crate::index_set::IndexSet) share: entries in one dense
+/// list, and a table of slots taking a key's hash to its entry's position. `X` finds the key in
+/// an entry.
+///
+/// The entries' length only changes through these methods, which keep every non-empty slot
+/// pointing below it; `probe` relies on that.
+pub(crate) struct Table<E, X> {
+    entries: Vec<E>,
+    slots: Vec<Slot>,
+    key: PhantomData<X>,
+}
+
+impl<E: Clone, X> Clone for Table<E, X> {
+    fn clone(&self) -> Self {
+        Self {
+            entries: self.entries.clone(),
+            slots: self.slots.clone(),
+            key: PhantomData,
+        }
+    }
+}
+
+impl<E, X> Default for Table<E, X> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            slots: Vec::new(),
+            key: PhantomData,
+        }
+    }
+}
+
+impl<E, X> Table<E, X> {
+    #[inline(always)]
+    pub(crate) fn entries(&self) -> &[E] {
+        &self.entries
+    }
+
+    /// The entries for writing. A slice, so the length can't change; callers must not change a
+    /// key.
+    #[inline(always)]
+    pub(crate) fn entries_mut(&mut self) -> &mut [E] {
+        &mut self.entries
+    }
+}
+
+impl<E, X: KeyOf<E>> Table<E, X> {
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        self.entries.reserve(additional);
+        self.grow_for(self.entries.len() + additional);
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+        self.slots.fill(EMPTY_SLOT);
+    }
+
+    /// Pushes `entry` if its key is new and returns `None`. Otherwise returns the position of the
+    /// entry with that key, and `entry` unused.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the table already holds `u32::MAX` entries and the key is new.
+    #[inline]
+    pub(crate) fn insert(&mut self, entry: E) -> Option<(usize, E)> {
+        self.grow_for(self.entries.len() + 1);
+        let tag = tag_of(X::key(&entry));
+        match self.probe(tag, X::key(&entry)) {
+            Ok(pos) => Some((self.slot(pos).index as usize, entry)),
+            Err(pos) => {
+                let index = self.entries.len();
+                assert!(
+                    index < EMPTY as usize,
+                    "{} can't hold more entries",
+                    X::NAME
+                );
+                self.entries.push(entry);
+                self.set_slot(pos, Slot::new(index, tag));
+                None
+            }
+        }
+    }
+
+    /// Removes the entry for `key` and returns it; the last entry takes its position.
+    pub(crate) fn swap_remove(&mut self, key: &X::Key) -> Option<E> {
         let pos = self.find(key)?;
         let index = self.slot(pos).index as usize;
         let last = self.entries.len() - 1;
         if index != last {
-            let tag = tag_of(&self.entries[last].0);
+            let tag = tag_of(X::key(&self.entries[last]));
             let moved = self.slot_of_index(tag, last);
             self.set_slot(moved, Slot::new(index, tag));
         }
         self.erase_slot(pos);
-        Some(self.entries.swap_remove(index).1)
+        Some(self.entries.swap_remove(index))
     }
 
     #[inline]
-    fn index_of(&self, key: &K) -> Option<usize> {
+    pub(crate) fn index_of(&self, key: &X::Key) -> Option<usize> {
         self.find(key).map(|pos| self.slot(pos).index as usize)
     }
 
     #[inline]
-    fn find(&self, key: &K) -> Option<usize> {
+    fn find(&self, key: &X::Key) -> Option<usize> {
         if self.entries.is_empty() {
             return None;
         }
@@ -267,7 +369,7 @@ impl<K: Hash + Eq, V> IndexMap<K, V> {
     }
 
     #[inline]
-    fn probe(&self, tag: u32, key: &K) -> Result<usize, usize> {
+    fn probe(&self, tag: u32, key: &X::Key) -> Result<usize, usize> {
         let mask = self.mask();
         let mut pos = tag as usize & mask;
         loop {
@@ -275,12 +377,13 @@ impl<K: Hash + Eq, V> IndexMap<K, V> {
             if slot.index == EMPTY {
                 return Err(pos);
             }
-            // SAFETY: every non-empty slot holds an index below `entries.len()`. Only this map
-            // writes its table (never loaded from a save), and every change keeps that true,
-            // even on panic: `insert` pushes before writing the slot, `grow_for` allocates before
-            // replacing the table, `swap_remove` hashes before changing anything.
+            // SAFETY: every non-empty slot holds an index below `entries.len()`. Only this table
+            // writes its slots (never loaded from a save), the entries' length only changes here
+            // (`entries_mut` hands out a slice), and every change keeps that true, even on panic:
+            // `insert` pushes before writing the slot, `grow_for` allocates before replacing the
+            // slots, `swap_remove` hashes before changing anything.
             if slot.tag == tag
-                && unsafe { &self.entries.get_unchecked(slot.index as usize).0 } == key
+                && X::key(unsafe { self.entries.get_unchecked(slot.index as usize) }) == key
             {
                 return Ok(pos);
             }
@@ -327,7 +430,7 @@ impl<K: Hash + Eq, V> IndexMap<K, V> {
     fn grow_for(&mut self, needed: usize) {
         let wanted = needed
             .checked_mul(1 << LOAD_SHIFT)
-            .expect("IndexMap capacity overflow");
+            .unwrap_or_else(|| panic!("{} capacity overflow", X::NAME));
         if wanted <= self.slots.len() {
             return;
         }
@@ -369,7 +472,7 @@ impl<K: Hash + Eq, V> IndexMap<K, V> {
             seen[index] = true;
             assert_eq!(
                 slot.tag,
-                tag_of(&self.entries[index].0),
+                tag_of(X::key(&self.entries[index])),
                 "slot {pos} has a stale tag"
             );
             let mut at = slot.tag as usize & mask;
@@ -417,14 +520,14 @@ impl<'a, K, V> IntoIterator for &'a IndexMap<K, V> {
     type IntoIter = slice::Iter<'a, (K, V)>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.entries.iter()
+        self.table.entries().iter()
     }
 }
 
 impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for IndexMap<K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_map()
-            .entries(self.entries.iter().map(|(key, value)| (key, value)))
+            .entries(self.table.entries().iter().map(|(key, value)| (key, value)))
             .finish()
     }
 }
@@ -455,8 +558,8 @@ impl<K: Hash + Eq, V, const N: usize> From<[(K, V); N]> for IndexMap<K, V> {
 
 impl<K: Serialize, V: Serialize> Serialize for IndexMap<K, V> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(self.entries.len()))?;
-        for (key, value) in &self.entries {
+        let mut map = serializer.serialize_map(Some(self.table.entries().len()))?;
+        for (key, value) in self.table.entries() {
             map.serialize_entry(key, value)?;
         }
         map.end()
@@ -510,7 +613,7 @@ where
     const PLAIN: bool = false;
 
     fn save(&self, out: &mut Vec<u8>) {
-        <(K, V)>::save_slice(&self.entries, out);
+        <(K, V)>::save_slice(self.table.entries(), out);
     }
 
     fn load(reader: &mut crate::save::Reader<'_>) -> Self {

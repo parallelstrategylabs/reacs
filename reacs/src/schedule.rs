@@ -40,13 +40,31 @@ pub(crate) const ANONYMOUS_SYSTEM: u128 = 0;
 #[resource]
 pub struct CurrentSystem(pub u128);
 
-/// The id of a system, implemented by `#[system]` on a type named after the function.
+/// The id of a system, implemented by `#[system]` and `#[group]` on a type named after the
+/// function.
 ///
 /// That type is what `run_before(...)`, `run_after(...)` and `in_group(...)` name.
 pub trait SystemId {
     /// A hash of the function's module path and name (see
     /// [`hash_path`]).
     const UUID: u128;
+}
+
+/// A group, implemented by `#[group]` on a type named after the function.
+///
+/// `in_group(...)` only accepts types implementing it, so joining a plain system is a compile
+/// error.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a group",
+    label = "not declared with `#[group]`",
+    note = "declare groups with `#[group] pub fn name();`, or order against a system with `run_after(...)` or `run_before(...)`"
+)]
+pub trait SystemGroup: SystemId {}
+
+/// Returns a group's id, and fails to compile if `G` isn't a group. Used by `#[system]`.
+#[doc(hidden)]
+pub const fn group_id<G: SystemGroup>() -> u128 {
+    G::UUID
 }
 
 /// A registered system: its id, name, ordering and the function that runs it.
@@ -65,6 +83,8 @@ pub struct SystemEntry {
     pub after: Vec<u128>,
     /// Id of the group this system belongs to, if any.
     pub groups: Vec<u128>,
+    /// Whether this entry is a group (`#[group]`), which runs no code.
+    pub group: bool,
     /// Short names of the signal types that wake this system, if it sleeps.
     pub wakes_on: Vec<&'static str>,
     pub(crate) init_fn: Box<dyn Fn(&mut World) + Send + Sync>,
@@ -73,6 +93,24 @@ pub struct SystemEntry {
 }
 
 impl SystemEntry {
+    /// Creates the entry of a group: it runs no code, and other systems join it with
+    /// [`in_group`](Self::in_group). `#[group]` builds these.
+    pub fn new_group() -> Self {
+        SystemEntry {
+            uuid: ANONYMOUS_SYSTEM,
+            module: "",
+            name: "",
+            before: Vec::new(),
+            after: Vec::new(),
+            groups: Vec::new(),
+            group: true,
+            wakes_on: Vec::new(),
+            init_fn: Box::new(|_| {}),
+            run_fn: Box::new(|_| {}),
+            wake_fn: None,
+        }
+    }
+
     /// Sets the system's module and name, and its id from them.
     pub fn named(mut self, module: &'static str, name: &'static str) -> Self {
         self.uuid = hash_path(module, name);
@@ -140,7 +178,8 @@ impl SystemGraph {
     /// # Panics
     ///
     /// Panics if the system has no id or the same id as another system, if it's in more than one
-    /// group, if groups end up nested, or if the ordering has a cycle.
+    /// group, if a group is in a group, if a system is in something that isn't a group, or if the
+    /// ordering has a cycle.
     pub fn insert(&mut self, system: SystemEntry) {
         assert!(
             system.uuid != ANONYMOUS_SYSTEM,
@@ -162,6 +201,13 @@ impl SystemGraph {
             );
         }
 
+        if system.group && !system.groups.is_empty() {
+            panic!(
+                "nested groups aren't supported: group `{}::{}` is in a group",
+                system.module, system.name
+            );
+        }
+
         self.nodes.push(system);
         self.sort();
     }
@@ -176,18 +222,12 @@ impl SystemGraph {
         let index_of = |uuid: &u128| self.nodes.binary_search_by_key(uuid, |x| x.uuid).ok();
 
         for system in &self.nodes {
-            for inner in system.groups.iter().filter_map(index_of) {
-                let inner = &self.nodes[inner];
-                if let Some(outer) = inner.groups.iter().find_map(index_of) {
-                    let outer = &self.nodes[outer];
+            for target in system.groups.iter().filter_map(index_of) {
+                let target = &self.nodes[target];
+                if !target.group {
                     panic!(
-                        "nested groups aren't supported: `{}::{}` is in group `{}::{}`, which is in group `{}::{}`",
-                        system.module,
-                        system.name,
-                        inner.module,
-                        inner.name,
-                        outer.module,
-                        outer.name
+                        "`{}::{}` is in `{}::{}`, which isn't a group",
+                        system.module, system.name, target.module, target.name
                     );
                 }
             }
@@ -356,6 +396,13 @@ impl SystemGraph {
             if system.wake_fn.is_some() {
                 write!(tree, " (wakes on {})", system.wakes_on.join(", ")).unwrap();
             }
+            let has_members = self
+                .nodes
+                .get(i + 1)
+                .is_some_and(|next| next.groups.first() == Some(&system.uuid));
+            if system.group && !has_members {
+                tree.push_str(" (empty group)");
+            }
             tree.push('\n');
         }
 
@@ -379,6 +426,9 @@ impl SystemGraph {
             .unwrap_or_else(|| conflict::<TickCount>())
             .0;
         for system in self.iter() {
+            if system.group {
+                continue;
+            }
             if let Some(wake) = system.wake_fn
                 && !wake(ParamWorld(world), system.uuid, tick)
             {
@@ -496,6 +546,7 @@ macro_rules! impl_into_system_tuples {
                     before: Vec::new(),
                     after: Vec::new(),
                     groups: Vec::new(),
+                    group: false,
                     wakes_on,
                     wake_fn,
                     init_fn: Box::new(move |world: &mut World| {
@@ -927,6 +978,7 @@ where
             before: Vec::new(),
             after: Vec::new(),
             groups: Vec::new(),
+            group: false,
             wakes_on: Vec::new(),
             wake_fn: None,
             init_fn: Box::new(|_world: &mut World| {}),
@@ -1552,8 +1604,8 @@ mod tests {
 
     use ordered::nested_first as renamed_first;
 
-    #[system]
-    fn ordered_group() {}
+    #[group]
+    fn ordered_group();
 
     #[system(run_after(ordered::nested_first), run_before(ordered_group))]
     fn ordered_middle() {}
@@ -1616,20 +1668,20 @@ mod tests {
     mod groups {
         use crate::prelude::*;
 
-        #[system]
-        pub fn group_input() {}
+        #[group]
+        pub fn group_input();
 
-        #[system(run_after(group_input))]
-        pub fn group_physics() {}
+        #[group(run_after(group_input))]
+        pub fn group_physics();
 
-        #[system(run_after(group_physics))]
-        pub fn group_logic() {}
+        #[group(run_after(group_physics))]
+        pub fn group_logic();
 
-        #[system(run_after(group_logic))]
-        pub fn group_audio() {}
+        #[group(run_after(group_logic))]
+        pub fn group_audio();
 
-        #[system(run_after(group_audio))]
-        pub fn group_render() {}
+        #[group(run_after(group_audio))]
+        pub fn group_render();
     }
 
     #[system(in_group(groups::group_input))]
@@ -1651,8 +1703,8 @@ mod tests {
         use super::groups::{group_logic, group_physics};
         use crate::prelude::*;
 
-        #[system(run_after(group_physics), run_before(group_logic))]
-        pub fn group_collisions() {}
+        #[group(run_after(group_physics), run_before(group_logic))]
+        pub fn group_collisions();
 
         #[system(in_group(group_collisions))]
         pub fn resolve_contacts() {}
@@ -1662,12 +1714,16 @@ mod tests {
     }
 
     fn group(name: &'static str, before: &[&str], after: &[&str]) -> SystemEntry {
+        SystemEntry::new_group()
+            .named(module_path!(), name)
+            .run_before(&before.iter().map(|n| id(n)).collect::<Vec<_>>())
+            .run_after(&after.iter().map(|n| id(n)).collect::<Vec<_>>())
+    }
+
+    fn empty(name: &'static str) -> SystemEntry {
         fn empty() {}
 
-        let mut entry = empty.into_system().named(module_path!(), name);
-        entry.before = before.iter().map(|n| id(n)).collect();
-        entry.after = after.iter().map(|n| id(n)).collect();
-        entry
+        empty.into_system().named(module_path!(), name)
     }
 
     fn member(entry: SystemEntry, groups: &[&str]) -> SystemEntry {
@@ -1836,8 +1892,8 @@ mod tests {
         let members = (0..6).map(|i| &*format!("member{i}").leak());
 
         let mut entries = vec![group("group_first", &[], &[])];
-        entries.extend(members.map(|name| member(group(name, &[], &[]), &["group_first"])));
-        entries.extend(unrelated.map(|name| group(name, &[], &[])));
+        entries.extend(members.map(|name| member(empty(name), &["group_first"])));
+        entries.extend(unrelated.map(empty));
         let graph = graph_of(entries);
 
         let names = names(&graph);
@@ -1890,16 +1946,30 @@ mod tests {
         graph_of(vec![
             group("outer", &[], &[]),
             member(group("inner", &[], &[]), &["outer"]),
-            member(group("leaf", &[], &[]), &["inner"]),
         ]);
     }
 
     #[test]
-    fn member_with_no_members_of_its_own_is_not_nested() {
+    #[should_panic(expected = "which isn't a group")]
+    fn member_of_a_plain_system_panics() {
         graph_of(vec![
-            group("outer", &[], &[]),
-            member(group("inner", &[], &[]), &["outer"]),
+            empty("outer"),
+            member(entry("input", &[], &[]), &["outer"]),
         ]);
+    }
+
+    #[test]
+    fn groups_run_no_code() {
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = ran.clone();
+        let mut entry = group("group_first", &[], &[]);
+        entry.run_fn = Box::new(move |_| seen.store(true, std::sync::atomic::Ordering::Relaxed));
+        let graph = graph_of(vec![entry]);
+
+        let mut world = World::new();
+        graph.run(&mut world);
+
+        assert!(!ran.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]
@@ -1971,7 +2041,7 @@ mod tests {
     }
 
     #[test]
-    fn tree_shows_a_group_without_members_as_a_plain_system() {
+    fn tree_marks_a_group_without_members() {
         let graph = graph_of(vec![
             group("group_first", &["render"], &[]),
             entry("render", &[], &[]),
@@ -1979,7 +2049,7 @@ mod tests {
 
         assert_eq!(
             graph.tree(),
-            tree_lines(&["1 @::group_first", "2 @::render"])
+            tree_lines(&["1 @::group_first (empty group)", "2 @::render"])
         );
     }
 
@@ -1997,7 +2067,7 @@ mod tests {
     fn tree_aligns_numbers_past_nine_systems() {
         let graph = graph_of(
             (0..10)
-                .map(|i| group(format!("system{i}").leak(), &[], &[]))
+                .map(|i| empty(format!("system{i}").leak()))
                 .collect(),
         );
         let tree = graph.tree();

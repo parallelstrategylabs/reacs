@@ -95,13 +95,15 @@ fn main() {
   every tick of it. A signal sent before a receiver runs arrives that tick, and one sent after it
   arrives the next tick.
 - **Systems** are functions marked `#[system]`. They run one at a time, in an order set with
-  `run_before`, `run_after` and groups. A system with a `Mut<Receiver<S>>` sleeps on ticks with nothing
+  `run_before`, `run_after` and groups (`#[group]`), and `world.print_system_order()` prints it
+  ([see below](#the-system-order)). A system with a `Mut<Receiver<S>>` sleeps on ticks with nothing
   to receive. A system with a `Mut<Signal<S>>`, or with no receiver, runs every tick.
 - **Entities and components:** an `Entity` is an id. Components are small `Copy` structs reached by
   `Entity` in O(1), from a signal. They are never iterated. Your own types used as fields, like an
   enum, are declared with `#[data]`.
 - **Resources** hold everything else, one value per type: settings, maps keyed by entity, a seeded
-  random generator. `IndexMap` is the map that keeps saves and replays deterministic.
+  random generator (`Rng`). `IndexMap` and `IndexSet` are the map and set that keep saves and
+  replays deterministic.
 - **The host,** the program around the world, writes into it once, in `World::build`. After that it
   sends input signals, steps, saves and loads, and reads components and resources.
 
@@ -159,13 +161,17 @@ fn main() -> std::io::Result<()> {
 ### Plugins
 
 A plugin is just a crate with systems in it: list it in your app's `Cargo.toml` and its systems run.
-It orders its systems against the app's, or against another plugin's, by path. Systems and groups
-named from another crate must be `pub`:
+It orders its systems against the app's, or against another plugin's, by path. Groups name the
+phases of a tick, and any crate's systems join one with `in_group`. Systems and groups named from
+another crate must be `pub`:
 
 ```rust,ignore
-// In a shared crate, game_core: a group is an ordinary empty system.
-#[system]
-pub fn combat() {}
+// In a shared crate, game_core: the phases of a tick. A group runs no code.
+#[group]
+pub fn orders();
+
+#[group(run_after(orders))]
+pub fn combat();
 
 // In the plugin crate, which depends on game_core:
 use game_core::{Health, Poison, combat};
@@ -189,11 +195,32 @@ poison = { path = "plugins/poison" }
 
 The app never names `poison_ticks`: listing the crate is enough.
 
+### The system order
+
+`world.print_system_order()` prints every system the program runs, in order, with each group's
+members under it and the signals that wake each sleeping system. For the game above, with `burn`
+and `bury` in `game_core`, `poison_ticks` in the plugin and `ignite` in the app:
+
+```text
+1 game_core::orders
+2 └─ game::ignite (wakes on Ignite)
+3 game_core::combat
+4 ├─ game_core::burn (wakes on Burn)
+5 └─ poison::poison_ticks (wakes on Poison)
+6 game_core::bury (wakes on Died)
+```
+
+The order is fixed when the program starts, from every crate linked into it, so this is the whole
+tick. Check it first when a system seems not to run, or to see a change a tick late.
+`world.system_order()` returns the same text, for a test that pins the order.
+
 ## Features
 
 - **Decentralized registration:** No central App or `add_systems`. Systems, components, resources and
   signals register themselves with an attribute, from your crate and its dependencies, with no extra
   setup.
+- **The whole tick at a glance:** `world.print_system_order()` lists every system from every crate,
+  in the order they run, grouped by phase, with what wakes each one.
 - **Sleeping systems:** A system is skipped on ticks with no signal to receive. Idle, it costs a few
   nanoseconds.
 - **Windowed signals:** One send covers many ticks: `For(5)`, `(At(40), To(50))`, `(In(2), ..)`.
@@ -264,10 +291,11 @@ If you need queries, parallel systems or a full engine, [Bevy](https://bevy.org)
 - **Long signals stay until they end:** A signal with no end, or a long window, keeps being delivered,
   and stays in memory and saves, until it's cancelled. Only `#[signal(entity)]` signals are cleaned up
   when their entity dies.
-- **Determinism needs your code too:** In systems and anything they call, use `IndexMap` instead of
-  `HashMap` or `HashSet`. Don't call float functions like `sin`, `cos`, `atan2`, `exp` or `powf`
-  (`+ - * /`, `sqrt` and `abs` are exact everywhere). Don't read time, unseeded randomness, files
-  or the environment.
+- **Determinism needs your code too:** In systems and anything they call, use `IndexMap` and
+  `IndexSet` instead of `HashMap` and `HashSet`. Don't call float functions like `sin`, `cos`, `atan2`, `exp` or `powf`
+  (`+ - * /`, `sqrt` and `abs` are exact everywhere). Don't read time, files or the environment.
+  For randomness, keep a seeded `Rng` in a resource or component, or derive one per use with
+  `Rng::keyed(seed, &[tick, entity.to_bits()])`, which doesn't depend on the order systems draw in.
 - **An app with no reacs macros** of its own must call `world!()` instead of `World::new()`, or
   `use plugin as _;`, or plugins it never names won't be linked. The same goes for a crate that only
   passes a plugin through without naming it.

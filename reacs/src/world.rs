@@ -327,7 +327,7 @@ impl World {
     /// Returns the execution order of every system as text.
     ///
     /// One numbered line per system, with each group's members under it. Sleeping systems show
-    /// the signals that wake them:
+    /// the signals that wake them, and a group nothing joined shows `(empty group)`:
     ///
     /// ```text
     /// 1 game::spawn_waves

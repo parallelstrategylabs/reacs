@@ -12,6 +12,9 @@ pub struct Velocity(pub f32, pub f32);
 #[component]
 pub struct Health(pub i32);
 
+#[component]
+pub struct Luck(pub Rng);
+
 #[signal(input)]
 pub struct SpawnOrder {
     pub count: u32,
@@ -47,6 +50,12 @@ pub struct Army {
 #[resource]
 pub struct Loot {
     pub carried: IndexMap<Entity, u32>,
+}
+
+#[resource]
+pub struct Fate {
+    pub rng: Rng,
+    pub marked: IndexSet<Entity>,
 }
 
 #[resource]
@@ -92,6 +101,9 @@ fn spawn(
             moves.send(Move(unit), ..);
             army.units.push(unit);
             world.loot.carried.insert(unit, r % 100);
+            world
+                .luck
+                .insert(unit, Luck(Rng::keyed(order.seed as u64, &[unit.to_bits()])));
             world.stats.spawned += 1;
         }
     }
@@ -101,6 +113,7 @@ fn spawn(
 pub struct SpawnBook {
     pub loot: Resource<Loot>,
     pub stats: Resource<Stats>,
+    pub luck: Component<Luck>,
 }
 
 #[system(run_after(spawn))]
@@ -108,10 +121,15 @@ fn movement(
     mut moves: Mut<Receiver<Move>>,
     mut position: Mut<Component<Position>>,
     mut velocity: Mut<Component<Velocity>>,
+    mut luck: Mut<Component<Luck>>,
 ) {
     moves.receive().for_each(|&Move(unit)| {
-        if let (Some(p), Some(v)) = (position.get_mut(unit), velocity.get_mut(unit)) {
-            p.0 += v.0 * 0.5;
+        if let (Some(p), Some(v), Some(l)) = (
+            position.get_mut(unit),
+            velocity.get_mut(unit),
+            luck.get_mut(unit),
+        ) {
+            p.0 += v.0 * 0.5 + l.0.range(-0.05f32..0.05);
             p.1 += v.1 * 0.5;
             v.0 *= 0.98;
             v.1 = v.1 * 0.97 + 0.01;
@@ -124,6 +142,8 @@ fn attack(
     mut orders: Mut<Receiver<AttackOrder>>,
     army: Resource<Army>,
     mut damage: Mut<Sender<Damage>>,
+    mut fate: Mut<Resource<Fate>>,
+    tick: Tick,
 ) {
     for order in orders.receive() {
         if army.units.is_empty() {
@@ -132,7 +152,10 @@ fn attack(
         for i in 0..4 {
             let r = mix(order.seed ^ i);
             let target = army.units[r as usize % army.units.len()];
-            let amount = 1 + (r % 6) as i32;
+            let amount = fate.rng.range(1..=2) + (r % 4) as i32;
+            if Rng::keyed(order.seed as u64, &[tick.get(), target.to_bits()]).chance(0.3) {
+                fate.marked.insert(target);
+            }
             damage.send(
                 Damage { target, amount },
                 (In(r as u64 % 3), For(1 + r as u64 % 20)),
@@ -167,12 +190,18 @@ fn apply_damage(
 }
 
 #[system(run_after(apply_damage))]
-fn bury(mut deaths: Mut<Receiver<Died>>, mut army: Mut<Resource<Army>>, mut book: Mut<SpawnBook>) {
+fn bury(
+    mut deaths: Mut<Receiver<Died>>,
+    mut army: Mut<Resource<Army>>,
+    mut book: Mut<SpawnBook>,
+    mut fate: Mut<Resource<Fate>>,
+) {
     for death in deaths.receive() {
         if let Some(i) = army.units.iter().position(|&unit| unit == death.unit) {
             army.units.swap_remove(i);
         }
         book.loot.carried.swap_remove(&death.unit);
+        fate.marked.swap_remove(&death.unit);
         book.stats.died += 1;
         book.stats.graves.push((death.x, death.y));
     }
@@ -230,6 +259,9 @@ fn run_session() -> Vec<String> {
     assert!(stats.spawned > 100, "the session should spawn units");
     assert!(stats.died > 50, "the session should kill units");
     assert!(stats.spawned > stats.died, "some units should survive");
+    let fate = world.get_resource::<Fate>().unwrap();
+    assert_ne!(fate.rng, Rng::default(), "the session should draw numbers");
+    assert!(!fate.marked.is_empty(), "the session should mark units");
     lines
 }
 

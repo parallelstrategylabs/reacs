@@ -25,5 +25,5 @@ pub struct Combat {
     pub tick: Tick,
 }
 
-#[system]
-pub fn combat_phase() {}
+#[group]
+pub fn combat_phase();

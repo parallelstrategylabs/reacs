@@ -20,8 +20,8 @@ pub struct ScoreView {
     pub score: Resource<Score>,
 }
 
-#[system]
-fn group() {}
+#[group]
+fn group();
 
 #[system(in_group(group))]
 fn member(_view: ScoreView) {}

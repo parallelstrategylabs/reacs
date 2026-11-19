@@ -44,14 +44,14 @@
 //! reacs can only promise its own part: a game is deterministic only if its systems are. In
 //! systems, and in anything they call:
 //!
-//! - Store maps as [`IndexMap`](index_map::IndexMap), never `HashMap` or `HashSet`, whose iteration
-//!   order changes between runs.
+//! - Store maps as [`IndexMap`](index_map::IndexMap) and sets as [`IndexSet`](index_set::IndexSet),
+//!   never `HashMap` or `HashSet`, whose iteration order changes between runs.
 //! - Don't call float math library functions like `sin`, `cos`, `atan2`, `exp`, `ln`, `powf` or
 //!   `powi`: they can return different bits on different systems. `+`, `-`, `*`, `/`, `sqrt`,
 //!   `abs` and casts are exact everywhere.
 //! - Don't read anything from outside the world: system time, unseeded randomness, environment
-//!   variables, files. Keep a seeded random generator in a resource, and send outside data as input
-//!   signals.
+//!   variables, files. Keep a seeded [`Rng`](rng::Rng) in a resource or component, and send outside
+//!   data as input signals.
 //! - Don't order anything by address or `TypeId`, and don't rely on the size of `usize`.
 //! - Check that dependencies, like a physics crate, follow the same rules.
 //!
@@ -148,9 +148,11 @@ pub mod entity;
 pub(crate) mod free_list;
 pub mod hashed;
 pub mod index_map;
+pub mod index_set;
 pub mod record;
 pub mod registry;
 pub mod resource;
+pub mod rng;
 pub mod save;
 pub mod schedule;
 pub mod signal;
@@ -179,7 +181,9 @@ pub mod prelude {
     pub use crate::entity::{Entity, EntityManager};
     pub use crate::hashed::Hashed;
     pub use crate::index_map::IndexMap;
+    pub use crate::index_set::IndexSet;
     pub use crate::resource::{LocalResource, Resource};
+    pub use crate::rng::Rng;
     pub use crate::save::Save;
     pub use crate::schedule::{
         IntoSystem, Mut, Setup, SystemEntry, SystemGraph, SystemParam, WorldAccess, system_graph,
@@ -192,7 +196,7 @@ pub mod prelude {
 
     #[doc(inline)]
     pub use reacs_derive::{
-        Hashed as DeriveHashed, component, data, param, resource, signal, system, world,
+        Hashed as DeriveHashed, component, data, group, param, resource, signal, system, world,
     };
 }
 
