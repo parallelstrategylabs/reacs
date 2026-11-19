@@ -290,7 +290,8 @@ If you need queries, parallel systems or a full engine, [Bevy](https://bevy.org)
   saved as 64-bit everywhere. See `reacs::save` for the rules.
 - **Long signals stay until they end:** A signal with no end, or a long window, keeps being delivered,
   and stays in memory and saves, until it's cancelled. Only `#[signal(entity)]` signals are cleaned up
-  when their entity dies.
+  when their entity dies. The system receiving it can stop it on a condition with `retain`: return
+  `false` from `burns.retain(|burn| ..)` once the fire is out.
 - **Determinism needs your code too:** In systems and anything they call, use `IndexMap` and
   `IndexSet` instead of `HashMap` and `HashSet`. Don't call float functions like `sin`, `cos`, `atan2`, `exp` or `powf`
   (`+ - * /`, `sqrt` and `abs` are exact everywhere). Don't read time, files or the environment.

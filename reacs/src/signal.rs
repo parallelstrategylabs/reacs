@@ -559,6 +559,83 @@ where
     })
 }
 
+#[inline(never)]
+fn retain_instances<S: Copy>(
+    list: &mut Vec<SignalInstance<S>>,
+    start: usize,
+    keep: &impl Fn(&S) -> bool,
+    f: &mut impl FnMut(&S) -> bool,
+    mut cancel: impl FnMut(u64) -> bool,
+) -> u64 {
+    let mut positions = Vec::new();
+    for (i, signal) in list[start..].iter().enumerate() {
+        if keep(&signal.payload) && !f(&signal.payload) && cancel(signal.id) {
+            positions.push(start + i);
+        }
+    }
+    let Some(&first) = positions.first() else {
+        return 0;
+    };
+
+    let len = list.len();
+    let mut write = first;
+    for (k, &position) in positions.iter().enumerate() {
+        let next = positions.get(k + 1).copied().unwrap_or(len);
+        list.copy_within(position + 1..next, write);
+        write += next - position - 1;
+    }
+    list.truncate(write);
+    positions.len() as u64
+}
+
+#[inline(never)]
+fn retain_entries<S: Copy>(
+    entries: &mut [WindowEntry<S>],
+    next_tick: u64,
+    keep: &impl Fn(&S) -> bool,
+    f: &mut impl FnMut(&S) -> bool,
+) -> u64 {
+    let mut cancelled = 0;
+    for entry in entries {
+        if !entry.0.is_cancelled()
+            && keep(&entry.1.payload)
+            && !f(&entry.1.payload)
+            && entry.0.end > next_tick
+        {
+            entry.0.cancel();
+            cancelled += 1;
+        }
+    }
+    cancelled
+}
+
+#[inline(never)]
+fn retain_permanent<S>(
+    permanent: &[SignalInstance<S>],
+    range: std::ops::Range<usize>,
+    bits: &mut BitSet,
+    skip_bits: bool,
+    keep: &impl Fn(&S) -> bool,
+    f: &mut impl FnMut(&S) -> bool,
+) -> u64 {
+    let mut cancelled = 0;
+    let mut position = range.start;
+    while position < range.end {
+        let next = match skip_bits {
+            true => bits.next_set(position, range.end),
+            false => range.end,
+        };
+        for (i, signal) in permanent[position..next].iter().enumerate() {
+            if keep(&signal.payload) && !f(&signal.payload) {
+                bits.set(position + i, true);
+                cancelled += 1;
+            }
+        }
+        position = next + 1;
+    }
+    cancelled
+}
+
 enum ReceiveStage {
     TransientBuffer,
     Running,
@@ -917,6 +994,89 @@ impl<S: SignalType> Signals<S> {
         tick: u64,
         keep: K,
     ) -> impl Iterator<Item = &'a S> + use<'a, S, K> {
+        self.receive_iter(data, system, tick, keep)
+    }
+
+    /// Receives like [`receive`](Self::receive), calls `f` on each signal and cancels every
+    /// signal `f` returns `false` for. Returns how many it cancelled.
+    ///
+    /// Walks the lists `receive` would, in the same order, and cancels each signal where it
+    /// finds it, as [`cancel`](Self::cancel) would, but only signals with ticks left after this
+    /// one: windows are marked in place and permanent signals get their cancelled bit. A signal
+    /// on its last tick (every one-tick signal, and windows ending now) is left alone. In
+    /// `transient_buffer`, only copies of windows sent this tick have ticks left: such a copy
+    /// leaves the list (one compacting pass) and its window in `transitory_pending` is
+    /// cancelled. Kept apart from `ReceiveIter` so its hot path is unchanged.
+    pub(crate) fn retain<K: Fn(&S) -> bool>(
+        &mut self,
+        data: &mut SignalData<S>,
+        system: u128,
+        tick: u64,
+        keep: K,
+        mut f: impl FnMut(&S) -> bool,
+    ) -> usize {
+        let (transient, buffer, windows) = self.advance_cursor(data, system, tick);
+        let transient = self.transient.len() - transient.len();
+        let buffer = self.transient_buffer.len() - buffer.len();
+        // `transient` only holds one-tick signals on their last tick, so none is cancelled.
+        retain_instances(&mut self.transient, transient, &keep, &mut f, |_| false);
+        // In the buffer, only copies of windows sent this tick have ticks left.
+        let pending = &mut self.transitory_pending;
+        let mut cancelled =
+            retain_instances(&mut self.transient_buffer, buffer, &keep, &mut f, |id| {
+                let found = pending.binary_search_by(|x| x.1.id.cmp(&id));
+                found.map(|i| pending[i].0.cancel()).is_ok()
+            });
+        if !windows {
+            return cancelled as usize;
+        }
+
+        for chunk in &mut self.transitory_running {
+            let head = chunk.head;
+            let count = retain_entries(&mut chunk.entries[head..], tick + 1, &keep, &mut f);
+            if count > 0 {
+                chunk.cancelled += count;
+                cancelled += count;
+                if !chunk.due && chunk.cancelled * 2 > chunk.live().len() as u64 {
+                    chunk.due = true;
+                    self.transitory_compact.push((true, chunk.key));
+                }
+            }
+        }
+        cancelled += retain_entries(&mut self.permanent_joining, tick + 1, &keep, &mut f);
+
+        let skip_bits = self.permanent_cancelled > 0;
+        let mut permanent = 0;
+        for range in [
+            0..self.permanent_write,
+            self.permanent_read..self.permanent.len(),
+        ] {
+            permanent += retain_permanent(
+                &self.permanent,
+                range,
+                &mut self.permanent_cancelled_bits,
+                skip_bits,
+                &keep,
+                &mut f,
+            );
+        }
+        self.permanent_cancelled += permanent;
+        (cancelled + permanent) as usize
+    }
+
+    /// Moves `system`'s cursor past everything it receives now. Returns its unread signals in
+    /// `transient` and `transient_buffer`, and whether it gets this tick's windows.
+    ///
+    /// Returns slices, not positions, so `receive` compiles as it did before `retain` shared this
+    /// code: re-slicing by position added bounds checks and slowed `for` loops over entity
+    /// signals by about 10%.
+    #[inline(always)]
+    fn advance_cursor<'a>(
+        &'a self,
+        data: &mut SignalData<S>,
+        system: u128,
+        tick: u64,
+    ) -> (&'a [SignalInstance<S>], &'a [SignalInstance<S>], bool) {
         let slot = data.cursors.binary_search_by_key(&system, |x| x.system);
         let (cursor, windows) = match slot {
             Ok(i) => (data.cursors[i].next, data.cursors[i].windows_tick != tick),
@@ -946,6 +1106,18 @@ impl<S: SignalType> Signals<S> {
                 },
             ),
         }
+        (transient, transient_buffer, windows)
+    }
+
+    #[inline(always)]
+    fn receive_iter<'a, K: Fn(&S) -> bool>(
+        &'a self,
+        data: &mut SignalData<S>,
+        system: u128,
+        tick: u64,
+        keep: K,
+    ) -> ReceiveIter<'a, S, K> {
+        let (transient, transient_buffer, windows) = self.advance_cursor(data, system, tick);
 
         let mut iter = ReceiveIter {
             run: transient.iter(),
@@ -1461,11 +1633,13 @@ pub struct Signal<S: SignalType> {
 /// new, so reacting to rare signals costs almost nothing. The whole system is skipped, so it
 /// shouldn't do work that doesn't come from its signals (see `#[system]`).
 ///
+/// A receiver can also stop the signals it receives, with [`retain`](Self::retain), and still
+/// sleep while nothing is in flight.
+///
 /// Receiving and sending the same type in one system needs [`Signal`]: a `Receiver<S>` and a
 /// `Sender<S>` in the same system is a borrow conflict.
 #[param(write, wake = __gate(S))]
 pub struct Receiver<S: SignalType> {
-    #[read]
     signals: Resource<Signals<S>>,
     data: Resource<SignalData<S>>,
     #[read]
@@ -1601,6 +1775,73 @@ impl<'w, S: SignalType> Signal<'w, S, Write> {
         )
     }
 
+    /// Receives like [`receive`](Self::receive), calling `f` on each signal, and cancels every
+    /// signal `f` returns `false` for that still has ticks left. Returns how many signals it
+    /// cancelled.
+    ///
+    /// This ends a window on a condition: send the signal with `..` (or a long window), and
+    /// return `false` once it should stop, for example when the burning unit runs out of fuel.
+    /// The cancel works like [`cancel`](Self::cancel): systems that run after this one no
+    /// longer get the signal, this tick included. A signal on its last tick (any one-tick
+    /// signal, or a window ending this tick) ends anyway, so `false` leaves it alone and later
+    /// systems still get it. `f` sees the signals in the order `receive` gives them and can use
+    /// the system's other params.
+    ///
+    /// Costs the same as `receive().for_each(..)` with the same work in `f`; each cancel adds a
+    /// few nanoseconds. Cancelling a window sent this tick also moves the one-tick signals sent
+    /// after it this tick, once per call.
+    ///
+    /// # Examples
+    ///
+    /// A fire that burns until its unit's fuel runs out:
+    ///
+    /// ```rust,standalone_crate
+    /// use reacs::prelude::*;
+    ///
+    /// #[component]
+    /// struct Fuel(u32);
+    ///
+    /// #[signal(entity)]
+    /// struct Burn(Entity);
+    ///
+    /// #[system]
+    /// fn burn(mut burns: Mut<Signal<Burn>>, mut fuel: Mut<Component<Fuel>>) {
+    ///     burns.retain(|&Burn(unit)| {
+    ///         let Some(left) = fuel.get_mut(unit) else {
+    ///             return false;
+    ///         };
+    ///         left.0 -= 1;
+    ///         left.0 > 0
+    ///     });
+    /// }
+    ///
+    /// fn main() {
+    ///     let mut unit = Entity::default();
+    ///     let mut world = World::build(|setup| {
+    ///         unit = setup.spawn();
+    ///         setup.set_component(unit, Fuel(3));
+    ///         setup.signal::<Burn>().send(Burn(unit), ..);
+    ///     });
+    ///     for _ in 0..10 {
+    ///         world.step();
+    ///     }
+    ///     // Burned on ticks 0, 1 and 2, then cancelled.
+    ///     assert_eq!(world.get_component::<Fuel>(unit).unwrap().0, 0);
+    /// }
+    /// ```
+    pub fn retain(&mut self, f: impl FnMut(&S) -> bool) -> usize {
+        let context = S::Filter::fetch(&self.world);
+        let system = (*self.current).0;
+        let tick = (*self.tick).0;
+        self.signals.retain(
+            &mut self.data,
+            system,
+            tick,
+            move |signal| S::Filter::keep(&context, signal),
+            f,
+        )
+    }
+
     /// Returns the current tick.
     #[inline]
     pub fn tick(&self) -> u64 {
@@ -1629,6 +1870,64 @@ impl<'w, S: SignalType> Receiver<'w, S, Write> {
             (*self.current).0,
             (*self.tick).0,
             move |signal| S::Filter::keep(&context, signal),
+        )
+    }
+
+    /// Receives like [`receive`](Self::receive), calling `f` on each signal, and cancels every
+    /// signal `f` returns `false` for that still has ticks left. Returns how many signals it
+    /// cancelled.
+    ///
+    /// The same as [`Signal::retain`], which has the details and an example, but the system
+    /// still sleeps while nothing is in flight.
+    ///
+    /// # Examples
+    ///
+    /// Regeneration that stops once a unit is healed, in a system that sleeps while no unit is
+    /// regenerating:
+    ///
+    /// ```rust,standalone_crate
+    /// use reacs::prelude::*;
+    ///
+    /// #[component]
+    /// struct Health(u32);
+    ///
+    /// #[signal(entity)]
+    /// struct Regen(Entity);
+    ///
+    /// #[system]
+    /// fn regen(mut regen: Mut<Receiver<Regen>>, mut health: Mut<Component<Health>>) {
+    ///     regen.retain(|&Regen(unit)| {
+    ///         let Some(hp) = health.get_mut(unit) else {
+    ///             return false;
+    ///         };
+    ///         hp.0 += 10;
+    ///         hp.0 < 100
+    ///     });
+    /// }
+    ///
+    /// fn main() {
+    ///     let mut unit = Entity::default();
+    ///     let mut world = World::build(|setup| {
+    ///         unit = setup.spawn();
+    ///         setup.set_component(unit, Health(70));
+    ///         setup.signal::<Regen>().send(Regen(unit), ..);
+    ///     });
+    ///     for _ in 0..10 {
+    ///         world.step();
+    ///     }
+    ///     assert_eq!(world.get_component::<Health>(unit).unwrap().0, 100);
+    /// }
+    /// ```
+    pub fn retain(&mut self, f: impl FnMut(&S) -> bool) -> usize {
+        let context = S::Filter::fetch(&self.world);
+        let system = (*self.current).0;
+        let tick = (*self.tick).0;
+        self.signals.retain(
+            &mut self.data,
+            system,
+            tick,
+            move |signal| S::Filter::keep(&context, signal),
+            f,
         )
     }
 
@@ -3839,6 +4138,72 @@ mod tests {
     }
 
     #[test]
+    fn retain_delivers_the_same_signals_in_the_same_order_as_next() {
+        let world = mixed_lists_world();
+        let mut by_retain = Vec::new();
+        let cancelled = world.signal::<NumSignal>().retain(|s| {
+            by_retain.push(s.0);
+            true
+        });
+
+        assert_eq!(cancelled, 0);
+        assert_eq!(by_retain, receive_by_next(&mixed_lists_world()));
+    }
+
+    #[test]
+    fn retain_cancels_in_every_list() {
+        let world = mixed_lists_world();
+        // 8: one-tick on its last tick (left alone), 9: a window's copy in the buffer, 102 and
+        // 106: permanent around the sweep gap with cancelled bits already set.
+        let dropped = [8, 9, 102, 106];
+        let cancelled = world
+            .signal::<NumSignal>()
+            .retain(|s| !dropped.contains(&s.0));
+        assert_eq!(cancelled, 3);
+        assert!(world.signal::<NumSignal>().retain(|_| false) == 0);
+
+        end_tick(&world);
+        let mut next = receive(&world);
+        next.sort_unstable();
+        assert_eq!(next, [7, 103, 104, 107, 108, 109]);
+    }
+
+    #[test]
+    fn retain_leaves_signals_on_their_last_tick_to_later_receivers() {
+        let mut world = world();
+        let (a, b) = receivers(&mut world);
+        send(&world, 2, 0..1);
+        world.signal::<NumSignal>().emit(NumSignal(1));
+        send(&world, 3, 0..2);
+        send(&world, 4, 0..9);
+
+        world.get_resource_mut::<CurrentSystem>().unwrap().0 = 7;
+        assert_eq!(world.signal::<NumSignal>().retain(|_| false), 2);
+        world.get_resource_mut::<CurrentSystem>().unwrap().0 = 0;
+        b.run(&mut world);
+        assert_eq!(take_b(&world), [2, 1]);
+
+        end_tick(&world);
+        a.run(&mut world);
+        // `a` ran before the senders, so it gets the one-tick signals now; 3 and 4 were cancelled.
+        assert_eq!(take_a(&world), [2, 1]);
+    }
+
+    #[test]
+    fn retain_leaves_a_window_on_its_last_tick() {
+        let world = world();
+        send(&world, 5, 0..2);
+        end_tick(&world);
+
+        let mut seen = Vec::new();
+        let cancelled = world.signal::<NumSignal>().retain(|s| {
+            seen.push(s.0);
+            false
+        });
+        assert_eq!((seen, cancelled), (vec![5], 0));
+    }
+
+    #[test]
     fn fold_after_partial_next_delivers_the_rest() {
         let world = mixed_lists_world();
         let mut signal = world.signal::<NumSignal>();
@@ -3892,6 +4257,8 @@ mod tests {
         delivered: u64,
         idle: u64,
         cancels: u64,
+        retain_cancels: u64,
+        retain_last_tick: u64,
         modifies: u64,
         rejected: u64,
         partial_sweeps: u64,
@@ -3992,17 +4359,45 @@ mod tests {
                     };
                     world.get_resource_mut::<CurrentSystem>().unwrap().0 = system;
                     let mut received: Vec<(u64, u64)> = Vec::new();
+                    let mut dropped: Vec<u64> = Vec::new();
+                    let mut count = 0;
                     let mut signals = world.signal::<Tagged>();
-                    if run.receives % 2 == 0 {
-                        for signal in signals.receive() {
-                            received.push((signal.0.to_bits(), signal.1));
+                    match run.receives % 3 {
+                        0 => {
+                            for signal in signals.receive() {
+                                received.push((signal.0.to_bits(), signal.1));
+                            }
                         }
-                    } else {
-                        signals
+                        1 => signals
                             .receive()
-                            .for_each(|signal| received.push((signal.0.to_bits(), signal.1)));
+                            .for_each(|signal| received.push((signal.0.to_bits(), signal.1))),
+                        _ => {
+                            let kill = if random(4) == 0 { random(8) } else { 8 };
+                            count = signals.retain(|signal| {
+                                received.push((signal.0.to_bits(), signal.1));
+                                let keep = signal.1 % 8 != kill;
+                                if !keep {
+                                    dropped.push(signal.1);
+                                }
+                                keep
+                            });
+                        }
                     }
                     drop(signals);
+                    let mut expected_count = 0;
+                    for signal in model.iter_mut().filter(|s| dropped.contains(&s.payload)) {
+                        assert!(!signal.cancelled, "retain cancelled {} twice", signal.id);
+                        // Only signals with ticks left are cancelled.
+                        if signal.end > tick + 1 {
+                            signal.cancelled = true;
+                            cancelled_ids.push(signal.id);
+                            run.retain_cancels += 1;
+                            expected_count += 1;
+                        } else {
+                            run.retain_last_tick += 1;
+                        }
+                    }
+                    assert_eq!(count, expected_count, "seed {seed:x}, tick {tick}");
                     world.get_resource_mut::<CurrentSystem>().unwrap().0 = 0;
                     received.sort();
                     assert_eq!(
@@ -4179,7 +4574,11 @@ mod tests {
                 "{run:?}"
             );
             assert!(
-                run.cancels > 0 && run.modifies > 0 && run.partial_sweeps > 0,
+                run.cancels > 0
+                    && run.retain_cancels > 0
+                    && run.retain_last_tick > 0
+                    && run.modifies > 0
+                    && run.partial_sweeps > 0,
                 "{run:?}"
             );
             if !cfg!(miri) {
