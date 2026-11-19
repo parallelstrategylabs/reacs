@@ -1,6 +1,6 @@
 [package]
 name = "reacs"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.88"
 description = "A reactive, signal-driven ECS on a deterministic, tick-based simulation kernel"
@@ -10,7 +10,7 @@ readme = "../README.md"
 links = "reacs"
 
 [dependencies]
-reacs-derive = { path = "../derive", version = "=0.4.0" }
+reacs-derive = { path = "../derive", version = "=0.4.1" }
 serde = { version = "1.0", features = ["derive"] }
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 
