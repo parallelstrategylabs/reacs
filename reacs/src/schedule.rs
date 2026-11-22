@@ -587,6 +587,63 @@ impl_into_system_tuples!(P1, P2, P3, P4, P5, P6, P7, P8);
 pub struct Read;
 
 /// The mode of a param that writes: [`Mut<P>`](Mut) is `P` in this mode.
+///
+/// Name it to add methods to the writable form of a `#[param]`, for example to group the
+/// components an entity is spawned with. The prelude exports it; a `use std::fmt::Write` or
+/// `use std::io::Write` in the same module shadows it, so write `reacs::prelude::Write` there.
+///
+/// # Examples
+///
+/// ```rust,standalone_crate
+/// use reacs::prelude::*;
+///
+/// #[component]
+/// struct Position(i32, i32);
+///
+/// #[component]
+/// struct Health(i32);
+///
+/// #[resource]
+/// struct LastSpawned(Entity);
+///
+/// #[param(write)]
+/// struct Units {
+///     entities: EntityManager,
+///     position: Component<Position>,
+///     health: Component<Health>,
+///     last: Resource<LastSpawned>,
+/// }
+///
+/// impl Units<'_, Write> {
+///     fn spawn(&mut self, x: i32, y: i32) -> Entity {
+///         let unit = self.entities.spawn();
+///         self.position.insert(unit, Position(x, y));
+///         self.health.insert(unit, Health(10));
+///         self.last.0 = unit;
+///         unit
+///     }
+/// }
+///
+/// #[signal(input)]
+/// struct SpawnUnit(i32, i32);
+///
+/// #[system]
+/// fn spawn_unit(mut orders: Mut<Receiver<SpawnUnit>>, mut units: Mut<Units>) {
+///     orders.receive().for_each(|&SpawnUnit(x, y)| {
+///         units.spawn(x, y);
+///     });
+/// }
+///
+/// fn main() {
+///     let mut world = World::new();
+///     world.input(SpawnUnit(3, 4));
+///     world.step();
+///
+///     let unit = world.get_resource::<LastSpawned>().unwrap().0;
+///     assert_eq!(world.get_component::<Position>(unit).unwrap().0, 3);
+///     assert_eq!(world.get_component::<Health>(unit).unwrap().0, 10);
+/// }
+/// ```
 pub struct Write;
 
 /// Whether a param reads or writes, which decides how it borrows what it uses.

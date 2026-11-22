@@ -186,7 +186,8 @@ pub mod prelude {
     pub use crate::rng::Rng;
     pub use crate::save::Save;
     pub use crate::schedule::{
-        IntoSystem, Mut, Setup, SystemEntry, SystemGraph, SystemParam, WorldAccess, system_graph,
+        IntoSystem, Mut, Setup, SystemEntry, SystemGraph, SystemParam, WorldAccess, Write,
+        system_graph,
     };
     pub use crate::signal::{
         At, For, In, InputSignal, IntoWindow, Receiver, Sender, Signal, SignalType, To,
