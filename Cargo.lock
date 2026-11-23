@@ -193,7 +193,7 @@ dependencies = [
 
 [[package]]
 name = "reacs"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "postcard",
  "reacs-derive",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "reacs-derive"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "proc-macro2",
  "quote",
