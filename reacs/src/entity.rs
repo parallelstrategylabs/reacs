@@ -111,7 +111,8 @@ impl DerefMut for EntityGenerations {
 
 /// System param that spawns, despawns and checks entities.
 ///
-/// `EntityManager` reads: [`is_alive`](Self::is_alive) and [`generation`](Self::generation).
+/// `EntityManager` reads: [`is_alive`](Self::is_alive), [`generation`](Self::generation) and
+/// [`entity_at`](Self::entity_at).
 /// `Mut<EntityManager>` also [spawns](Self::spawn) and [despawns](Self::despawn). The host reads
 /// it with [`World::entities`].
 ///
@@ -173,6 +174,63 @@ impl<M: Mode> EntityManager<'_, M> {
     pub fn is_alive(&self, entity: Entity) -> bool {
         self.free_list.bitset.get(entity.index() as usize)
             && self.generation(entity.index()) == entity.generation()
+    }
+
+    /// Returns the entity living at `index` now, or `None` if the index is free.
+    ///
+    /// This turns an index stored on its own, such as an item id in a spatial index, back into a
+    /// handle that reads components. It answers with whoever lives at `index` *now*: once the
+    /// entity that was there is despawned and a spawn reuses the index, it returns the new entity,
+    /// not `None`. Remove an entity's index from wherever it's stored when it's despawned, or store
+    /// the [`Entity`] and check [`is_alive`](Self::is_alive) when it must be that exact entity.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,standalone_crate
+    /// use reacs::prelude::*;
+    ///
+    /// #[component]
+    /// struct Health(i32);
+    ///
+    /// #[signal(input)]
+    /// struct Strike {
+    ///     index: u32,
+    /// }
+    ///
+    /// #[system]
+    /// fn strike(
+    ///     mut strikes: Mut<Receiver<Strike>>,
+    ///     entities: EntityManager,
+    ///     mut health: Mut<Component<Health>>,
+    /// ) {
+    ///     for strike in strikes.receive() {
+    ///         if let Some(target) = entities.entity_at(strike.index) {
+    ///             if let Some(health) = health.get_mut(target) {
+    ///                 health.0 -= 1;
+    ///             }
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// fn main() {
+    ///     let mut world = World::build(|setup| {
+    ///         let unit = setup.spawn();
+    ///         setup.set_component(unit, Health(3));
+    ///     });
+    ///     let unit = world.entities().entity_at(0).unwrap();
+    ///     assert_eq!(world.entities().entity_at(1), None);
+    ///
+    ///     world.input(Strike { index: unit.index() });
+    ///     world.step();
+    ///     assert_eq!(world.get_component::<Health>(unit).unwrap().0, 2);
+    /// }
+    /// ```
+    #[inline]
+    pub fn entity_at(&self, index: u32) -> Option<Entity> {
+        self.free_list
+            .bitset
+            .get(index as usize)
+            .then(|| Entity::new(index, self.generation(index)))
     }
 }
 
@@ -364,6 +422,31 @@ mod tests {
         let new = em.spawn();
         assert!(em.is_alive(new));
         assert!(!em.is_alive(old));
+    }
+
+    #[test]
+    fn entity_at_returns_whoever_lives_at_the_index_now() {
+        let world = World::new();
+        let mut em = world.entity_manager();
+        let old = em.spawn();
+        let other = em.spawn();
+        assert_eq!(em.entity_at(old.index()), Some(old));
+        assert_eq!(em.entity_at(other.index()), Some(other));
+        assert_eq!(em.entity_at(2), None);
+        assert_eq!(em.entity_at(1_000), None);
+        assert_eq!(em.entity_at(u32::MAX), None);
+
+        em.despawn(old);
+        assert_eq!(em.entity_at(old.index()), None);
+
+        let new = em.spawn();
+        assert_eq!(new.index(), old.index());
+        assert_eq!(em.entity_at(old.index()), Some(new));
+        assert_eq!(em.entity_at(other.index()), Some(other));
+        drop(em);
+
+        assert_eq!(world.entities().entity_at(old.index()), Some(new));
+        assert_eq!(world.entities().entity_at(2), None);
     }
 
     #[test]

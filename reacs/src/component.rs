@@ -665,10 +665,16 @@ mod tests {
             assert_eq!(em.generation(index as u32), generation, "index {index}");
             let current = Entity::new(index as u32, generation);
             assert_eq!(em.is_alive(current), model.alive[index], "{current:?}");
+            assert_eq!(
+                em.entity_at(index as u32),
+                model.alive[index].then_some(current),
+                "index {index}"
+            );
             if model.alive[index] {
                 assert_eq!(components.get(current).map(|c| c.0), model.owned[index]);
             }
         }
+        assert_eq!(em.entity_at(model.generations.len() as u32), None);
         for &handle in handles {
             assert_eq!(em.is_alive(handle), model.is_current(handle), "{handle:?}");
             assert_eq!(components.get(handle).map(|c| c.0), model.slot(handle));
